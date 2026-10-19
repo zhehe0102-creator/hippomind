@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 from collections import deque
 
-from .textutil import token_sim
+from .textutil import informative_ratio, is_noise_text, token_sim
 from .sanitize import MAX_ARCHIVE_MESSAGE_CHARS, sanitize_chat_content
 
 
@@ -432,7 +432,17 @@ def _normalise_procedural(record: Mapping[str, Any], metadata: Dict[str, Any], k
 
 def _quality_score(kind: str, content: str, evidence: Sequence[str], metadata: Mapping[str, Any], raw_chat: bool) -> float:
     if raw_chat:
-        return 1.0
+        # Raw chat is evidence, not knowledge.  Scoring it 1.0 unconditionally let
+        # harness banners, `/command` echoes and one-word acknowledgements occupy
+        # the same retrieval band as a real lesson.  Such rows stay in the ledger
+        # for audit, but they must not be treated as accepted working memory.
+        #
+        # The classifier is deliberately conservative (see textutil.is_noise_text):
+        # it only rejects structurally provable noise, so a short but substantive
+        # answer is still admitted.
+        if is_noise_text(content):
+            return 0.15
+        return round(0.55 + 0.45 * min(1.0, informative_ratio(content) / 0.55), 4)
     if bool(metadata.get("derived_from_raw_chat")) or bool(metadata.get("untrusted_source")):
         # A marker heuristic is auditable provenance, not independently
         # verified state. It stays queryable through audit APIs but never

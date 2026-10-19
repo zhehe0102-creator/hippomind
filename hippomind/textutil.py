@@ -116,6 +116,107 @@ def content_fingerprint(text: str, *, keep_wrappers: bool = False) -> str:
     return hashlib.sha256(canonical.encode("utf-8", errors="replace")).hexdigest()[:32]
 
 
+# ---------------------------------------------------------------------------
+# Noise classification
+# ---------------------------------------------------------------------------
+# Raw chat is the dominant volume in a real hub (1.47M of 1.54M rows), and most of
+# it carries no reusable knowledge: harness banners, tool banners, slash-command
+# echoes, one-word acknowledgements.  These heuristics let the storage layer and
+# the retriever agree on what "noise" means without either importing the other.
+
+#: Strings a harness injects around the real payload.  Matched case-insensitively
+#: against the *stripped* text; a message that is only a banner is pure noise.
+_BANNER_PREFIXES = (
+    "# agents.md instructions",
+    "<user_request>",
+    "</user_request>",
+    "<additional_metadata>",
+    "</additional_metadata>",
+    "<environment_context>",
+    "</environment_context>",
+    "<system-reminder>",
+    "</system-reminder>",
+    "the current local time is:",
+    "filesystem sandboxing defines",
+    "approval policy is currently",
+    "you are an ai assistant accessed via",
+)
+
+#: One-word acknowledgements that neither carry facts nor aid retrieval.
+_FILLER_EXACT = frozenset({
+    "ok", "okay", "好", "好的", "嗯", "嗯嗯", "可以", "行", "继续", "对", "是的",
+    "谢谢", "多谢", "thanks", "thank you", "thx", "yes", "no", "y", "n", "k",
+    "go", "go on", "continue", "下一步", "然后呢",
+})
+
+#: Command echoes (`/compact`, `!ls`) carry no semantic content.
+_COMMAND_ECHO_RE = re.compile(r"^[/!][a-zA-Z][\w-]{0,48}\s*$")
+
+#: Tool-result banners such as `[exit 0]`, `(tool result)`; not knowledge.
+_TOOL_BANNER_RE = re.compile(
+    r"^(?:\[[^\]]{0,40}\]|\([^)]{0,40}\))\s*$"
+)
+
+
+def _strip_banners(text: str) -> str:
+    """Drop leading harness banner lines so the payload can be inspected."""
+    lines = [line for line in (text or "").splitlines()]
+    kept = []
+    for line in lines:
+        probe = line.strip().lower()
+        if any(probe.startswith(prefix) for prefix in _BANNER_PREFIXES):
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
+
+
+def is_noise_text(text: str, *, min_informative_chars: int = 12) -> bool:
+    """Return ``True`` when ``text`` is very unlikely to be useful memory.
+
+    The test is deliberately conservative: it only rejects content that is
+    *provably* structural (banners, command echoes, tool banners) or has almost
+    no informative characters after normalisation.  Anything ambiguous is kept,
+    because a false negative (we store noise) is cheaper than a false positive
+    (we discard a real lesson).
+    """
+    payload = _strip_banners(text or "")
+    if not payload:
+        return True
+    probe = payload.strip().lower()
+    if not probe:
+        return True
+    if probe in _FILLER_EXACT:
+        return True
+    if _COMMAND_ECHO_RE.match(probe) or _TOOL_BANNER_RE.match(probe):
+        return True
+    informative = [ch for ch in payload if not ch.isspace()]
+    if len(informative) < min_informative_chars:
+        # Short but substantive Chinese answers ("用 Redis 因为要持久化") still pass
+        # as long as they contain letters/digits; punctuation-only does not.
+        if not any(ch.isalnum() for ch in payload):
+            return True
+        cjk = sum(1 for ch in payload if "\u3400" <= ch <= "\u9fff")
+        latin = sum(1 for ch in payload if ch.isascii() and ch.isalnum())
+        return (cjk + latin) < 4
+    return False
+
+
+def informative_ratio(text: str) -> float:
+    """Fraction of characters that carry signal, for ranking/filtering.
+
+    Returns ``0.0`` for empty input and ``1.0`` for dense prose.  Used to bias
+    retrieval away from boilerplate without hard-dropping anything.
+    """
+    text = text or ""
+    if not text:
+        return 0.0
+    payload = _strip_banners(text)
+    if not payload:
+        return 0.0
+    informative = sum(1 for ch in payload if ch.isalnum() or "\u3400" <= ch <= "\u9fff")
+    return informative / max(1, len(payload))
+
+
 def truncate_middle(text: str, limit: int, marker: str = "\n…\n") -> str:
     """Truncate ``text`` to ``limit`` characters keeping both ends readable."""
     if limit <= 0:
