@@ -1,0 +1,850 @@
+{
+  "preflight": {
+    "step": "preflight",
+    "passed": true,
+    "checks": [
+      {
+        "id": "db_exists",
+        "ok": true,
+        "fatal": true,
+        "detail": "/Users/zps/Library/Application Support/HippoMind/hippomind.sqlite"
+      },
+      {
+        "id": "db_regular_file",
+        "ok": true,
+        "fatal": true,
+        "detail": "is_file=True is_symlink=False"
+      },
+      {
+        "id": "backup_exists",
+        "ok": true,
+        "fatal": true,
+        "detail": "/Volumes/移动硬盘/记忆系统重构/backups/hippomind-pre-compaction-20261019T141216Z.sqlite"
+      },
+      {
+        "id": "backup_regular_file",
+        "ok": true,
+        "fatal": true,
+        "detail": "is_file=True is_symlink=False"
+      },
+      {
+        "id": "backup_sha256",
+        "ok": true,
+        "fatal": true,
+        "detail": "expected=948002887dd42998c90d189b3af26b30f0a4f2313f4fbb6f1591aaf584d9b638 actual=948002887dd42998c90d189b3af26b30f0a4f2313f4fbb6f1591aaf584d9b638"
+      },
+      {
+        "id": "backup_integrity_check",
+        "ok": true,
+        "fatal": true,
+        "detail": "ok (86.1s)"
+      },
+      {
+        "id": "backup_matches_live",
+        "ok": true,
+        "fatal": true,
+        "detail": "identical logical fingerprint"
+      },
+      {
+        "id": "daemon_stopped",
+        "ok": true,
+        "fatal": true,
+        "detail": "{\"matching_processes\": [], \"launchd\": {\"com.hippomind.gui\": \"-\", \"com.hippomind.daemon\": \"-\"}, \"open_handles\": [], \"recorded_pid\": 816, \"recorded_pid_alive\": false, \"serving\": false}"
+      },
+      {
+        "id": "no_residual_temp_tables",
+        "ok": true,
+        "fatal": true,
+        "detail": "residual=[]"
+      },
+      {
+        "id": "wal_checkpointed",
+        "ok": true,
+        "fatal": true,
+        "detail": "wal_bytes=0"
+      },
+      {
+        "id": "free_space",
+        "ok": true,
+        "fatal": true,
+        "detail": "free=36.1 GB required>=5.0 GB"
+      },
+      {
+        "id": "schema_version_supported",
+        "ok": true,
+        "fatal": true,
+        "detail": "ledger=8 code=8"
+      }
+    ],
+    "backup": {
+      "path": "/Volumes/移动硬盘/记忆系统重构/backups/hippomind-pre-compaction-20261019T141216Z.sqlite",
+      "sha256": "948002887dd42998c90d189b3af26b30f0a4f2313f4fbb6f1591aaf584d9b638",
+      "integrity_check": "ok",
+      "fingerprint": {
+        "memories": 1536641,
+        "ledger_events": 1536641,
+        "memory_fts": 5691,
+        "raw_chat": 1475584,
+        "semantic": 56010,
+        "memory_claims": 0,
+        "memory_relations": 0,
+        "memory_feedback": 0,
+        "schema_version": "8",
+        "min_created": "2026-08-09T12:32:59.132000+00:00",
+        "max_created": "2026-10-02T10:10:40.536474+00:00",
+        "journal_mode": "delete",
+        "page_size": 4096,
+        "page_count": 1094546,
+        "freelist_count": 9878,
+        "file_bytes": 4483260416
+      }
+    },
+    "live": {
+      "path": "/Users/zps/Library/Application Support/HippoMind/hippomind.sqlite",
+      "fingerprint": {
+        "memories": 1536641,
+        "ledger_events": 1536641,
+        "memory_fts": 5691,
+        "raw_chat": 1475584,
+        "semantic": 56010,
+        "memory_claims": 0,
+        "memory_relations": 0,
+        "memory_feedback": 0,
+        "schema_version": "8",
+        "min_created": "2026-08-09T12:32:59.132000+00:00",
+        "max_created": "2026-10-02T10:10:40.536474+00:00",
+        "journal_mode": "wal",
+        "page_size": 4096,
+        "page_count": 1094546,
+        "freelist_count": 9878,
+        "file_bytes": 4483260416
+      }
+    },
+    "daemon": {
+      "matching_processes": [],
+      "launchd": {
+        "com.hippomind.gui": "-",
+        "com.hippomind.daemon": "-"
+      },
+      "open_handles": [],
+      "recorded_pid": 816,
+      "recorded_pid_alive": false,
+      "serving": false
+    },
+    "recorded_at": "2026-10-19T16:39:39.251024+00:00"
+  },
+  "dry_run": {
+    "step": "dry-run",
+    "elapsed_seconds": 11.6,
+    "collapse_dry_run": {
+      "duplicate_groups": 97142,
+      "collapsed": 0,
+      "archive_path": "",
+      "dry_run": true
+    },
+    "purge_dry_run": {
+      "purge_candidates": 0,
+      "purged": 0,
+      "events_purged": 0,
+      "archive_path": "",
+      "dry_run": true,
+      "retention_days": 90
+    },
+    "duplicate_plan_independent": {
+      "collapse_key": "content, source_agent, session_id, role",
+      "duplicate_groups": 97142,
+      "rows_inside_groups": 1441456,
+      "redundant_rows": 1344314,
+      "largest_group": 359,
+      "memories_before": 1536641,
+      "memories_after_expected": 192327,
+      "content_only_groups": 39345,
+      "content_only_redundant_rows": 1404190
+    },
+    "counts": {
+      "memories": 1536641,
+      "ledger_events": 1536641,
+      "memory_fts": 5691,
+      "raw_chat": 1475584,
+      "non_raw": 61057,
+      "semantic": 56010,
+      "semantic_distinct": 142,
+      "schema_version": "8",
+      "page_size": 4096,
+      "page_count": 1094546,
+      "freelist_count": 9878,
+      "journal_mode": "wal",
+      "min_created": "2026-08-09T12:32:59.132000+00:00",
+      "max_created": "2026-10-02T10:10:40.536474+00:00"
+    },
+    "ttl_days": 90,
+    "oldest_row_age_days": 71.2,
+    "purge_expected_empty": true,
+    "recorded_at": "2026-10-19T16:41:00.576388+00:00"
+  },
+  "baseline_fts_sync": {
+    "status": "warn",
+    "projections": 58322,
+    "fts_rows": 5691,
+    "unindexed": 1528034,
+    "fts_cold_leak": 0,
+    "expected_by_rebuild_invariant": 62993,
+    "drift_vs_rebuild_invariant": true,
+    "active_claims": 0,
+    "dangling_claims": 0,
+    "method": "linear temp-table anti-join (shipped fts_sync_report is quadratic)"
+  },
+  "baseline_counts": {
+    "memories": 1536641,
+    "ledger_events": 1536641,
+    "memory_fts": 5691,
+    "raw_chat": 1475584,
+    "non_raw": 61057,
+    "semantic": 56010,
+    "semantic_distinct": 142,
+    "schema_version": "8",
+    "page_size": 4096,
+    "page_count": 1094546,
+    "freelist_count": 9878,
+    "journal_mode": "wal",
+    "min_created": "2026-08-09T12:32:59.132000+00:00",
+    "max_created": "2026-10-02T10:10:40.536474+00:00"
+  },
+  "baseline_duplicate_plan": {
+    "collapse_key": "content, source_agent, session_id, role",
+    "duplicate_groups": 97142,
+    "rows_inside_groups": 1441456,
+    "redundant_rows": 1344314,
+    "largest_group": 359,
+    "memories_before": 1536641,
+    "memories_after_expected": 192327,
+    "content_only_groups": 39345,
+    "content_only_redundant_rows": 1404190
+  },
+  "execute": {
+    "step": "execute",
+    "aborted": false,
+    "steps": [
+      {
+        "step": "collapse_duplicate_rows",
+        "elapsed_seconds": 1399.1,
+        "result": {
+          "duplicate_groups": 97142,
+          "collapsed": 1344314,
+          "archive_path": "/Users/zps/Library/Application Support/HippoMind/hippomind.raw-archive/dedupe-20261019T164641Z-91b1e77b38f0.jsonl.gz",
+          "dry_run": false
+        },
+        "db_bytes_after": 4483260416
+      },
+      {
+        "step": "purge_expired_raw",
+        "elapsed_seconds": 3.0,
+        "result": {
+          "purge_candidates": 0,
+          "purged": 0,
+          "events_purged": 0,
+          "archive_path": "",
+          "dry_run": false,
+          "retention_days": 90
+        },
+        "db_bytes_after": 4483260416
+      },
+      {
+        "step": "vacuum",
+        "elapsed_seconds": 9.7,
+        "result": {
+          "before_bytes": 4483260416,
+          "after_bytes": 693755904,
+          "reclaimed_bytes": 3789504512
+        },
+        "db_bytes_after": 693755904
+      }
+    ],
+    "before": {
+      "memories": 1536641,
+      "ledger_events": 1536641,
+      "memory_fts": 5691,
+      "raw_chat": 1475584,
+      "non_raw": 61057,
+      "semantic": 56010,
+      "semantic_distinct": 142,
+      "schema_version": "8",
+      "page_size": 4096,
+      "page_count": 1094546,
+      "freelist_count": 9878,
+      "journal_mode": "wal",
+      "min_created": "2026-08-09T12:32:59.132000+00:00",
+      "max_created": "2026-10-02T10:10:40.536474+00:00"
+    },
+    "after": {
+      "memories": 192327,
+      "ledger_events": 192327,
+      "memory_fts": 4137,
+      "raw_chat": 131270,
+      "non_raw": 61057,
+      "semantic": 56010,
+      "semantic_distinct": 142,
+      "schema_version": "8",
+      "page_size": 4096,
+      "page_count": 169374,
+      "freelist_count": 0,
+      "journal_mode": "wal",
+      "min_created": "2026-08-09T12:33:01.714000+00:00",
+      "max_created": "2026-10-02T10:10:40.536474+00:00"
+    },
+    "before_bytes": 4483260416,
+    "after_bytes": 693755904,
+    "reclaimed_bytes": 3789504512,
+    "archive_before": {
+      "files": 695,
+      "bytes": 169290714
+    },
+    "archive_after": {
+      "files": 696,
+      "bytes": 368292907
+    },
+    "ttl_days": 90,
+    "recorded_at": "2026-10-19T17:09:50.659543+00:00"
+  },
+  "verify": {
+    "step": "verify",
+    "samples": 20,
+    "integrity_check": {
+      "status": "ok",
+      "elapsed_seconds": 1.9,
+      "ok": true
+    },
+    "counts": {
+      "memories": 192327,
+      "ledger_events": 192327,
+      "memory_fts": 4137,
+      "raw_chat": 131270,
+      "non_raw": 61057,
+      "semantic": 56010,
+      "semantic_distinct": 142,
+      "schema_version": "8",
+      "page_size": 4096,
+      "page_count": 169374,
+      "freelist_count": 0,
+      "journal_mode": "wal",
+      "min_created": "2026-08-09T12:33:01.714000+00:00",
+      "max_created": "2026-10-02T10:10:40.536474+00:00"
+    },
+    "file_bytes": 693755904,
+    "file_bytes_wal": 0,
+    "file_bytes_shm": 32768,
+    "duplicate_plan_after": {
+      "collapse_key": "content, source_agent, session_id, role",
+      "duplicate_groups": 0,
+      "rows_inside_groups": 0,
+      "redundant_rows": 0,
+      "largest_group": null,
+      "memories_before": 192327,
+      "memories_after_expected": 192327,
+      "content_only_groups": 13590,
+      "content_only_redundant_rows": 59876
+    },
+    "duplicates_eliminated": true,
+    "fts_sync": {
+      "status": "warn",
+      "projections": 56768,
+      "fts_rows": 4137,
+      "unindexed": 185274,
+      "fts_cold_leak": 0,
+      "expected_by_rebuild_invariant": 61439,
+      "drift_vs_rebuild_invariant": true,
+      "active_claims": 0,
+      "dangling_claims": 0,
+      "method": "linear temp-table anti-join (shipped fts_sync_report is quadratic)"
+    },
+    "baseline_fts_sync": null,
+    "fts_sync_unchanged_vs_baseline": false,
+    "recall": {
+      "elapsed_seconds": 0.2,
+      "sample_size": 20,
+      "recalled": 4,
+      "at_rank_1": 0,
+      "details": [
+        {
+          "memory_id": "mem_9b98cbe8914c590e86581fe6ec48f480",
+          "query": "的已证据化摘",
+          "found": false,
+          "rank": null,
+          "returned": 80,
+          "scope": "shared",
+          "kind": "semantic",
+          "lifecycle": "active"
+        },
+        {
+          "memory_id": "mem_5507ae296d1e6797c130c84185fe6229",
+          "query": "的已证据化摘",
+          "found": false,
+          "rank": null,
+          "returned": 80,
+          "scope": "shared",
+          "kind": "semantic",
+          "lifecycle": "active"
+        },
+        {
+          "memory_id": "mem_fdfb5bef1187c6b40e9124a69a8bf888",
+          "query": "的已证据化摘",
+          "found": false,
+          "rank": null,
+          "returned": 80,
+          "scope": "shared",
+          "kind": "semantic",
+          "lifecycle": "active"
+        },
+        {
+          "memory_id": "mem_bcef6dffd1faefd476ab190b82a2968c",
+          "query": "的已证据化摘",
+          "found": false,
+          "rank": null,
+          "returned": 80,
+          "scope": "shared",
+          "kind": "semantic",
+          "lifecycle": "active"
+        },
+        {
+          "memory_id": "mem_fb6e21c161a295487b0148ba671a8e9f",
+          "query": "的已证据化摘",
+          "found": false,
+          "rank": null,
+          "returned": 80,
+          "scope": "shared",
+          "kind": "semantic",
+          "lifecycle": "active"
+        },
+        {
+          "memory_id": "mem_20ee47d07a3944fcb48b0ce535a3e6c3",
+          "query": "的已证据化摘",
+          "found": false,
+          "rank": null,
+          "returned": 80,
+          "scope": "shared",
+          "kind": "semantic",
+          "lifecycle": "active"
+        },
+        {
+          "memory_id": "mem_3a1f909182d6c2ab0bc96d33b7919c5d",
+          "query": "的已证据化摘",
+          "found": true,
+          "rank": 80,
+          "returned": 80,
+          "scope": "shared",
+          "kind": "semantic",
+          "lifecycle": "active"
+        },
+        {
+          "memory_id": "mem_7d2f256814691b29bb0999bc1b17eb09",
+          "query": "的已证据化摘",
+          "found": true,
+          "rank": 41,
+          "returned": 80,
+          "scope": "shared",
+          "kind": "semantic",
+          "lifecycle": "active"
+        },
+        {
+          "memory_id": "mem_90dfe79550441f0f03022ab3c52c799b",
+          "query": "的已证据化摘",
+          "found": false,
+          "rank": null,
+          "returned": 80,
+          "scope": "shared",
+          "kind": "semantic",
+          "lifecycle": "active"
+        },
+        {
+          "memory_id": "mem_4d257192cfc4d600c0574bef78bf4a24",
+          "query": "的已证据化摘",
+          "found": false,
+          "rank": null,
+          "returned": 80,
+          "scope": "shared",
+          "kind": "semantic",
+          "lifecycle": "active"
+        },
+        {
+          "memory_id": "mem_46165a2052483eb7f2da4ff5b54feadd",
+          "query": "的已证据化摘",
+          "found": false,
+          "rank": null,
+          "returned": 80,
+          "scope": "shared",
+          "kind": "semantic",
+          "lifecycle": "active"
+        },
+        {
+          "memory_id": "mem_bad164530e15eead1b69702695453beb",
+          "query": "的已证据化摘",
+          "found": true,
+          "rank": 46,
+          "returned": 80,
+          "scope": "shared",
+          "kind": "semantic",
+          "lifecycle": "active"
+        },
+        {
+          "memory_id": "mem_08aa00b543374f1c18d5bd7cacfe9281",
+          "query": "的已证据化摘",
+          "found": false,
+          "rank": null,
+          "returned": 80,
+          "scope": "shared",
+          "kind": "semantic",
+          "lifecycle": "active"
+        },
+        {
+          "memory_id": "mem_5ce4f83d8ba0f3dd62e9a16b690cfc90",
+          "query": "的已证据化摘",
+          "found": false,
+          "rank": null,
+          "returned": 80,
+          "scope": "shared",
+          "kind": "semantic",
+          "lifecycle": "active"
+        },
+        {
+          "memory_id": "mem_2635be84a2314ac8732340251fced256",
+          "query": "的已证据化摘",
+          "found": false,
+          "rank": null,
+          "returned": 80,
+          "scope": "shared",
+          "kind": "semantic",
+          "lifecycle": "active"
+        },
+        {
+          "memory_id": "mem_01f0d1346eb7c782dd1fcd88529e7487",
+          "query": "的已证据化摘",
+          "found": false,
+          "rank": null,
+          "returned": 80,
+          "scope": "shared",
+          "kind": "semantic",
+          "lifecycle": "active"
+        },
+        {
+          "memory_id": "mem_bd670cd08ce767c1a68a600676f52fb4",
+          "query": "的已证据化摘",
+          "found": false,
+          "rank": null,
+          "returned": 80,
+          "scope": "shared",
+          "kind": "semantic",
+          "lifecycle": "active"
+        },
+        {
+          "memory_id": "mem_91f43b52c32db4decabf6f1b1e6eb43c",
+          "query": "的已证据化摘",
+          "found": true,
+          "rank": 68,
+          "returned": 80,
+          "scope": "agent:deepseek",
+          "kind": "semantic",
+          "lifecycle": "active"
+        },
+        {
+          "memory_id": "mem_4dc5a8b71d6792a28d732966ab68be85",
+          "query": "的已证据化摘",
+          "found": false,
+          "rank": null,
+          "returned": 80,
+          "scope": "shared",
+          "kind": "semantic",
+          "lifecycle": "active"
+        },
+        {
+          "memory_id": "mem_755720dece2d6f9a4e82b3498a0c6b06",
+          "query": "的已证据化摘",
+          "found": false,
+          "rank": null,
+          "returned": 80,
+          "scope": "shared",
+          "kind": "semantic",
+          "lifecycle": "active"
+        }
+      ]
+    },
+    "archive": {
+      "path": "/Users/zps/Library/Application Support/HippoMind/hippomind.raw-archive/dedupe-20261019T164641Z-91b1e77b38f0.jsonl.gz",
+      "bytes": 199002193,
+      "sha256": "c23cecf679661bb39a3b0197b0246bc9035d9667699d289d53c57c338c502c87",
+      "lines": 1344314,
+      "bad_json_lines": 0,
+      "missing_id_lines": 0,
+      "empty_content_lines": 0,
+      "reasons": {
+        "duplicate": 1344314
+      },
+      "full_decompress_ok": true,
+      "sample_size": 20,
+      "sample_recoverable": 0,
+      "sample_details": [
+        {
+          "memory_id": "mem_496fcf98fb9c02128111b7e8f95309bb",
+          "event_id": "evt_496fcf98fb9c02128111b7e8f95309bb",
+          "content_chars": 52,
+          "content_sha256": "496fcf98fb9c02128111b7e8f95309bb05a2b4fbc5462443d5e26b8c992c70ec",
+          "reason": "duplicate",
+          "created_at": "2026-08-11T15:41:13.865000+00:00",
+          "row_still_in_db": false,
+          "event_still_in_db": false,
+          "survivor_memory_id": null,
+          "content_identical_to_survivor": false,
+          "recoverable": false
+        },
+        {
+          "memory_id": "mem_506eb928ebd9efde8d8711a8862099d6",
+          "event_id": "evt_506eb928ebd9efde8d8711a8862099d6",
+          "content_chars": 45,
+          "content_sha256": "506eb928ebd9efde8d8711a8862099d6648d3a4ba90552e1011d4698b69bf89b",
+          "reason": "duplicate",
+          "created_at": "2026-08-15T02:52:43.561000+00:00",
+          "row_still_in_db": false,
+          "event_still_in_db": false,
+          "survivor_memory_id": null,
+          "content_identical_to_survivor": false,
+          "recoverable": false
+        },
+        {
+          "memory_id": "mem_5748dd682bebe1ac3a7446e8deb56aea",
+          "event_id": "evt_5748dd682bebe1ac3a7446e8deb56aea",
+          "content_chars": 56,
+          "content_sha256": "5748dd682bebe1ac3a7446e8deb56aeae94d8e532b5ab5f6cd6283184b2a2cd0",
+          "reason": "duplicate",
+          "created_at": "2026-08-16T11:37:17.881000+00:00",
+          "row_still_in_db": false,
+          "event_still_in_db": false,
+          "survivor_memory_id": null,
+          "content_identical_to_survivor": false,
+          "recoverable": false
+        },
+        {
+          "memory_id": "mem_72b54b284065066db32f61dbfe7eb80c",
+          "event_id": "evt_72b54b284065066db32f61dbfe7eb80c",
+          "content_chars": 48,
+          "content_sha256": "72b54b284065066db32f61dbfe7eb80cc3e59236a35e6fd10303908599b0fa51",
+          "reason": "duplicate",
+          "created_at": "2026-08-12T00:33:16.883000+00:00",
+          "row_still_in_db": false,
+          "event_still_in_db": false,
+          "survivor_memory_id": null,
+          "content_identical_to_survivor": false,
+          "recoverable": false
+        },
+        {
+          "memory_id": "mem_1b2f2883ebaced1ca374f6990f7bf1e4",
+          "event_id": "evt_1b2f2883ebaced1ca374f6990f7bf1e4",
+          "content_chars": 3994,
+          "content_sha256": "1b2f2883ebaced1ca374f6990f7bf1e4dd484013d535224301bb1464fe39503e",
+          "reason": "duplicate",
+          "created_at": "2026-08-14T16:59:05.701000+00:00",
+          "row_still_in_db": false,
+          "event_still_in_db": false,
+          "survivor_memory_id": null,
+          "content_identical_to_survivor": false,
+          "recoverable": false
+        },
+        {
+          "memory_id": "mem_915dc9e37b008455357488c583292065",
+          "event_id": "evt_915dc9e37b008455357488c583292065",
+          "content_chars": 38,
+          "content_sha256": "915dc9e37b008455357488c583292065c1a535e616153f4519dd620969bfdf95",
+          "reason": "duplicate",
+          "created_at": "2026-08-11T15:19:00.975000+00:00",
+          "row_still_in_db": false,
+          "event_still_in_db": false,
+          "survivor_memory_id": null,
+          "content_identical_to_survivor": false,
+          "recoverable": false
+        },
+        {
+          "memory_id": "mem_cda07530bfe0efbd3130411d936ae22d",
+          "event_id": "evt_cda07530bfe0efbd3130411d936ae22d",
+          "content_chars": 49,
+          "content_sha256": "cda07530bfe0efbd3130411d936ae22d715c9f6588cf93dc7d2a3404dde8d45c",
+          "reason": "duplicate",
+          "created_at": "2026-08-10T06:22:09.185000+00:00",
+          "row_still_in_db": false,
+          "event_still_in_db": false,
+          "survivor_memory_id": null,
+          "content_identical_to_survivor": false,
+          "recoverable": false
+        },
+        {
+          "memory_id": "mem_2e683e1b7da9955cfb95b15d32096030",
+          "event_id": "evt_2e683e1b7da9955cfb95b15d32096030",
+          "content_chars": 63,
+          "content_sha256": "2e683e1b7da9955cfb95b15d32096030b5203d8b8214b9a411e5bb3b6179869c",
+          "reason": "duplicate",
+          "created_at": "2026-08-14T17:54:45.822000+00:00",
+          "row_still_in_db": false,
+          "event_still_in_db": false,
+          "survivor_memory_id": null,
+          "content_identical_to_survivor": false,
+          "recoverable": false
+        },
+        {
+          "memory_id": "mem_c70e32f743291f2625da597163671ba5",
+          "event_id": "evt_c70e32f743291f2625da597163671ba5",
+          "content_chars": 52,
+          "content_sha256": "c70e32f743291f2625da597163671ba56a6c51dd34a9b8177942e1ccafef6eeb",
+          "reason": "duplicate",
+          "created_at": "2026-08-14T19:15:21.843000+00:00",
+          "row_still_in_db": false,
+          "event_still_in_db": false,
+          "survivor_memory_id": null,
+          "content_identical_to_survivor": false,
+          "recoverable": false
+        },
+        {
+          "memory_id": "mem_e7c906b0113658356228c60b950aa556",
+          "event_id": "evt_e7c906b0113658356228c60b950aa556",
+          "content_chars": 48,
+          "content_sha256": "e7c906b0113658356228c60b950aa5562e637dbc9159990c585e28221d1df247",
+          "reason": "duplicate",
+          "created_at": "2026-08-17T03:52:09.448000+00:00",
+          "row_still_in_db": false,
+          "event_still_in_db": false,
+          "survivor_memory_id": null,
+          "content_identical_to_survivor": false,
+          "recoverable": false
+        },
+        {
+          "memory_id": "mem_40f2946a4ec9738d31121746bfa85ebf",
+          "event_id": "evt_40f2946a4ec9738d31121746bfa85ebf",
+          "content_chars": 46,
+          "content_sha256": "40f2946a4ec9738d31121746bfa85ebf88d8ca53597eb1cde4ca78efb48fc928",
+          "reason": "duplicate",
+          "created_at": "2026-08-11T15:42:14.611000+00:00",
+          "row_still_in_db": false,
+          "event_still_in_db": false,
+          "survivor_memory_id": null,
+          "content_identical_to_survivor": false,
+          "recoverable": false
+        },
+        {
+          "memory_id": "mem_35acb05adf8599bd69b5a92846d156bf",
+          "event_id": "evt_35acb05adf8599bd69b5a92846d156bf",
+          "content_chars": 109,
+          "content_sha256": "35acb05adf8599bd69b5a92846d156bf063a323148f84a792c524cb2f76369b3",
+          "reason": "duplicate",
+          "created_at": "2026-08-27T01:12:08.371000+00:00",
+          "row_still_in_db": false,
+          "event_still_in_db": false,
+          "survivor_memory_id": null,
+          "content_identical_to_survivor": false,
+          "recoverable": false
+        },
+        {
+          "memory_id": "mem_b733d4ff3fa41fa4e0746d0c9714cfa8",
+          "event_id": "evt_b733d4ff3fa41fa4e0746d0c9714cfa8",
+          "content_chars": 50,
+          "content_sha256": "b733d4ff3fa41fa4e0746d0c9714cfa88dcf434191869bbe25c6403ee0c4b2b1",
+          "reason": "duplicate",
+          "created_at": "2026-08-16T10:06:40.146000+00:00",
+          "row_still_in_db": false,
+          "event_still_in_db": false,
+          "survivor_memory_id": null,
+          "content_identical_to_survivor": false,
+          "recoverable": false
+        },
+        {
+          "memory_id": "mem_b6848f4aba2ab7c9308753dfc3e17d4e",
+          "event_id": "evt_b6848f4aba2ab7c9308753dfc3e17d4e",
+          "content_chars": 49,
+          "content_sha256": "b6848f4aba2ab7c9308753dfc3e17d4ea162e4fe1c7e8541f2a064c2c8817ea0",
+          "reason": "duplicate",
+          "created_at": "2026-08-12T00:32:36.741000+00:00",
+          "row_still_in_db": false,
+          "event_still_in_db": false,
+          "survivor_memory_id": null,
+          "content_identical_to_survivor": false,
+          "recoverable": false
+        },
+        {
+          "memory_id": "mem_db0eed286530b2a1cf11d547285dfc2c",
+          "event_id": "evt_db0eed286530b2a1cf11d547285dfc2c",
+          "content_chars": 9,
+          "content_sha256": "db0eed286530b2a1cf11d547285dfc2c68e5c5b5da138732322ecb44893629ba",
+          "reason": "duplicate",
+          "created_at": "2026-08-10T14:57:38.973000+00:00",
+          "row_still_in_db": false,
+          "event_still_in_db": false,
+          "survivor_memory_id": null,
+          "content_identical_to_survivor": false,
+          "recoverable": false
+        },
+        {
+          "memory_id": "mem_66764aaa4289358faf51f11a5a41c2f9",
+          "event_id": "evt_66764aaa4289358faf51f11a5a41c2f9",
+          "content_chars": 69,
+          "content_sha256": "66764aaa4289358faf51f11a5a41c2f9234768cafa25beed4aec2f49b44370cf",
+          "reason": "duplicate",
+          "created_at": "2026-08-11T16:22:50.357000+00:00",
+          "row_still_in_db": false,
+          "event_still_in_db": false,
+          "survivor_memory_id": null,
+          "content_identical_to_survivor": false,
+          "recoverable": false
+        },
+        {
+          "memory_id": "mem_fd4b30574475762b4383739a3728e754",
+          "event_id": "evt_fd4b30574475762b4383739a3728e754",
+          "content_chars": 51,
+          "content_sha256": "fd4b30574475762b4383739a3728e75448d8ac8f16f29b6b63a8c131a6bf1f04",
+          "reason": "duplicate",
+          "created_at": "2026-08-14T19:46:11.991000+00:00",
+          "row_still_in_db": false,
+          "event_still_in_db": false,
+          "survivor_memory_id": null,
+          "content_identical_to_survivor": false,
+          "recoverable": false
+        },
+        {
+          "memory_id": "mem_6b604f71e392042555634301514a4ef9",
+          "event_id": "evt_6b604f71e392042555634301514a4ef9",
+          "content_chars": 48,
+          "content_sha256": "6b604f71e392042555634301514a4ef99e9355086694ed942ce1f446fdb9c438",
+          "reason": "duplicate",
+          "created_at": "2026-08-14T17:21:53.559000+00:00",
+          "row_still_in_db": false,
+          "event_still_in_db": false,
+          "survivor_memory_id": null,
+          "content_identical_to_survivor": false,
+          "recoverable": false
+        },
+        {
+          "memory_id": "mem_5905ac3bc3e87834533b2bc1e867d175",
+          "event_id": "evt_5905ac3bc3e87834533b2bc1e867d175",
+          "content_chars": 57,
+          "content_sha256": "5905ac3bc3e87834533b2bc1e867d175aff20c742757caac447383c7ba0e8cee",
+          "reason": "duplicate",
+          "created_at": "2026-08-11T15:41:13.857000+00:00",
+          "row_still_in_db": false,
+          "event_still_in_db": false,
+          "survivor_memory_id": null,
+          "content_identical_to_survivor": false,
+          "recoverable": false
+        },
+        {
+          "memory_id": "mem_32479afe74f18cba6a5c3eaa7673d2b6",
+          "event_id": "evt_32479afe74f18cba6a5c3eaa7673d2b6",
+          "content_chars": 52,
+          "content_sha256": "32479afe74f18cba6a5c3eaa7673d2b6c1c7797e70dc01a2356dd56630a23365",
+          "reason": "duplicate",
+          "created_at": "2026-08-14T17:33:14.315000+00:00",
+          "row_still_in_db": false,
+          "event_still_in_db": false,
+          "survivor_memory_id": null,
+          "content_identical_to_survivor": false,
+          "recoverable": false
+        }
+      ],
+      "elapsed_seconds": 5.3
+    },
+    "recorded_at": "2026-10-19T17:11:26.841324+00:00"
+  }
+}
