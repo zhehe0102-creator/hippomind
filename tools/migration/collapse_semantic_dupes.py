@@ -48,7 +48,7 @@ def _ro(path: str) -> sqlite3.Connection:
 
 def plan(conn: sqlite3.Connection) -> dict:
     """Return the survivor/duplicate split without touching anything."""
-    rows = conn.execute(f"""
+    rows = conn.execute("""
         SELECT memory_id, content, scope, task_id, project, lifecycle, created_at
         FROM memories WHERE kind='semantic'
         ORDER BY content, scope, task_id, project,

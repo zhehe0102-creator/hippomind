@@ -685,16 +685,19 @@ def run_recall_ab(live_db: Path, control_db: Path,
             "recalled", "recalled_content_equivalent", "at_rank_1", "distinct_queries")},
         "parity": (control["recalled_content_equivalent"]
                    == live["recalled_content_equivalent"]),
-        "details": [{"memory_id": c["memory_id"], "query": c["query"],
-                     "control_rank": c["rank"], "live_rank": l["rank"],
-                     "control_equiv": c.get("content_equivalent"),
-                     "live_equiv": l.get("content_equivalent")}
-                    for c, l in zip(control["details"], live["details"])],
+        "details": [{"memory_id": control_row["memory_id"],
+                     "query": control_row["query"],
+                     "control_rank": control_row["rank"],
+                     "live_rank": live_row["rank"],
+                     "control_equiv": control_row.get("content_equivalent"),
+                     "live_equiv": live_row.get("content_equivalent")}
+                    for control_row, live_row in zip(control["details"], live["details"])],
     }
 
 
 def run_verify(db_path: Path, expected_archive: str,
-               baseline: Dict[str, Any], *, sample_size: int = 20) -> Dict[str, Any]:
+               baseline: Dict[str, Any], *, sample_size: int = 20,
+               control_db: Optional[Path] = None) -> Dict[str, Any]:
     from hippomind.ledger import SQLiteLedger
 
     out: Dict[str, Any] = {"step": "verify", "samples": sample_size}
@@ -752,6 +755,14 @@ def run_verify(db_path: Path, expected_archive: str,
         out["archive"] = verify_archive(db_path, archive, sample_size)
     else:
         out["archive"] = {"error": f"archive not found: {expected_archive}"}
+
+    # ---- A/B recall parity against the pre-compaction control ------------
+    if control_db and Path(control_db).is_file():
+        out["recall_ab"] = run_recall_ab(db_path, Path(control_db), sample_size)
+        out["provenance_gap"] = provenance_gap(Path(control_db))
+    else:
+        out["recall_ab"] = {"skipped": "no control db supplied"}
+        out["provenance_gap"] = {"skipped": "no control db supplied"}
 
     out["recorded_at"] = datetime.now(timezone.utc).isoformat()
     return out
@@ -982,6 +993,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--ttl-days", type=int, default=DEFAULT_TTL_DAYS)
     parser.add_argument("--state", default=str(DEFAULT_STATE))
     parser.add_argument("--samples", type=int, default=20)
+    parser.add_argument("--control", default="",
+                        help="pre-compaction copy used for the A/B recall parity check")
     parser.add_argument("--json", dest="json_out", default="")
     args = parser.parse_args(argv)
 
@@ -1032,7 +1045,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             raise SystemExit("no archive_path recorded in state; run execute first")
         baseline = state.get("baseline_fts_sync") or {
             "fts_sync": (state.get("verify") or {}).get("baseline_fts_sync")}
-        result = run_verify(db_path, archive, baseline, sample_size=args.samples)
+        result = run_verify(db_path, archive, baseline, sample_size=args.samples,
+                            control_db=Path(args.control).expanduser() if args.control else None)
         emit("verify", result)
         ok = (result["integrity_check"]["ok"]
               and result["duplicates_eliminated"]
@@ -1070,7 +1084,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     for item in exe.get("steps", []):
         archive = (item.get("result") or {}).get("archive_path") or archive
     ver = run_verify(db_path, archive, {"fts_sync": state.get("baseline_fts_sync")},
-                     sample_size=args.samples)
+                     sample_size=args.samples,
+                     control_db=Path(args.control).expanduser() if args.control else None)
     state["verify"] = ver
     save_state(state_path, state)
     print(json.dumps({"verify": {
