@@ -863,6 +863,12 @@ class SQLiteLedger:
         evidence = [sanitize_chat_content(ref, limit=512)[0] for ref in evidence]
         fts_content = _fts_text(content, metadata)
         now = utc_now()
+        # An *explicit* observation time is meaningful identity: the append-only
+        # contract says "same record at a new observation time is a new event".
+        # A time derived from ``utc_now()`` is capture drift and must not be
+        # hashed, or every re-report becomes a new row (the 1.47M-row storm).
+        explicit_valid_from = bool(str(record.get("valid_from", "") or "").strip())
+        explicit_observed_at = bool(str(timestamp_value or "").strip())
         valid_from = _timestamp(record.get("valid_from", occurred_at))
         valid_until = _short(record.get("valid_until", ""), 80)
         if valid_until:
@@ -908,6 +914,10 @@ class SQLiteLedger:
                 "content": normalise_for_dedup(content),
             }
         else:
+            # ``role`` and ``evidence`` are deliberately absent: an agent that
+            # re-reports the same decision with a fresh evidence id is repeating
+            # itself, not making a new observation.  Keeping ``valid_from``
+            # preserves genuine bitemporal history (same sentence, new time).
             identity = {
                 "class": "structured",
                 "kind": kind,
@@ -916,11 +926,12 @@ class SQLiteLedger:
                 "external_id": external_id,
                 "task_id": task_id,
                 "project": project,
-                "role": role,
                 "scope": scope,
-                "valid_from": valid_from,
+                # Only an explicitly supplied observation time identifies a
+                # distinct bitemporal observation. When it is derived from "now"
+                # it is capture drift: hashing it made every re-report a new row.
+                "valid_from": (valid_from if (explicit_valid_from or explicit_observed_at) else ""),
                 "valid_until": valid_until,
-                "evidence": evidence,
                 "content": normalise_for_dedup(content),
             }
         content_hash = _hash(_json(identity, "ingest identity", MAX_CONTENT_CHARS + 8_000))
@@ -1577,6 +1588,7 @@ class SQLiteLedger:
                  raw_archive_dir: Optional[os.PathLike] = None,
                  raw_archive_max_bytes: int = DEFAULT_RAW_ARCHIVE_MAX_BYTES,
                  archive_raw: bool = True,
+                 auto_vacuum_min_bytes: int = DEFAULT_AUTO_VACUUM_MIN_BYTES,
                  events_keep: int = 100_000) -> Dict[str, Any]:
         """Decay projections, expire facts and cold-archive low-value rows.
 
@@ -1813,7 +1825,16 @@ class SQLiteLedger:
         # moves freed pages to the freelist but never returns them to the OS
         # unless VACUUM runs, so a ledger could delete 1.4M rows and stay 4.48GB.
         result["storage"] = self._storage_report()
-        result["auto_vacuum"] = self._maybe_auto_vacuum(result["storage"])
+        result["auto_vacuum"] = self._maybe_auto_vacuum(
+            result["storage"],
+            min_reclaimable_bytes=_clamp_int(
+                auto_vacuum_min_bytes, DEFAULT_AUTO_VACUUM_MIN_BYTES, 0, 64 * 1024 * 1024 * 1024),
+            # Only the tier that can actually free pages is allowed to reclaim
+            # them.  A full VACUUM is a whole-file rewrite; running it on a
+            # maintenance tick that deleted nothing rewrites a multi-GB file for
+            # no reason and starves concurrent readers.  ``purge_raw`` is the
+            # delete-capable pass, so it owns the shrink.
+            allow=bool(purge_raw))
         if result["auto_vacuum"].get("vacuumed"):
             # Re-measure: the point of the pass was to change these numbers.
             result["storage"] = self._storage_report()
@@ -1842,6 +1863,7 @@ class SQLiteLedger:
     def _maybe_auto_vacuum(self, storage: Mapping[str, Any], *,
                            min_reclaimable_bytes: int = DEFAULT_AUTO_VACUUM_MIN_BYTES,
                            freelist_ratio: float = DEFAULT_AUTO_VACUUM_FREELIST_RATIO,
+                           allow: bool = True,
                            dry_run: bool = False) -> Dict[str, Any]:
         """Shrink the database file when deleted pages have piled up.
 
@@ -1870,6 +1892,9 @@ class SQLiteLedger:
             "after_bytes": int(storage.get("db_bytes", 0) or 0),
             "mode": "none", "dry_run": bool(dry_run),
         }
+        if not allow:
+            summary["reason"] = "no delete pass this cycle"
+            return summary
         if not storage:
             summary["reason"] = "storage unavailable"
             return summary

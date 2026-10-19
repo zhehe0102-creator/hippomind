@@ -37,6 +37,11 @@ class MemoryHubAgentAdapter:
                                       scope=str(scope or "shared")[:128] or "shared")
         self.ledger = ledger or SQLiteLedger(ledger_path or None)
         self.contexts = ContextPackBuilder(self.ledger)
+        #: Most recent record written through this adapter.  Used to link the
+        #: next record as its causal child, which is what populates
+        #: ``memory_relations`` — that table was measured at 0 rows on a live
+        #: 1.5M-row ledger, so the whole causal-explanation feature was dead code.
+        self._last_memory_id: str = ""
 
     def begin_task(self, query: str, *, max_items: int = 8, max_chars: int = DEFAULT_MAX_CHARS,
                    source_agents: Sequence[str] = (), debug: bool = False) -> Dict[str, Any]:
@@ -57,13 +62,26 @@ class MemoryHubAgentAdapter:
                importance: int = 5, confidence: float = 0.5) -> IngestResult:
         data = dict(metadata or {})
         data["lifecycle_adapter"] = self.identity.source_agent
-        return self.ledger.ingest({
+        payload = {
             "kind": kind, "content": content, "source_agent": self.identity.source_agent,
             "session_id": self.identity.session_id, "task_id": self.identity.task_id,
             "project": self.identity.project, "scope": self.identity.scope, "role": role,
             "evidence": list(evidence), "context": dict(context or {}), "tags": list(tags),
             "metadata": data, "importance": importance, "confidence": confidence,
-        })
+        }
+        # Link the new record to the previous one from this adapter, so a
+        # progress -> decision -> result sequence carries an explainable causal
+        # chain instead of being a bag of unrelated rows.  Bounded to a single
+        # parent: a long chain is reconstructible by walking it, and inventing
+        # extra edges would make ``causal_ancestors`` expensive for no gain.
+        previous = self._last_memory_id
+        if previous and not data.get("causal_parents"):
+            payload["causal_parents"] = [{"memory_id": previous,
+                                           "relation_type": "follows"}]
+        result = self.ledger.ingest(payload)
+        if result.inserted:
+            self._last_memory_id = result.memory_id
+        return result
 
     def checkpoint(self, progress: str, *, evidence: Iterable[str], next_steps: Iterable[str] = ()) -> IngestResult:
         return self.record("progress", progress, evidence=evidence,
