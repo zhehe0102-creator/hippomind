@@ -16,3 +16,6 @@ tmp/
 *.bak.hippomind
 *.egg-info/
 BASELINE_*.md
+
+# macOS AppleDouble metadata on external (exFAT/FAT) volumes
+._*
