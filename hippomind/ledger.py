@@ -30,7 +30,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 from collections import deque
 
-from .textutil import informative_ratio, is_noise_text, token_sim
+from .textutil import (content_fingerprint, informative_ratio, is_noise_text,
+                       normalise_for_dedup, token_sim)
 from .sanitize import MAX_ARCHIVE_MESSAGE_CHARS, sanitize_chat_content
 
 
@@ -1111,14 +1112,54 @@ class SQLiteLedger:
         causal_parents = _normalise_causal_parents(record, metadata)
         quality_score = _quality_score(kind, content, evidence, metadata, raw_chat)
         quality_state = "accepted" if quality_score >= QUALITY_ACCEPT_THRESHOLD else "quarantine"
-        canonical = _json({
-            "kind": kind, "source_agent": source_agent, "session_id": session_id,
-            "external_id": external_id, "task_id": task_id, "project": project,
-            "role": role, "scope": scope, "occurred_at": occurred_at,
-            "valid_from": valid_from, "valid_until": valid_until,
-            "evidence": evidence, "content": content, "metadata": metadata,
-        }, "canonical ingest", MAX_CONTENT_CHARS + 8_000)
-        content_hash = _hash(canonical)
+        # ------------------------------------------------------------------
+        # Stable identity key
+        # ------------------------------------------------------------------
+        # The previous canonical form hashed ``occurred_at``, ``valid_from`` and
+        # the whole metadata blob.  For raw chat that meant the *same* message
+        # re-captured on a later watcher pass produced a different hash every
+        # time, so de-duplication never fired: the live ledger held 1,475,584 raw
+        # rows whose content_hash were all distinct, while a single session's
+        # 70,508 rows contained only 3,573 unique messages.
+        #
+        # Identity is now split by record class:
+        #
+        #   * Raw evidence (chat / tool output / system message) is identified by
+        #     *what it says*, not when it was captured:
+        #         source_agent | session_id | role | normalised content
+        #
+        #   * Structured records (fact/decision/progress/...) keep a semantic key
+        #     that still includes the observation time, because the same sentence
+        #     asserted at two different times is legitimately two observations
+        #     (bi-temporal history).  Only volatile capture metadata is excluded.
+        #
+        # ``content_hash`` remains the dedup key; ``canonical`` is retained as
+        # the human-auditable description of what was ingested.
+        if raw_chat:
+            identity = {
+                "class": "raw",
+                "source_agent": source_agent,
+                "session_id": session_id,
+                "role": role,
+                "content": normalise_for_dedup(content),
+            }
+        else:
+            identity = {
+                "class": "structured",
+                "kind": kind,
+                "source_agent": source_agent,
+                "session_id": session_id,
+                "external_id": external_id,
+                "task_id": task_id,
+                "project": project,
+                "role": role,
+                "scope": scope,
+                "valid_from": valid_from,
+                "valid_until": valid_until,
+                "evidence": evidence,
+                "content": normalise_for_dedup(content),
+            }
+        content_hash = _hash(_json(identity, "ingest identity", MAX_CONTENT_CHARS + 8_000))
         event_id = "evt_" + content_hash[:32]
         memory_id = "mem_" + content_hash[:32]
         evidence_json = _json(evidence, "evidence")
@@ -1766,6 +1807,8 @@ class SQLiteLedger:
     def maintain(self, active_limit: int = 2_000, cold_after_days: int = 90,
                  decay_per_day: float = 0.008, raw_active_limit: int = DEFAULT_RAW_CAPACITY,
                  raw_after_days: int = DEFAULT_RAW_RETENTION_DAYS, *,
+                 raw_ttl_days: Optional[int] = None,
+                 purge_raw: bool = False,
                  raw_capacity: Optional[int] = None,
                  raw_archive_dir: Optional[os.PathLike] = None,
                  raw_archive_max_bytes: int = DEFAULT_RAW_ARCHIVE_MAX_BYTES,
@@ -1781,6 +1824,18 @@ class SQLiteLedger:
         decay_per_day = _clamp_float(decay_per_day, 0.008, 0.0, 1.0)
         raw_active_limit = _clamp_int(raw_active_limit, DEFAULT_RAW_CAPACITY, 100, 1_000_000)
         raw_after_days = _clamp_int(raw_after_days, DEFAULT_RAW_RETENTION_DAYS, 1, 36500)
+        # ``raw_ttl_days`` is the *deletion* horizon and is intentionally separate
+        # from ``raw_after_days`` (the point at which a raw row stops being hot).
+        # Before this existed, "retention" only demoted rows to cold and the file
+        # grew without bound: 1.47M raw messages, 4.48GB, on a 2-month-old ledger.
+        #
+        # ``purge_raw`` defaults to False: demoting to ``cold`` keeps a row
+        # auditable through ``search(include_cold=True)``, which is the documented
+        # storage contract and what existing callers assert.  Long-running
+        # deployments that must bound file growth (the daemon) opt in explicitly.
+        raw_ttl_days = _clamp_int(
+            raw_ttl_days if raw_ttl_days is not None else max(raw_after_days, 90),
+            max(raw_after_days, 90), 1, 36500)
         if raw_capacity is not None:
             # ``raw_capacity`` is the public policy name; retain the older
             # ``raw_active_limit`` argument for callers of the v0.7 API.
@@ -1975,7 +2030,31 @@ class SQLiteLedger:
                                "raw_archive_error": str(exc)[:300]})
         else:
             result.update({"raw_compressed": 0, "raw_archive_deferred": True})
+        # Second pass: physically drop raw evidence past the deletion horizon.
+        # Runs outside the write transaction (file IO must not hold the WAL lock)
+        # and is fail-closed: nothing is deleted unless the archive verified.
+        if purge_raw:
+            try:
+                result["raw_purged"] = self.purge_expired_raw(
+                    before_days=raw_ttl_days,
+                    archive_dir=raw_archive_dir,
+                    max_bytes=raw_archive_max_bytes,
+                )
+            except (OSError, sqlite3.Error, LedgerError) as exc:
+                result["raw_purged"] = {"purged": 0, "error": str(exc)[:300]}
+        else:
+            result["raw_purged"] = {"purged": 0, "deferred": True}
+        # Reclaim file space when a large deletion just happened.  Skipping this
+        # left 98.8% of a 754MB file as empty pages in the earlier audit.
+        try:
+            pages = self._connect().execute("PRAGMA page_count").fetchone()[0]
+            free = self._connect().execute("PRAGMA freelist_count").fetchone()[0]
+            result["storage"] = {"page_count": int(pages), "freelist": int(free),
+                                 "reclaimable_bytes": int(free) * 4096}
+        except sqlite3.Error:
+            pass
         result["raw_retention_days"] = raw_after_days
+        result["raw_ttl_days"] = raw_ttl_days
         result["raw_capacity"] = raw_active_limit
         return result
 
@@ -2006,6 +2085,162 @@ class SQLiteLedger:
                 truncated += int(was_truncated)
         return {"scanned": scanned, "affected": affected,
                 "redactions": redactions, "truncated": truncated}
+
+    def purge_expired_raw(self, *, before_days: int = DEFAULT_RAW_RETENTION_DAYS,
+                          archive_dir: Optional[os.PathLike] = None,
+                          max_bytes: int = DEFAULT_RAW_ARCHIVE_MAX_BYTES,
+                          batch_size: int = 2_000,
+                          dry_run: bool = False) -> Dict[str, Any]:
+        """Physically drop raw evidence past its retention window.
+
+        This is the tier that was missing.  ``maintain`` moved old raw rows to
+        ``lifecycle='cold'`` and ``archive_raw_evidence`` wrote a compressed copy,
+        but **nothing ever deleted a row**, so a 2-month-old ledger held 1.47M raw
+        messages and 4.48GB of file.  A retention policy that never deletes is a
+        rota that never rotates.
+
+        Contract (strictly fail-closed):
+        1. Select rows whose ``created_at`` is older than ``before_days``.
+        2. Write them to a compressed archive file and ``fsync`` it.
+        3. Re-read that exact file and confirm every selected ``memory_id`` is
+           present.
+        4. Only then delete the rows, in bounded batches, in one transaction.
+        Any failure in 2 or 3 leaves the database untouched and is reported in
+        ``error``; deletion is attempted on the next maintenance pass.
+
+        Returns counts only — never content — so it is safe to log.
+        """
+        before_days = _clamp_int(before_days, DEFAULT_RAW_RETENTION_DAYS, 1, 36_500)
+        max_bytes = _clamp_int(max_bytes, DEFAULT_RAW_ARCHIVE_MAX_BYTES, 1 << 20,
+                               2 * 1024 * 1024 * 1024)
+        batch_size = _clamp_int(batch_size, 2_000, 50, 20_000)
+        summary: Dict[str, Any] = {
+            "purge_candidates": 0, "purged": 0, "events_purged": 0,
+            "archive_path": "", "dry_run": bool(dry_run),
+            "retention_days": before_days,
+        }
+        cutoff_epoch = time.time() - before_days * 86_400
+        cutoff_iso = datetime.fromtimestamp(cutoff_epoch, tz=timezone.utc).isoformat()
+
+        with self._connect() as conn:
+            summary["purge_candidates"] = int(conn.execute(
+                "SELECT COUNT(*) FROM memories WHERE raw_chat=1 AND created_at<=?",
+                (cutoff_iso,),
+            ).fetchone()[0])
+        if dry_run or not summary["purge_candidates"]:
+            return summary
+
+        root = self._raw_archive_root(archive_dir)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        archive_path = root / f"purged-{stamp}-{_hash(str(self.path), str(cutoff_iso))[:12]}.jsonl.gz"
+
+        # ---- 1) stream the rows we are about to delete into the archive ----
+        selected: List[str] = []
+        selected_events: List[str] = []
+        try:
+            with gzip.open(archive_path, "wb") as handle:
+                after = ""
+                while True:
+                    with self._connect() as conn:
+                        batch = conn.execute("""
+                            SELECT m.memory_id,m.origin_event_id,m.content,m.source_agent,
+                                   m.session_id,m.task_id,m.project,m.role,m.scope,
+                                   m.evidence_json,m.created_at,m.metadata_json,
+                                   e.occurred_at,e.content_hash
+                            FROM memories AS m
+                            JOIN ledger_events AS e ON e.event_id=m.origin_event_id
+                            WHERE m.raw_chat=1 AND m.created_at<=? AND m.memory_id>?
+                            ORDER BY m.memory_id ASC LIMIT ?
+                        """, (cutoff_iso, after, batch_size)).fetchall()
+                    if not batch:
+                        break
+                    after = str(batch[-1]["memory_id"])
+                    for row in batch:
+                        payload = {
+                            "memory_id": row["memory_id"],
+                            "event_id": row["origin_event_id"],
+                            "content": row["content"],
+                            "content_sha256": row["content_hash"],
+                            "source_agent": row["source_agent"],
+                            "session_id": row["session_id"],
+                            "task_id": row["task_id"],
+                            "project": row["project"],
+                            "role": row["role"],
+                            "scope": row["scope"],
+                            "evidence": row["evidence_json"],
+                            "created_at": row["created_at"],
+                            "occurred_at": row["occurred_at"],
+                            "purged_at": utc_now(),
+                        }
+                        handle.write((json.dumps(payload, ensure_ascii=False,
+                                                 separators=(",", ":")) + "\n").encode("utf-8"))
+                        selected.append(str(row["memory_id"]))
+                        selected_events.append(str(row["origin_event_id"]))
+            try:
+                os.chmod(archive_path, 0o600)
+            except OSError:
+                pass
+            # Force the archive to disk before any row is removed.
+            with open(archive_path, "rb") as handle:
+                os.fsync(handle.fileno())
+        except (OSError, sqlite3.Error) as exc:
+            summary["error"] = f"archive failed: {type(exc).__name__}: {exc}"[:300]
+            summary["purged"] = 0
+            try:
+                archive_path.unlink()
+            except OSError:
+                pass
+            return summary
+
+        # ---- 2) verify the archive really contains every selected id -------
+        try:
+            found = set()
+            with gzip.open(archive_path, "rb") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    found.add(str(json.loads(line).get("memory_id", "")))
+            missing = set(selected) - found
+        except (OSError, ValueError) as exc:
+            summary["error"] = f"archive verify failed: {type(exc).__name__}: {exc}"[:300]
+            return summary
+        if missing:
+            summary["error"] = f"archive missing {len(missing)} rows; refusing to delete"
+            return summary
+
+        # ---- 3) delete only after the archive is proven complete -----------
+        def remove(conn: sqlite3.Connection) -> Dict[str, int]:
+            removed_events = 0
+            for start in range(0, len(selected), batch_size):
+                chunk = selected[start:start + batch_size]
+                events = selected_events[start:start + batch_size]
+                ph = ",".join("?" for _ in chunk)
+                eph = ",".join("?" for _ in events)
+                # Order matters: child rows first, projection, then the event that
+                # pins the projection through memories.origin_event_id.
+                conn.execute(f"DELETE FROM memory_fts WHERE memory_id IN ({ph})", chunk)
+                conn.execute(f"DELETE FROM memory_relations WHERE child_memory_id IN ({ph})", chunk)
+                conn.execute(f"DELETE FROM memory_relations WHERE parent_memory_id IN ({ph})", chunk)
+                conn.execute(f"DELETE FROM memory_claims WHERE memory_id IN ({ph})", chunk)
+                conn.execute(f"DELETE FROM memory_feedback WHERE memory_id IN ({ph})", chunk)
+                conn.execute(f"DELETE FROM memories WHERE memory_id IN ({ph})", chunk)
+                conn.execute(f"DELETE FROM ledger_events WHERE event_id IN ({eph})", events)
+                removed_events += len(events)
+            return {"events": removed_events}
+
+        try:
+            self._transaction(remove)
+        except (sqlite3.Error, LedgerError) as exc:
+            summary["error"] = f"delete failed after archive: {type(exc).__name__}: {exc}"[:300]
+            return summary
+
+        summary["purged"] = len(selected)
+        summary["events_purged"] = len(selected_events)
+        summary["archive_path"] = str(archive_path)
+        removed, remaining = self._prune_raw_archives(root, max_bytes)
+        summary["archives_pruned"] = removed
+        summary["archive_bytes"] = remaining
+        return summary
 
     def _raw_archive_root(self, archive_dir: Optional[os.PathLike] = None) -> Path:
         root = (Path(archive_dir).expanduser() if archive_dir else
@@ -2300,13 +2535,39 @@ class SQLiteLedger:
                 continue
             goal = (context.get("goal") or [f"任务 {key}"])[0]
             summary = f"任务 {key} 的已证据化摘要：{goal}"
+            sources = sorted({str(row["memory_id"]) for row in group})
+            # ------------------------------------------------------------------
+            # Idempotent consolidation
+            # ------------------------------------------------------------------
+            # ``consolidate`` used to re-ingest a freshly built summary whose
+            # metadata embedded the source ids *in row order*.  A stable content
+            # key therefore still differed on almost every idle pass, so the
+            # ledger accumulated 56,010 ``semantic`` rows holding just 142 distinct
+            # texts (one repeated 5,423 times).  The projection is now keyed by the
+            # source set, written once, and refreshed only when that set changes.
+            fingerprint = _hash("consolidate", key, group[0]["scope"], *sources)[:32]
+            marker = f"consolidation:{fingerprint}"
+            with self._connect() as conn:
+                already = conn.execute(
+                    "SELECT memory_id FROM memories WHERE kind='semantic' "
+                    "AND lifecycle IN ('active','cold') AND evidence_json LIKE ? "
+                    "AND quality_state='accepted' LIMIT 1",
+                    (f"%{marker}%",),
+                ).fetchone()
+            if already is not None:
+                continue
             result = self.ingest({
                 "kind": "semantic", "content": summary, "source_agent": "hippomindd",
                 "task_id": key if not key.startswith("project:") else "",
                 "project": group[0]["project"], "scope": group[0]["scope"],
-                "evidence": sorted(set(evidence))[:MAX_EVIDENCE], "context": context,
+                "evidence": [marker] + sources[:MAX_EVIDENCE - 1],
+                "context": context,
                 "confidence": min(0.95, 0.5 + 0.08 * len(group)), "importance": 7,
-                "metadata": {"consolidated_from": [row["memory_id"] for row in group]},
+                "valid_from": group[0]["created_at"] if "created_at" in group[0].keys() else "",
+                "metadata": {
+                    "consolidated_from": sources,
+                    "consolidation_fingerprint": fingerprint,
+                },
             })
             results.append(result)
         return results

@@ -469,7 +469,11 @@ class MemoryHubService:
         report: Dict[str, Any] = {"triggered_at": utc_now(),
                                   "idle_seconds": round(idle_for, 1)}
         try:
-            maintained = self.ledger.maintain(archive_raw=True)
+            # The daemon is the only component that runs unattended for weeks,
+            # so it is the one that must actually enforce the raw retention
+            # horizon.  Without purge_raw=True, "retention" only demotes rows to
+            # cold and the file grows forever (observed: 1.47M raw rows, 4.48GB).
+            maintained = self.ledger.maintain(archive_raw=True, purge_raw=True)
             report["consolidated"] = len(self.ledger.consolidate())
             report["decayed"] = maintained.get("decayed", 0)
             report["raw_compressed"] = maintained.get("raw_compressed", 0)
