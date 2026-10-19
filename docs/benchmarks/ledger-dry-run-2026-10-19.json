@@ -1,0 +1,90 @@
+{
+  "database": "/Users/zps/Library/Application Support/HippoMind/hippomind.sqlite",
+  "read_only": true,
+  "file_bytes": 4483260416,
+  "file_bytes_wal": 3024112,
+  "file_bytes_shm": 32768,
+  "schema_version": "8",
+  "journal_mode": "wal",
+  "page_size": 4096,
+  "page_count": 1094546,
+  "freelist_count": 9878,
+  "composition": [
+    {
+      "lifecycle": "active",
+      "raw_chat": false,
+      "rows": 5851,
+      "content_chars": 472088
+    },
+    {
+      "lifecycle": "cold",
+      "raw_chat": false,
+      "rows": 55206,
+      "content_chars": 5294529
+    },
+    {
+      "lifecycle": "active",
+      "raw_chat": true,
+      "rows": 1936,
+      "content_chars": 717443
+    },
+    {
+      "lifecycle": "cold",
+      "raw_chat": true,
+      "rows": 1473648,
+      "content_chars": 155273214
+    }
+  ],
+  "total_memories": 1536641,
+  "total_events": 1536641,
+  "bytes_by_column": {
+    "content": 161757274,
+    "evidence_json": 35887250,
+    "metadata_json": 805250862,
+    "tags_json": 3224522
+  },
+  "bytes_by_column_events": {
+    "content": 161757274,
+    "evidence_json": 35887250,
+    "metadata_json": 444207102
+  },
+  "raw_duplication": {
+    "redundant_rows": 1404190,
+    "duplicate_groups": 39345
+  },
+  "semantic_bloat": {
+    "rows": 56010,
+    "distinct_content": 142,
+    "redundant_rows": 55868
+  },
+  "raw_age": {
+    "oldest": "2026-08-09T12:32:59.132000+00:00",
+    "newest": "2026-10-02T09:50:38+00:00",
+    "rows_older_than_90d": 0
+  },
+  "unused_structures": {
+    "memory_claims": 0,
+    "memory_relations": 0,
+    "memory_feedback": 0
+  },
+  "fts_rows": 5691,
+  "fts_cold_leak": 0,
+  "planned_actions": [
+    {
+      "action": "collapse_raw_duplicates",
+      "rows_removed": 1404190,
+      "rationale": "同一会话内规范化后完全相同的原始消息只保留最早一条"
+    },
+    {
+      "action": "collapse_semantic_duplicates",
+      "rows_removed": 55868,
+      "rationale": "巩固自噬产生的同内容 semantic 摘要合并为一条（保留谱系）"
+    },
+    {
+      "action": "vacuum",
+      "rows_removed": 0,
+      "rationale": "回收删除后的空洞页；预计回收 freelist_count 页"
+    }
+  ],
+  "estimated_reclaim_bytes": 40460288
+}
