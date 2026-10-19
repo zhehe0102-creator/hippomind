@@ -26,8 +26,10 @@ _TOKEN_RE = re.compile(r"[a-z0-9_]+|[" + _CJK + r"]")
 # Wrapper markers emitted by agent harnesses around otherwise identical user
 # text.  They differ on every replay (timestamps, metadata blocks), which used to
 # make semantically identical messages hash differently and defeat de-duplication.
-_WRAPPER_PATTERNS = (
-    re.compile(r"<USER_REQUEST>.*?</USER_REQUEST>", re.S | re.I),
+#: Blocks whose *entire content* is volatile runtime state.  These are removed
+#: with their contents: keeping them would make two captures of the same request
+#: hash differently because the timestamp inside changed.
+_VOLATILE_BLOCK_PATTERNS = (
     re.compile(r"<ADDITIONAL_METADATA>.*?</ADDITIONAL_METADATA>", re.S | re.I),
     re.compile(r"<environment_context>.*?</environment_context>", re.S | re.I),
     re.compile(r"<environment-context>.*?</environment-context>", re.S | re.I),
@@ -36,6 +38,16 @@ _WRAPPER_PATTERNS = (
     re.compile(r"<current_time>.*?</current_time>", re.S | re.I),
     re.compile(r"<local_time>.*?</local_time>", re.S | re.I),
 )
+
+#: Tags that merely *wrap* real payload.  Only the tag itself is dropped so the
+#: user's actual sentence survives de-duplication.
+_WRAPPER_TAG_RE = re.compile(
+    r"</?(?:USER_REQUEST|user_request|USER_MESSAGE|HUMAN_MESSAGE)\s*/?>",
+    re.I,
+)
+
+#: Backwards-compatible aggregate: everything that is not payload.
+_WRAPPER_PATTERNS = _VOLATILE_BLOCK_PATTERNS + (_WRAPPER_TAG_RE,)
 #: Inline timestamps and clock-time phrases that carry no memory signal.
 _TIMESTAMP_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?"
@@ -82,10 +94,15 @@ def token_sim(a: str, b: str) -> float:
 
 
 def strip_wrappers(text: str) -> str:
-    """Remove harness wrapper elements that carry volatile per-run metadata."""
+    """Remove harness chrome while preserving the actual payload.
+
+    Volatile blocks are dropped entirely (their contents change every run);
+    wrapping tags are dropped but their contents are kept.
+    """
     cleaned = text or ""
-    for pattern in _WRAPPER_PATTERNS:
+    for pattern in _VOLATILE_BLOCK_PATTERNS:
         cleaned = pattern.sub(" ", cleaned)
+    cleaned = _WRAPPER_TAG_RE.sub(" ", cleaned)
     return cleaned
 
 

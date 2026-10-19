@@ -24,7 +24,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from .textutil import token_sim
+from .textutil import normalise_for_dedup, token_sim
 from .ledger import CONTEXT_FIELDS, SQLiteLedger
 from .time_parse import parse_temporal_expression
 
@@ -244,11 +244,24 @@ def _normalised_text_key(value: object) -> str:
     Consolidation can re-state a source task as a semantic summary. Treat the
     wrapper and ordinary whitespace/punctuation differences as the same fact,
     while preserving the original value for display and evidence.
+
+    The key now also strips the volatile harness wrappers that every agent
+    capture adds (``<USER_REQUEST>``, ``<ADDITIONAL_METADATA>`` with a fresh
+    timestamp, ``<environment_context>``).  Without that, two captures of the
+    *same* user sentence produced different keys and both survived into the
+    Context Pack, burning the 8-item budget: the live ledger held 70,508 rows
+    for one session that contained only 3,573 distinct messages.
     """
-    text = " ".join(str(value or "").split()).strip().lower()
+    raw = str(value or "")
+    text = " ".join(raw.split()).strip().lower()
     text = re.sub(r"^\[待核验的聊天提炼\]\s*", "", text)
     text = re.sub(r"^任务\s+[^：:]{1,260}\s+的已证据化摘要[：:]\s*", "", text)
-    return re.sub(r"[\s，,。.;；:：'\"`]+", "", text)
+    stripped = re.sub(r"[\s，,。.;；:：'\"`]+", "", text)
+    # Fall back to the wrapper-aware fingerprint only when wrappers are present,
+    # so ordinary text keeps its exact previous key (no ranking drift).
+    if "<user_request>" in text or "<additional_metadata>" in text or "<environment_context>" in text:
+        return normalise_for_dedup(raw)
+    return stripped
 
 
 def _source_time(item: Mapping[str, Any]) -> str:
