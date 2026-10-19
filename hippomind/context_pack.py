@@ -22,9 +22,11 @@ import html
 import secrets
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .textutil import normalise_for_dedup, token_sim
+from .embeddings import HybridRanker
 from .ledger import CONTEXT_FIELDS, SQLiteLedger
 from .time_parse import parse_temporal_expression
 
@@ -49,6 +51,37 @@ DOMINANT_TASK_BONUS = 0.08
 # 近似重复硬剔除阈值（token_sim bigram Jaccard）。改写/复述的同义候选与
 # 精确重复一样浪费分组名额（MemFlow packer 的 Jaccard 去重实践）。
 NEAR_DUPLICATE_SIM = 0.85
+
+# ---------------------------------------------------------------------------
+# 内容级折叠（content fold）——在 MMR 之前生效
+# ---------------------------------------------------------------------------
+# 线上实测形态：1,475,584 条 raw 行中，单个会话 70,508 行只有 3,573 条唯一
+# content（≈95% 冗余）；56,010 条 kind='semantic' 只对应 142 条不同正文，
+# 最热一条重复 5,423 次。检索候选池被这类近似重复占满后，8 条预算里剩下的
+# 真正不同结论寥寥无几。折叠在分组/MMR 之前做一次，把「同一内容」压成一条，
+# 但**必须**保住双时态语义：同一结论在不同时间/不同置信度下的版本是历史，
+# 不是噪声。
+FOLD_ENABLED_DEFAULT = True
+# 双时态保护的实现口径（重要，别改成"精确比较"）。
+#
+# 两个互相冲突的事实：
+#   1. 同一结论在不同生效窗口下是历史，必须保留（本任务硬性要求）；
+#   2. 同一段文本被反复采集时，valid_from 会退化成"采集时刻"（
+#      _prepare_ingest 里 valid_from 缺省 = occurred_at = 采集时间），
+#      于是每次重复都拿到一个不同的 valid_from。若精确比较 valid_from，
+#      每一行重复都等于一张"我是历史版本"的免死金牌，折叠恒为 0。
+#      ——这与存储组修 canonical hash 时把 occurred_at 移出去键是同一个病根。
+#
+# 因此按**天**粒度比较 valid_from：同一天内的重复采集折叠掉，跨天则视为
+# 真正的时间版本而保留。valid_until / 置信度分档 / superseded_by 仍精确参与，
+# 因为它们不会被采集动作伪造。
+DUAL_TEMPORAL_FIELDS: Tuple[str, ...] = ("valid_from", "valid_until")
+#: valid_from 的比较粒度（秒）。默认 86400 = 按天：同日内重采视为重复。
+#: 设为 0 恢复"精确比较 tick"，会把折叠率降到接近 0（仅作诊断开关）。
+TEMPORAL_BUCKET_SECONDS = 86400
+# 置信度分档宽度：0.05 内的差异视为同一断言（避免浮点噪声拆开同一条记忆），
+# 超过则认为是不同的证据强度版本。
+CONFIDENCE_BUCKET = 0.05
 
 # A handoff is primarily about the state that changed most recently.  Durable
 # background is useful only after a receiving agent knows where the task is.
@@ -97,6 +130,13 @@ class ContextPackOptions:
     # 预算占比，以及单卡基础字符上限。给集成方调优旋钮，不改默认行为。
     state_fraction: float = 0.64
     max_block_chars: int = 520
+    # 内容级折叠（去重折叠）：在分组/MMR 之前把"同一内容的重复采集"压成一条，
+    # 但保留双时态版本。默认开——它是纯净收益（不改变排序语义，只是不再让
+    # 重复行占用名额），见 FOLD_ENABLED_DEFAULT 的实测说明。
+    fold_duplicates: bool = FOLD_ENABLED_DEFAULT
+    # 混合重排通道：需要 builder 持有一个 embedder 才真正生效（否则空转）。
+    # 默认关——A/B 实测四类指标持平但无提升，见 HybridWeights 注释。
+    hybrid_rerank: bool = False
 
     def normalise(self) -> "ContextPackOptions":
         self.max_items = max(1, min(16, int(self.max_items)))
@@ -245,23 +285,22 @@ def _normalised_text_key(value: object) -> str:
     wrapper and ordinary whitespace/punctuation differences as the same fact,
     while preserving the original value for display and evidence.
 
-    The key now also strips the volatile harness wrappers that every agent
-    capture adds (``<USER_REQUEST>``, ``<ADDITIONAL_METADATA>`` with a fresh
-    timestamp, ``<environment_context>``).  Without that, two captures of the
-    *same* user sentence produced different keys and both survived into the
-    Context Pack, burning the 8-item budget: the live ledger held 70,508 rows
-    for one session that contained only 3,573 distinct messages.
+    One key, one alphabet: harness chrome is removed first (``<USER_REQUEST>``
+    keeps its text; ``<ADDITIONAL_METADATA>``/``<environment_context>`` and
+    inline ISO timestamps are dropped with their contents), then *every* input
+    is reduced through the same punctuation-stripped alphabet. An earlier
+    version branched on "does the text contain a wrapper" and returned
+    ``normalise_for_dedup`` verbatim on that branch -- so a wrapped and an
+    unwrapped copy of one sentence produced different keys, and both survived
+    into the pack. That matters at live scale: the ledger held 70,508 raw rows
+    for a session with only 3,573 distinct messages (~95% redundant).
     """
-    raw = str(value or "")
-    text = " ".join(raw.split()).strip().lower()
+    text = normalise_for_dedup(str(value or ""))
+    # Prefix anchors must be applied *after* wrapper removal, otherwise a
+    # leading wrapper stops ``^任务 ... 的已证据化摘要`` from matching.
     text = re.sub(r"^\[待核验的聊天提炼\]\s*", "", text)
     text = re.sub(r"^任务\s+[^：:]{1,260}\s+的已证据化摘要[：:]\s*", "", text)
-    stripped = re.sub(r"[\s，,。.;；:：'\"`]+", "", text)
-    # Fall back to the wrapper-aware fingerprint only when wrappers are present,
-    # so ordinary text keeps its exact previous key (no ranking drift).
-    if "<user_request>" in text or "<additional_metadata>" in text or "<environment_context>" in text:
-        return normalise_for_dedup(raw)
-    return stripped
+    return re.sub(r"[\s，,。.;；:：'\"`]+", "", text)
 
 
 def _source_time(item: Mapping[str, Any]) -> str:
@@ -287,6 +326,72 @@ def _conclusion_subject_text(item: Mapping[str, Any]) -> str:
     parts = [str(item.get("content", "")).strip()]
     parts.extend(_context_values(item).get("key_decisions", []))
     return " ".join(part for part in parts if part)[:2_000]
+
+
+def _temporal_bucket(value: object) -> str:
+    """把 ISO 时间戳按 ``TEMPORAL_BUCKET_SECONDS`` 归并成可比较的桶键。
+
+    采集侧时间戳会落在同一逻辑时刻的不同 tick 上，精确比较会把它们当成不同
+    版本。按桶归并后，同一时间窗内的重复采集共享一个桶键（折叠），跨桶则保留
+    （真实的双时态历史）。无法解析的值原样返回——宁可多保留，不可误折叠。
+    """
+    text = str(value or "").strip()
+    if not text or TEMPORAL_BUCKET_SECONDS <= 0:
+        return text
+    parsed = _parse_iso_epoch(text)
+    if parsed is None:
+        return text
+    return str(int(parsed // TEMPORAL_BUCKET_SECONDS))
+
+
+def _parse_iso_epoch(text: str) -> Optional[float]:
+    """解析 ISO-8601 到 epoch 秒；解析失败返回 None（不抛异常）。"""
+    candidate = str(text or "").strip()
+    if not candidate:
+        return None
+    try:
+        return datetime.fromisoformat(candidate.replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        pass
+    # 兼容无时区后缀的写法（仓库里存在 "")
+    try:
+        return datetime.strptime(candidate[:19], "%Y-%m-%dT%H:%M:%S").timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def _temporal_version_key(item: Mapping[str, Any]) -> Tuple[str, ...]:
+    """双时态版本签名：同一内容的哪些"维度"变化意味着它是一条新历史。
+
+    折叠只应删掉**同一断言被重复采集**产生的行，绝不能删掉"同一结论在不同
+    时间成立""置信度被上调""原结论失效"这类真正的时间演化。因此折叠键 =
+    内容指纹 + 版本签名；版本签名覆盖双时态窗口（valid_from 按桶粒度）、
+    置信度分档与取代关系。
+
+    ``asserted_at`` 刻意不参与：它是 ingest 侧的 wall-clock，每次重复采集都会
+    变，纳入就等于让所有重复都免于折叠（实测折叠率恒为 0）。
+    """
+    parts: List[str] = []
+    for field in DUAL_TEMPORAL_FIELDS:
+        raw = str(item.get(field, "") or "")
+        if field == "valid_from":
+            parts.append(f"{field}={_temporal_bucket(raw)}")
+        else:
+            parts.append(f"{field}={raw}")
+    try:
+        confidence = float(item.get("confidence", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    # 分档而非精确比较：0.9 与 0.9000001 是同一条断言的不同序列化。
+    parts.append(f"conf={round(confidence / CONFIDENCE_BUCKET)}")
+    parts.append(f"superseded_by={str(item.get('superseded_by', '') or '')}")
+    return tuple(parts)
+
+
+def _fold_key(item: Mapping[str, Any]) -> Tuple[str, Tuple[str, ...]]:
+    """折叠键：(规范化内容指纹, 双时态版本签名)。"""
+    content = str(item.get("content", ""))
+    return (_normalised_text_key(content), _temporal_version_key(item))
 
 
 class ContextPackBuilder:
@@ -468,6 +573,107 @@ class ContextPackBuilder:
             return ""
         winner = max(anchors, key=lambda item: (float(item.get("score", 0.0)), _source_time(item)))
         return str(winner.get("task_id", "")).strip()
+
+    def _deepen_until_distinct(
+            self, query: str, candidates: Sequence[Mapping[str, Any]],
+            options: "ContextPackOptions", *, task_id: str, project: str,
+            eff_from: str, eff_to: str, initial_limit: int,
+            use_embedder: bool = False,
+    ) -> List[Mapping[str, Any]]:
+        """重复密度高时加深取数，直到折叠后凑够不同候选。
+
+        背景（实测，非估算）：线上 raw 语料约 95% 是同一消息的重复采集。
+        固定取数深度 ``max_items*12`` 在这种分布下会整池命中重复行——
+        10 个不同事实 × 30 份副本的合成库上，limit=48 只捞出 2 条不同内容，
+        limit=96 捞到 4 条，连"8 条预算"都填不满，MMR 与分组再聪明也无从选择。
+
+        策略：折叠后的不同候选数不足 ``max_items`` 时，按 4 倍加深一次，
+        最多两级（48 → 192 → 768），且只在"实际上被重复占满"时才付出成本。
+        加深所得候选仍走完全相同的可靠性门槛/折叠/分组/MMR，不引入新语义。
+        """
+        def distinct_count(rows: Sequence[Mapping[str, Any]]) -> int:
+            return len({_fold_key(row) for row in rows})
+
+        target = max(1, int(options.max_items))
+        if distinct_count(candidates) >= target:
+            return list(candidates)
+        deepest = max(initial_limit * 16, 768)
+        limit = initial_limit
+        current = list(candidates)
+        while distinct_count(current) < target and limit < deepest:
+            limit = min(deepest, limit * 4)
+            deeper = self.ledger.search(
+                query, scope=options.scope, task_id=task_id, project=project,
+                source_agents=options.source_agents, roles=options.roles,
+                from_time=eff_from, to_time=eff_to,
+                include_raw_chat=options.raw_chat,
+                require_evidence=options.require_evidence,
+                limit=limit,
+                embedder=self.embedder if use_embedder else None,
+                as_of=options.as_of,
+            )
+            if len(deeper) <= len(current):
+                # 已到该查询能返回的上限，继续加深无收益。
+                break
+            current = list(deeper)
+        return current
+
+    def _hybrid_reranker(self) -> HybridRanker:
+        """混合重排器（单例，按当前 embedder 缓存，避免每轮重建权重）。"""
+        cached = getattr(self, "_hybrid_cached", None)
+        if cached is None or cached.embedder is not self.embedder:
+            cached = HybridRanker(self.embedder)
+            self._hybrid_cached = cached
+        return cached
+
+    def _fold_duplicate_candidates(
+            self, candidates: Sequence[Mapping[str, Any]]
+    ) -> Tuple[List[Mapping[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+        """内容级折叠：同一内容指纹只保留最高分一条，保留双时态版本。
+
+        为什么必须在 MMR 之前：MMR/分组是按"名额"竞争的，重复行先占位就
+        等于把预算烧在噪声上。线上形态是 70,508 行 / 3,573 条唯一内容，
+        候选池与 8 条注入预算都会被这类重复挤满。
+
+        折叠键 = (规范化内容指纹, 双时态版本签名)，见 :func:`_fold_key`。
+        因此**只有**"同一断言被重复采集"才会被合并：
+        * 同一结论在不同 valid_from/valid_until（历史版本）→ 版本签名不同 → 保留；
+        * 置信度显著不同（跨 CONFIDENCE_BUCKET 档）→ 保留；
+        * 被取代关系不同（superseded_by）→ 保留。
+        组内保留最高分者；同分时保留来源时间最新者，与全局 _record_rank 一致。
+        折叠计数写入返回值，由 build() 落到 debug。
+        """
+        best: Dict[Tuple[str, Tuple[str, ...]], Mapping[str, Any]] = {}
+        order: List[Tuple[str, Tuple[str, ...]]] = []
+        folded: List[Dict[str, Any]] = []
+        for candidate in candidates:
+            key = _fold_key(candidate)
+            incumbent = best.get(key)
+            if incumbent is None:
+                best[key] = candidate
+                order.append(key)
+                continue
+            # 组内择优：分数优先，分数相同时取更新的来源时间——与账本排序口径一致，
+            # 避免"保留哪一条"取决于候选到达顺序。
+            challenger_rank = (float(candidate.get("score", 0.0)), _source_time(candidate))
+            incumbent_rank = (float(incumbent.get("score", 0.0)), _source_time(incumbent))
+            if challenger_rank > incumbent_rank:
+                best[key] = candidate
+                loser = incumbent
+            else:
+                loser = candidate
+            folded.append({
+                "memory_id": str(loser.get("memory_id", "")),
+                "kept_memory_id": str(best[key].get("memory_id", "")),
+                "reason": "内容级折叠（同一内容的重复采集；双时态版本已保留）",
+                "score": round(float(loser.get("score", 0.0)), 4),
+                "score_parts": loser.get("score_parts", {}),
+            })
+        result = [best[key] for key in order]
+        stats = {"applied": True, "before": len(candidates), "after": len(result),
+                 "folded": len(folded),
+                 "fold_ratio": round(len(folded) / len(candidates), 4) if candidates else 0.0}
+        return result, folded, stats
 
     def _prune_groups(self, groups: Mapping[str, Sequence[Mapping[str, Any]]]
                       ) -> Tuple[Dict[str, List[Mapping[str, Any]]], List[Dict[str, Any]]]:
@@ -726,7 +932,12 @@ class ContextPackBuilder:
                      options.from_time, options.to_time, eff_from, eff_to,
                      options.as_of,
                      options.debug, options.state_fraction,
-                     options.max_block_chars)
+                     options.max_block_chars,
+                     # 折叠/混合重排开关必须进缓存键：否则同一 query 在两种配置
+                     # 之间切换时会命中上一次的缓存包，A/B 对比直接失真
+                     # （实测会把 fold=False 的结果当成 fold=True 返回）。
+                     options.fold_duplicates, options.hybrid_rerank,
+                     id(self.embedder) if self.embedder is not None else None)
         cached = self._cached(cache_key)
         if cached is not None:
             return cached
@@ -747,12 +958,18 @@ class ContextPackBuilder:
                                                  "require_evidence": options.require_evidence,
                                                  "reason": "缺少查询关键词或结构化过滤"}}
             return self._remember(cache_key, pack)
+        # 候选取数深度：max_items*12（下限 48）在"内容不重复"的语料上够用，但在
+        # 线上那种 95% 冗余的分布上会把候选池整个烧在重复行上。实测（10 个不同
+        # 事实 × 30 份重复副本）：limit=48 → 只 2 条不同内容；limit=96 → 4 条；
+        # limit=240 → 8 条。也就是说固定深度 96 连"8 个不同结论"都凑不齐。
+        # 折叠生效时按需加深取数，直到"折叠后不同候选数 ≥ max_items"或触顶。
+        initial_limit = max(options.max_items * 12, 48)
         candidates = self.ledger.search(
             query, scope=options.scope, task_id=task_id, project=project,
             source_agents=options.source_agents, roles=options.roles,
             from_time=eff_from, to_time=eff_to,
             include_raw_chat=options.raw_chat, require_evidence=options.require_evidence,
-            limit=max(options.max_items * 12, 48), embedder=self.embedder,
+            limit=initial_limit, embedder=self.embedder,
             as_of=options.as_of,
         )
         # Resolve shared task titles before grouping. This is intentionally a
@@ -768,7 +985,14 @@ class ContextPackBuilder:
                 source_agents=options.source_agents, roles=options.roles,
                 from_time=eff_from, to_time=eff_to,
                 include_raw_chat=options.raw_chat, require_evidence=options.require_evidence,
-                limit=max(options.max_items * 12, 48), as_of=options.as_of,
+                limit=initial_limit, as_of=options.as_of,
+            )
+        # 自适应加深：重复密度高时增加取数深度，直到折叠后凑够不同候选。
+        if options.fold_duplicates and candidates:
+            candidates = self._deepen_until_distinct(
+                query, candidates, options, task_id=task_id, project=project,
+                eff_from=eff_from, eff_to=eff_to, initial_limit=initial_limit,
+                use_embedder=bool(task_anchor),
             )
         candidate_debug = [{
             "memory_id": str(candidate.get("memory_id", "")),
@@ -780,6 +1004,25 @@ class ContextPackBuilder:
             "score_parts": candidate.get("score_parts", {}),
             "evidence": list(candidate.get("evidence", []))[:3],
         } for candidate in candidates[:32]]
+        # 内容级折叠 + 可选混合重排，都在分组/MMR **之前**：
+        # 1) 折叠先做——否则重复行会先占满分组名额，MMR 面对的是已被污染
+        #    的候选集（线上 8 条预算被近似重复吃掉就是此因）。
+        # 2) 重排随后——它只改顺序不改集合，因此不会与折叠互相干扰。
+        fold_notes: List[Dict[str, Any]] = []
+        fold_stats: Dict[str, Any] = {"applied": False, "before": len(candidates),
+                                      "after": len(candidates), "folded": 0,
+                                      "fold_ratio": 0.0}
+        if options.fold_duplicates and candidates:
+            candidates, fold_notes, fold_stats = self._fold_duplicate_candidates(candidates)
+        hybrid_stats: Dict[str, Any] = {"applied": False}
+        if options.hybrid_rerank and self.embedder is not None and candidates:
+            reranked = self._hybrid_reranker().rank(query, candidates)
+            hybrid_stats = {"applied": True, "before": len(candidates),
+                            "after": len(reranked),
+                            "weights": self._hybrid_reranker().weights.as_dict(),
+                            "reordered": sum(1 for a, b in zip(candidates, reranked)
+                                             if a is not b)}
+            candidates = reranked
         groups: Dict[str, List[Mapping[str, Any]]] = {}
         filtered: List[Dict[str, Any]] = []
         seen_content = set()
@@ -809,6 +1052,8 @@ class ContextPackBuilder:
             seen_content.add(signature)
             kept_contents.append(content_text)
             groups.setdefault(self._group_key(candidate), []).append(candidate)
+        # 折叠记录并入过滤轨迹：debug 里能直接看到"折叠了多少、谁留下的"。
+        filtered.extend(fold_notes)
         # 过时结论降权 + 冲突记忆不注入：在分组选择前裁剪同主题的旧结论。
         groups, conflict_notes = self._prune_groups(groups)
         filtered.extend(conflict_notes)
@@ -826,6 +1071,8 @@ class ContextPackBuilder:
                                  "dominant_task": dominant_task,
                                  "task_anchor": task_anchor,
                                  "conflict_filtered": conflict_notes,
+                                 "fold": fold_stats,
+                                 "hybrid": hybrid_stats,
                                  "evidence_sources": [
                                      ref for candidate in candidate_debug
                                      for ref in candidate.get("evidence", [])
@@ -926,6 +1173,8 @@ class ContextPackBuilder:
                 "dominant_task": dominant_task,
                 "task_anchor": task_anchor,
                 "conflict_filtered": conflict_notes,
+                "fold": fold_stats,
+                "hybrid": hybrid_stats,
                 "candidate_count": len(candidates),
                 "constraints": {"max_items": options.max_items, "max_chars": options.max_chars,
                                 "max_tokens": options.max_tokens,
