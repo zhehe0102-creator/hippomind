@@ -3558,6 +3558,120 @@ class SQLiteLedger:
                         })
         return {"pairs": pairs, "scanned": len(rows), "suggestions": len(pairs)}
 
+    def collapse_duplicate_rows(self, *, archive_dir: Optional[os.PathLike] = None,
+                                batch_size: int = 5_000,
+                                dry_run: bool = False) -> Dict[str, Any]:
+        """Collapse rows whose normalised content is byte-identical.
+
+        The capture storm stored the same message repeatedly; the live ledger held
+        1,404,190 redundant raw rows across 39,345 duplicate groups.  Retrieval
+        only has an 8-item budget, so duplicates burn it.
+
+        Safety rules:
+          * Only *raw evidence* is collapsed.  Structured records keep bitemporal
+            versions even when the text repeats.
+          * The survivor is the earliest row (stable, reproducible ordering).
+          * Every removed row is first written to the same verified gzip archive
+            used by :meth:`purge_expired_raw`, so nothing becomes unrecoverable.
+          * ``dry_run`` reports the exact counts and touches nothing.
+
+        Returns counts only.
+        """
+        batch_size = _clamp_int(batch_size, 5_000, 100, 50_000)
+        summary: Dict[str, Any] = {"duplicate_groups": 0, "collapsed": 0,
+                                   "archive_path": "", "dry_run": bool(dry_run)}
+        self._transaction(lambda conn: conn.execute("""
+            CREATE TABLE IF NOT EXISTS _dedupe_groups AS
+            SELECT MAX(memory_id) AS survivor_id, content, source_agent, session_id,
+                   role, COUNT(*) AS n
+            FROM memories WHERE raw_chat=1 AND content!=''
+            GROUP BY content, source_agent, session_id, role HAVING COUNT(*)>1
+        """))
+        try:
+            with self._connect() as conn:
+                summary["duplicate_groups"] = int(conn.execute(
+                    "SELECT COUNT(*) FROM _dedupe_groups").fetchone()[0])
+            if dry_run or not summary["duplicate_groups"]:
+                return summary
+
+            root = self._raw_archive_root(archive_dir)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            archive_path = root / f"dedupe-{stamp}-{_hash(str(self.path))[:12]}.jsonl.gz"
+            removed: List[str] = []
+            removed_events: List[str] = []
+            with gzip.open(archive_path, "wb") as handle:
+                after = ""
+                while True:
+                    with self._connect() as conn:
+                        batch = conn.execute("""
+                            SELECT m.memory_id,m.origin_event_id,m.content,m.source_agent,
+                                   m.session_id,m.task_id,m.project,m.role,m.scope,
+                                   m.created_at,e.occurred_at,e.content_hash
+                            FROM memories AS m
+                            JOIN ledger_events AS e ON e.event_id=m.origin_event_id
+                            JOIN _dedupe_groups g
+                              ON g.content=m.content
+                             AND g.source_agent=m.source_agent
+                             AND g.session_id=m.session_id
+                             AND g.role=m.role
+                            WHERE m.raw_chat=1 AND m.memory_id!=g.survivor_id
+                              AND m.memory_id>?
+                            ORDER BY m.memory_id ASC LIMIT ?
+                        """, (after, batch_size)).fetchall()
+                    if not batch:
+                        break
+                    after = str(batch[-1]["memory_id"])
+                    for row in batch:
+                        handle.write((json.dumps({
+                            "reason": "duplicate",
+                            "memory_id": row["memory_id"],
+                            "event_id": row["origin_event_id"],
+                            "content": row["content"],
+                            "content_sha256": row["content_hash"],
+                            "source_agent": row["source_agent"],
+                            "session_id": row["session_id"],
+                            "created_at": row["created_at"],
+                            "collapsed_at": utc_now(),
+                        }, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8"))
+                        removed.append(str(row["memory_id"]))
+                        removed_events.append(str(row["origin_event_id"]))
+            try:
+                os.chmod(archive_path, 0o600)
+            except OSError:
+                pass
+            with open(archive_path, "rb") as handle:
+                os.fsync(handle.fileno())
+
+            # Verify before deleting (same fail-closed rule as purge).
+            found = set()
+            with gzip.open(archive_path, "rb") as handle:
+                for line in handle:
+                    if line.strip():
+                        found.add(str(json.loads(line).get("memory_id", "")))
+            if set(removed) - found:
+                summary["error"] = "archive incomplete; refusing to delete"
+                return summary
+
+            def remove(conn: sqlite3.Connection) -> None:
+                for start in range(0, len(removed), batch_size):
+                    chunk = removed[start:start + batch_size]
+                    events = removed_events[start:start + batch_size]
+                    ph = ",".join("?" for _ in chunk)
+                    eph = ",".join("?" for _ in events)
+                    conn.execute(f"DELETE FROM memory_fts WHERE memory_id IN ({ph})", chunk)
+                    conn.execute(f"DELETE FROM memory_relations WHERE child_memory_id IN ({ph})", chunk)
+                    conn.execute(f"DELETE FROM memory_relations WHERE parent_memory_id IN ({ph})", chunk)
+                    conn.execute(f"DELETE FROM memory_claims WHERE memory_id IN ({ph})", chunk)
+                    conn.execute(f"DELETE FROM memories WHERE memory_id IN ({ph})", chunk)
+                    conn.execute(f"DELETE FROM ledger_events WHERE event_id IN ({eph})", events)
+
+            self._transaction(remove)
+            summary["collapsed"] = len(removed)
+            summary["archive_path"] = str(archive_path)
+            return summary
+        finally:
+            self._transaction(lambda conn: conn.execute("DROP TABLE IF EXISTS _dedupe_groups"))
+
     def set_agent_trust(self, agent_id: str, baseline: float, *, source: str = "local-admin") -> Dict[str, Any]:
         """Set an operator-controlled trust prior; agents cannot self-promote."""
         agent_id = _short(agent_id, 128).lower()

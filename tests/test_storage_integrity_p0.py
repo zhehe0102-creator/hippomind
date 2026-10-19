@@ -173,3 +173,74 @@ class StorageP0Tests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DedupeCollapseTests(unittest.TestCase):
+    """Collapsing historical duplicates must be session-scoped and recoverable."""
+
+    def setUp(self) -> None:
+        self.home = tempfile.mkdtemp()
+        self.path = os.path.join(self.home, "ledger.sqlite")
+        self.ledger = SQLiteLedger(self.path)
+
+    def tearDown(self) -> None:
+        self.ledger.close()
+
+    def _legacy_rows(self, count: int, session: str, text: str) -> None:
+        """Insert pre-fix rows directly: distinct hashes for identical text."""
+        import sqlite3
+        with sqlite3.connect(self.path) as conn:
+            for index in range(count):
+                mid = f"mem_{session}_{index:03d}"
+                eid = f"evt_{session}_{index:03d}"
+                conn.execute(
+                    "INSERT INTO ledger_events(event_id,event_type,occurred_at,ingested_at,"
+                    "source_agent,session_id,scope,evidence_json,content,content_hash) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (eid, "raw_chat", f"2026-08-10T10:{index:02d}:00+00:00",
+                     "2026-08-10T10:00:00+00:00", "codex", session, "shared",
+                     '["a:1"]', text, f"hash_{session}_{index}"))
+                conn.execute(
+                    "INSERT INTO memories(memory_id,origin_event_id,kind,content,source_agent,"
+                    "session_id,scope,evidence_json,created_at,updated_at,last_weighted_at,"
+                    "raw_chat,quality_state) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (mid, eid, "raw_chat", text, "codex", session, "shared", '["a:1"]',
+                     "2026-08-10T10:00:00+00:00", "2026-08-10T10:00:00+00:00",
+                     "2026-08-10T10:00:00+00:00", 1, "accepted"))
+
+    def test_collapse_keeps_one_row_per_session(self):
+        text = "同一条被重复捕获的消息：部署失败因为 daemon 未重启"
+        self._legacy_rows(20, "s1", text)
+        self._legacy_rows(1, "s2", text)  # different conversation, must survive
+        result = self.ledger.collapse_duplicate_rows(
+            archive_dir=os.path.join(self.home, "arch"))
+        self.assertIsNone(result.get("error"))
+        self.assertEqual(result["collapsed"], 19)
+        self.assertEqual(self.ledger.stats()["memories"], 2)
+
+    def test_collapse_dry_run_is_read_only(self):
+        self._legacy_rows(5, "s1", "重复内容 abc")
+        before = self.ledger.stats()["memories"]
+        self.ledger.collapse_duplicate_rows(dry_run=True)
+        self.assertEqual(self.ledger.stats()["memories"], before)
+
+    def test_collapse_is_recoverable_from_archive(self):
+        self._legacy_rows(4, "s1", "可恢复性验证内容 xyz")
+        result = self.ledger.collapse_duplicate_rows(
+            archive_dir=os.path.join(self.home, "arch"))
+        with gzip.open(result["archive_path"], "rt", encoding="utf-8") as handle:
+            rows = [json.loads(line) for line in handle if line.strip()]
+        self.assertEqual(len(rows), 3)
+        self.assertTrue(all(row["reason"] == "duplicate" for row in rows))
+
+    def test_new_ingest_does_not_create_duplicates_to_collapse(self):
+        """The write path must already be idempotent; collapse finds nothing."""
+        for index in range(10):
+            self.ledger.ingest({
+                "content": "已经幂等的消息", "kind": "raw_chat", "raw_chat": True,
+                "source_agent": "codex", "session_id": "s", "role": "user",
+                "evidence": [f"a:{index}"],
+            })
+        result = self.ledger.collapse_duplicate_rows(dry_run=True)
+        self.assertEqual(result["duplicate_groups"], 0)
+        self.assertEqual(self.ledger.stats()["memories"], 1)

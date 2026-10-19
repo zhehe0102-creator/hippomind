@@ -11,6 +11,7 @@ import hashlib
 import os
 import plistlib
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -1391,12 +1392,38 @@ def cmd_maintain(args) -> int:
     if _daemon_serves_ledger(paths, _port(args, paths)):
         raise LedgerError("维护 raw 证据前请先运行 hippomind stop，避免与 daemon 并发写入")
     ledger = SQLiteLedger(paths.ledger_path)
+    dry_run = bool(getattr(args, "dry_run", False))
+    if dry_run:
+        # A dry run must not write.  Report the exact candidate counts and the
+        # file sizes so the operator can decide before anything is touched.
+        report = {
+            "dry_run": True,
+            "memories": ledger.stats()["memories"],
+            "purge_candidates": ledger.purge_expired_raw(
+                before_days=getattr(args, "raw_ttl_days", 0) or max(args.raw_retention_days, 90),
+                dry_run=True,
+            )["purge_candidates"],
+        }
+        try:
+            report["duplicate_groups"] = ledger.duplicate_candidates().get("groups", -1)
+        except Exception:
+            report["duplicate_groups"] = -1
+        _print(report)
+        return 0
     result = ledger.maintain(
         raw_after_days=args.raw_retention_days,
         raw_capacity=args.raw_capacity,
         raw_archive_dir=args.raw_archive_dir or None,
         raw_archive_max_bytes=args.raw_archive_max_bytes,
+        raw_ttl_days=getattr(args, "raw_ttl_days", 0) or None,
+        purge_raw=bool(getattr(args, "purge_raw", False)),
     )
+    if getattr(args, "dedupe", False):
+        try:
+            result["dedupe"] = ledger.collapse_duplicate_rows(
+                archive_dir=args.raw_archive_dir or None)
+        except (LedgerError, sqlite3.Error) as exc:
+            result["dedupe"] = {"error": f"{type(exc).__name__}: {exc}"[:300]}
     # 合并建议：只报告不自动删——合并语义需人工确认（哪条留谱系）。
     try:
         duplicates = ledger.duplicate_candidates()
@@ -1925,6 +1952,14 @@ def build_parser() -> argparse.ArgumentParser:
     maintain.add_argument("--prune-backups", type=int, default=0, metavar="N",
                           help="只保留最近 N 个登记在册的备份文件（sha256 校验后才删）")
     maintain.add_argument("--raw-retention-days", type=int, default=30)
+    maintain.add_argument("--raw-ttl-days", type=int, default=0, metavar="N",
+                          help="raw 证据物理删除期限（天）；0 表示按保留期+90 推导")
+    maintain.add_argument("--purge-raw", action="store_true",
+                          help="归档校验通过后物理删除过期 raw 证据（真正缩容）")
+    maintain.add_argument("--dedupe", action="store_true",
+                          help="折叠规范化后完全相同的重复行（保留最早一条与谱系）")
+    maintain.add_argument("--dry-run", action="store_true",
+                          help="只报告将发生什么，不做任何写入")
     maintain.add_argument("--raw-capacity", type=int, default=5_000)
     maintain.add_argument("--raw-archive-dir", default="")
     maintain.add_argument("--raw-archive-max-bytes", type=int, default=256 * 1024 * 1024)
