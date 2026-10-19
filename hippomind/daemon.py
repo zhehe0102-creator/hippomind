@@ -39,7 +39,10 @@ from .watcher import ArchiveWatcher, default_dsh_sessions_root
 
 
 API_VERSION = "v1"
-SERVER_VERSION = "0.9.2"
+#: Reported over HTTP and in ``hippomind version``. Sourced from the package
+#: so a release only has to bump one place.
+from . import __version__ as _PACKAGE_VERSION  # noqa: E402  (kept near its use)
+SERVER_VERSION = _PACKAGE_VERSION
 MAX_REQUEST_BYTES = 1_000_000
 MAX_RESPONSE_BYTES = 512_000
 MAX_CONCURRENT_REQUESTS = 16
@@ -92,6 +95,23 @@ def render_prometheus(stats: Mapping[str, Any], uptime_s: float) -> str:
              "Sleep consolidation cycles", health.get("sleep_cycles", 0))
         emit("hippomind_sleep_errors_total", "counter",
              "Sleep consolidation errors", health.get("sleep_errors", 0))
+        # Retention convergence: these are the numbers that would have made the
+        # 4.48GB growth visible while it was happening.
+        emit("hippomind_raw_purged_total", "counter",
+             "Raw evidence rows physically deleted after archival",
+             health.get("raw_purged_total", 0))
+        emit("hippomind_bytes_reclaimed_total", "counter",
+             "File bytes returned to the OS by automatic shrinking",
+             health.get("bytes_reclaimed_total", 0))
+        storage = health.get("last_storage")
+        if isinstance(storage, Mapping):
+            emit("hippomind_db_bytes", "gauge", "Ledger file size in bytes",
+                 storage.get("db_bytes", 0))
+            emit("hippomind_freelist_pages", "gauge",
+                 "Pages on the freelist awaiting reclaim", storage.get("freelist", 0))
+            emit("hippomind_reclaimable_bytes", "gauge",
+                 "Bytes recoverable by a shrink pass",
+                 storage.get("reclaimable_bytes", 0))
     emit("hippomind_uptime_seconds", "gauge", "Daemon uptime in seconds",
          round(float(uptime_s), 3))
     return "\n".join(lines) + "\n"
@@ -196,7 +216,11 @@ class MemoryHubService:
         # 健康自监控（迭代55）：后台周期任务的成功/失败计数进 /stats，
         # 让「daemon 看起来活着但巩固一直在静默失败」这类问题可观测。
         self.health = {"sleep_cycles": 0, "sleep_errors": 0,
-                       "last_sleep_report_at": ""}
+                       "last_sleep_report_at": "",
+                       # Convergence counters: a long-running hub must be able to
+                       # show that it is shrinking, not just "healthy".
+                       "raw_purged_total": 0, "bytes_reclaimed_total": 0,
+                       "last_storage": {}}
         self._last_sleep_run: Optional[float] = None
         self.last_sleep_report: Optional[Dict[str, Any]] = None
         # Latest controlled auto-install outcome (per detected agent); only
@@ -477,6 +501,33 @@ class MemoryHubService:
             report["consolidated"] = len(self.ledger.consolidate())
             report["decayed"] = maintained.get("decayed", 0)
             report["raw_compressed"] = maintained.get("raw_compressed", 0)
+            # Convergence must be observable from a long-running process. Without
+            # these counters an operator can watch the daemon stay healthy while
+            # the ledger silently grows to 4.48GB: nothing reported how many rows
+            # were actually purged, nor how much file space was reclaimable.
+            purged = maintained.get("raw_purged") or {}
+            report["raw_purged"] = int(purged.get("purged", 0) or 0)
+            report["raw_events_purged"] = int(purged.get("events_purged", 0) or 0)
+            report["purge_error"] = str(purged.get("error", "") or "")
+            storage = maintained.get("storage") or {}
+            report["storage"] = {
+                "freelist": int(storage.get("freelist", 0) or 0),
+                "page_count": int(storage.get("page_count", 0) or 0),
+                "db_bytes": int(storage.get("db_bytes", 0) or 0),
+                "reclaimable_bytes": int(storage.get("reclaimable_bytes", 0) or 0),
+            }
+            shrink = maintained.get("auto_vacuum") or {}
+            report["auto_vacuum"] = {
+                "vacuumed": bool(shrink.get("vacuumed")),
+                "mode": str(shrink.get("mode", "none")),
+                "reclaimed_bytes": int(shrink.get("reclaimed_bytes", 0) or 0),
+                "reason": str(shrink.get("reason", "")),
+            }
+            # Keep the cumulative view on the health record so /stats shows the
+            # whole-run trend, not just the most recent cycle.
+            self.health["raw_purged_total"] += report["raw_purged"]
+            self.health["bytes_reclaimed_total"] += report["auto_vacuum"]["reclaimed_bytes"]
+            self.health["last_storage"] = dict(report["storage"])
             wal = self.ledger.maintenance_checkpoint()
             report["wal_truncated"] = bool(wal.get("wal_truncated"))
             self.health["sleep_cycles"] += 1
@@ -497,9 +548,13 @@ class MemoryHubService:
                 try:
                     report = self._maybe_sleep_consolidate()
                     if report is not None and "error" not in report:
+                        # 运维日志必须同时显示「删了多少」和「文件缩了多少」：
+                        # 只打归档数会让一个永不删除的保留策略看起来正常。
                         print(f"[hippomindd] 空闲巩固：规则 +{report['consolidated']}，"
                               f"衰减 {report['decayed']} 行，raw 归档 "
-                              f"{report['raw_compressed']} 条")
+                              f"{report['raw_compressed']} 条，"
+                              f"物理删除 {report.get('raw_purged', 0)} 条，"
+                              f"空闲页 {report.get('storage', {}).get('freelist', 0)}")
                 except Exception:
                     pass
                 self._stop_event.wait(60.0)

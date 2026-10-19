@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hippomind"
-version = "0.9.2"
+version = "1.0.0"
 description = "A local, evidence-backed memory hub for coding agents"
 readme = "README.md"
 license = "MIT"
@@ -29,3 +29,55 @@ include-package-data = false
 
 [tool.setuptools.package-data]
 integrations = ["*.md", "*.json", "dsh-plugin/**/*"]
+
+# ---------------------------------------------------------------------------
+# Static analysis: incremental ratchet, not a big-bang reformat
+# ---------------------------------------------------------------------------
+# The repository predates any linter config, so a "everything must be clean"
+# gate would fail on ~140 pre-existing findings and tempt people to disable it.
+# Instead:
+#   * `lint` is the gate: an explicit, high-signal rule set that must stay clean
+#     (undefined names, shadowed imports, syntax/whitespace errors, warnings).
+#   * `lint-legacy` reports the wide default rule set for visibility only; its
+#     current count is pinned in scripts/lint-baseline.txt so new findings in
+#     that superset are still caught, while legacy debt cannot grow.
+# Neither rule set is allowed to depend on a network install: `scripts/lint.sh`
+# skips with a clear message when ruff is absent (CI installs it).
+
+[tool.ruff]
+target-version = "py39"
+line-length = 120
+# exFAT volumes spawn AppleDouble `._foo.py` companions; they are binary junk.
+extend-exclude = ["*.pyi", "._*", ".git", ".venv", "build", "dist", "output", "tmp"]
+
+[tool.ruff.lint]
+# E9  syntax/IO errors            F63 assert on tuple
+# F7  syntax errors               F82 undefined name (real NameErrors)
+# F811 redefinition               F402 import shadowed by loop variable
+# E4  import placement            W   trailing whitespace / blank lines
+select = ["E4", "E7", "E9", "W", "F63", "F7", "F82", "F811", "F402"]
+
+[tool.ruff.lint.per-file-ignores]
+# Test modules deliberately insert the repository root on sys.path before
+# importing hippomind, which is an import-after-code by construction.
+"tests/**" = ["E402"]
+
+# ---------------------------------------------------------------------------
+# Type checking: baseline-locked, opt-in
+# ---------------------------------------------------------------------------
+# mypy is not a runtime dependency and is not installed on every machine; the
+# configured scope is the modules that are already close to typed. Widen it as
+# modules get annotated rather than starting a codebase-wide red wall.
+
+[tool.mypy]
+python_version = "3.9"
+files = ["hippomind/ledger.py", "hippomind/schema.py", "hippomind/cli.py"]
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = false
+no_implicit_optional = false
+check_untyped_defs = false
+ignore_missing_imports = true
+show_error_codes = true
+pretty = false
+exclude = '(^|/)(tests?|build|dist|output|tmp|\.venv)(/|$)|(^|/)\._'

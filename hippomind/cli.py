@@ -1694,6 +1694,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     version_cmd = sub.add_parser("version", help="输出版本/schema/账本概要")
     _connection_arguments(version_cmd)
+    # ``version`` already prints JSON; the flag exists so release automation and
+    # ``tests/test_schema_contract.py`` can ask for machine-readable output
+    # explicitly instead of relying on the default being JSON forever.
+    version_cmd.add_argument("--json", action="store_true",
+                             help="以 JSON 输出（默认已是 JSON；保留该开关供发布脚本显式声明）")
     version_cmd.set_defaults(func=cmd_version)
 
     doctor = sub.add_parser("doctor", help="以不泄露凭据的方式检查服务是否可用")

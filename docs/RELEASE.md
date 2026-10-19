@@ -22,3 +22,49 @@
 ## GitHub publication
 
 Initialize a repository only after the checks pass, commit source/docs/screenshots without local data, tag the release, then create the GitHub repository with the owner-selected name and visibility. The final release description should link to `README.md`, `docs/PORTABILITY.md`, `MEMORY_HUB_GUIDE.md`, and the PDF guide.
+
+## Schema compatibility gate (blocking)
+
+These checks are mandatory for every release. The 2026-08 outage happened
+because a live ledger reached schema **v8** while the only published source
+tree was **v5**; the source refused to open the database, and 1.5M memories had
+no code that could read them. Nothing caught it, because every test built
+databases with the code under test — a database created by the code under test
+can never be too new for it.
+
+- [ ] **Source `SCHEMA_VERSION` >= the live ledger schema.** Compare the two
+      numbers directly before tagging:
+      - source: `python3 -c "from hippomind.schema import SCHEMA_VERSION; print(SCHEMA_VERSION)"`
+      - live ledger: `sqlite3 "$HOME/Library/Application Support/HippoMind/hippomind.sqlite" "SELECT value FROM schema_meta WHERE key='schema_version'"`
+      A source version **lower** than the live ledger is a hard stop: that
+      release cannot read the data it is meant to serve. Ship the newer source,
+      or do not ship.
+- [ ] **`python3 -m hippomind version` passes** and reports the expected
+      `schema_version`. The command always emits JSON, so it is scriptable
+      today: `python3 -m hippomind version | python3 -c "import json,sys; print(json.load(sys.stdin)['schema_version'])"`.
+      `tests/test_schema_contract.py` pins this contract.
+      **Known gap:** the `--json` flag does not exist yet (`hippomind version
+      --json` exits 2 with `unrecognized arguments`), which is why that test
+      currently *skips* instead of asserting. A release must not rely on the
+      flag until `hippomind/cli.py` accepts it; use the plain command above.
+- [ ] **`hippomind checkup` passes** (`"checkup": "ok"`, exit 0) against a
+      disposable ledger, and against a copy of the live ledger when one exists.
+- [ ] **Run the schema-migration drill before tagging:**
+      `python3 tests/drill_schema_migration.py`
+      It must print `PASS` and exit 0. On a machine with a real ledger, also
+      rehearse the upgrade on a copy: `python3 tests/drill_schema_migration.py --live`
+      (the drill only ever reads the source ledger; it never migrates it in place).
+- [ ] **Add a frozen fixture for the new schema.** If `SCHEMA_VERSION` moved,
+      add `tests/fixtures/schema/v<N>.sql` capturing what the *old* release
+      wrote, so the next release has a real historical database to migrate. A
+      fixture newer than the source is a drill failure by design.
+- [ ] **Back up before upgrading a real installation:**
+      `scripts/backup.sh` (consistent SQLite snapshot + `.sha256`), and verify
+      it with `scripts/restore.sh --db <copy> <snapshot>` on a throwaway path.
+
+## Static analysis gate (blocking)
+
+- [ ] `bash scripts/lint.sh` exits 0. The gate rule set must stay clean; the
+      legacy baseline in `scripts/lint-baseline.txt` may only shrink. If a new
+      finding is genuinely intentional, run `scripts/lint.sh --update-baseline`
+      and explain the new entries in the commit message.

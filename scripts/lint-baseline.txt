@@ -1,0 +1,79 @@
+# Static-analysis baseline for scripts/lint.sh.
+# Format: <path> <ruff-rule> <count>, grouped by rule set.
+# Regenerate with: scripts/lint.sh --update-baseline
+#
+# The gate must ratchet down to zero; legacy debt is pinned so it
+# cannot grow. Never add entries by hand to silence a new finding.
+
+[gate]
+hippomind/context_pack.py F402 3
+hippomind/daemon.py E402 7
+hippomind/network_visualizer.py F821 2
+hippomind/visualizer.py E402 10
+hippomind/visualizer.py E702 4
+hippomind/visualizer.py F821 1
+integrations/query.py E702 20
+tests/test_metrics_counts.py E741 2
+tests/test_metrics_endpoint.py E741 2
+tests/test_upgrade_round.py F811 1
+tools/build_hippomind_manual.py E701 1
+tools/build_hippomind_manual.py E702 32
+tools/capture_gui_screenshots.py E402 5
+
+[legacy]
+hippomind/agent_install.py E501 1
+hippomind/auto_context.py E501 8
+hippomind/cli.py E501 2
+hippomind/context_pack.py F402 3
+hippomind/daemon.py E402 7
+hippomind/dsh_sessions.py F401 1
+hippomind/embeddings.py F401 2
+hippomind/embeddings.py F841 1
+hippomind/hippocampus.py F401 1
+hippomind/hub_client.py E501 1
+hippomind/hub_client.py F401 1
+hippomind/ledger.py E501 13
+hippomind/ledger.py F401 3
+hippomind/ledger.py F841 1
+hippomind/mcp.py E501 2
+hippomind/network_visualizer.py F821 2
+hippomind/raw_extract.py E501 2
+hippomind/visualizer.py E402 10
+hippomind/visualizer.py E702 4
+hippomind/visualizer.py F401 1
+hippomind/visualizer.py F821 1
+hippomind/watcher.py E501 4
+hippomind/watcher.py F401 1
+integrations/query.py E501 1
+integrations/query.py E702 20
+integrations/query.py F541 2
+tests/benchmark_daemon_http.py F401 1
+tests/soak_simulation.py F841 2
+tests/test_activation_panel.py F401 1
+tests/test_agent_adapters.py E501 1
+tests/test_agent_adapters.py F401 5
+tests/test_agent_adapters.py F841 1
+tests/test_dsh_sessions.py F841 2
+tests/test_entity_graph.py F841 1
+tests/test_entity_overlay.py F401 1
+tests/test_export_import.py F401 1
+tests/test_final_qa.py F401 1
+tests/test_hub_rtt.py F401 1
+tests/test_mcp_register.py F401 1
+tests/test_memory_hub.py E501 6
+tests/test_memory_hub.py F841 1
+tests/test_metrics_counts.py E741 2
+tests/test_metrics_endpoint.py E741 2
+tests/test_reader_cache.py F401 1
+tests/test_restore_guard.py F401 1
+tests/test_retrieval_eval.py F401 1
+tests/test_schema_contract.py F401 1
+tests/test_timeline_gif.py F841 1
+tests/test_timeline_speed.py F401 1
+tests/test_upgrade_round.py F401 2
+tests/test_upgrade_round.py F811 1
+tests/test_upgrade_round.py F841 1
+tools/build_hippomind_manual.py E501 86
+tools/build_hippomind_manual.py E701 1
+tools/build_hippomind_manual.py E702 32
+tools/capture_gui_screenshots.py E402 5
