@@ -1,0 +1,9 @@
+# dsh-hippomind bundle 层：插入 HippoMind Memory Hub 接入插件行。
+# 官方 bundles 契约要求每个 bundle 包声明 dsh.bundle.patch（见 dsh-app-boot loadProfile）：
+# 缺少本文件与 package.json 中的声明会导致整个 profile 启动失败。
+# agentConfig 指向 0600 凭据文件的绝对路径；token 本体永不进入本文件。
+- insert:
+    - id: hippomind
+      name: '@dsh-external/dsh-hippomind'
+      config:
+        agentConfig: __HIPPOMIND_AGENT_CONFIG__

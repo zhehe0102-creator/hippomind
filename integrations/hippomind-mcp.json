@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "hippomind": {
+      "command": "python3",
+      "args": ["-m", "hippomind.mcp"]
+    }
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "name": "@dsh-external/dsh-hippomind",
+  "version": "0.1.0",
+  "description": "HippoMind Memory Hub 原生接入：请求前注入最小 Context Pack，会话结束结构化写回 progress/decision/result（零第三方依赖，凭据独立 0600 文件，故障隔离启动安全）",
+  "private": true,
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "license": "Apache-2.0"
+}

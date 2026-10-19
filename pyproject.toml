@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hippomind"
+version = "0.9.2"
+description = "A local, evidence-backed memory hub for coding agents"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+authors = [{name = "HippoMind contributors"}]
+dependencies = ["matplotlib>=3.6"]
+
+[project.urls]
+Homepage = "https://github.com/zps-31/hippomind"
+Repository = "https://github.com/zps-31/hippomind"
+Documentation = "https://github.com/zps-31/hippomind/blob/main/docs/DETAILED_GUIDE.md"
+
+[project.scripts]
+hippomind = "hippomind.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["hippomind", "hippomind.*", "integrations", "integrations.*"]
+exclude = ["*.tests", "*.tests.*", "*.test", "*.test.*", "*.__pycache__", "*.__pycache__.*"]
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.package-data]
+integrations = ["*.md", "*.json", "dsh-plugin/**/*"]

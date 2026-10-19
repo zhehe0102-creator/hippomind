@@ -1,0 +1,6 @@
+include LICENSE README.md MEMORY_HUB_GUIDE.md MEMORY_SYSTEM_DESIGN.md USAGE_GUIDE.md requirements.txt start-hippomind.command
+recursive-include integrations *
+recursive-include docs *
+recursive-include tools *
+global-exclude __pycache__
+global-exclude *.py[cod]

@@ -1,0 +1,73 @@
+"""daemon 优雅停机集成测试（迭代 31）。
+
+真实子进程 + SIGTERM：验证退出码 0、运行态文件清理、WAL 侧车归零。
+"""
+import json
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class GracefulShutdownTests(unittest.TestCase):
+    def test_sigterm_exits_cleanly_with_zero_wal(self):
+        tmp = Path(tempfile.mkdtemp(prefix="hippo-shutdown-test-"))
+        self.addCleanup(lambda: subprocess.run(
+            ["rm", "-rf", str(tmp)], check=False))
+        ledger = tmp / "sd.sqlite"
+        runtime = tmp / "runtime"
+        port = 18791
+
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "hippomind.daemon", "--ledger", str(ledger),
+             "--runtime-dir", str(runtime), "--port", str(port),
+             "--no-auth", "--no-watch"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            deadline = time.time() + 20
+            ready = False
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    self.fail("daemon 提前退出")
+                try:
+                    with urllib.request.urlopen(
+                            f"http://127.0.0.1:{port}/stats", timeout=1) as r:
+                        if r.status == 200:
+                            ready = True
+                            break
+                except Exception:
+                    time.sleep(0.2)
+            self.assertTrue(ready, "daemon 未在时限内就绪")
+
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/ingest",
+                data=json.dumps({"content": "优雅停机测试记忆", "kind": "fact",
+                                 "source_agent": "shutdown-test",
+                                 "evidence": ["test:shutdown"]}).encode(),
+                headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=5) as r:
+                self.assertEqual(r.status, 200)
+
+            proc.send_signal(signal.SIGTERM)
+            rc = proc.wait(timeout=20)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)
+
+        self.assertEqual(rc, 0, "SIGTERM 后必须以 0 退出")
+        self.assertFalse((runtime / "daemon-state.json").exists(),
+                         "运行态状态文件必须被清理")
+        wal = Path(str(ledger) + "-wal")
+        wal_bytes = wal.stat().st_size if wal.exists() else 0
+        self.assertEqual(wal_bytes, 0, "停机检查点后 WAL 必须归零")
+
+
+if __name__ == "__main__":
+    unittest.main()
