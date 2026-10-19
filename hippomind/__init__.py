@@ -40,9 +40,15 @@ from typing import Any
 
 __version__ = "1.0.0"
 
-#: 源码支持的账本 schema 版本。写在这里而不是 ledger 里，是为了让
-#: ``hippomind version`` 与安装检查能在不打开数据库的前提下报告兼容范围。
-SCHEMA_VERSION = 9
+#: 源码支持的账本 schema 版本。
+#:
+#: 单一事实来源是 :mod:`hippomind.ledger`；这里**延迟**转发，绝不复制字面量。
+#: 曾经源码树停留在 v5、生产库已到 v8，导致 150 万条记忆没有任何代码能打开，
+#: 而两处各自维护版本号正是让这种漂移无法被 CI 发现的直接原因。
+def __getattr_schema_version() -> int:
+    from .ledger import SCHEMA_VERSION as _version
+
+    return _version
 
 #: ``__all__`` 同时列出 hub 与 demo 的名字，保证 ``import *`` 与文档一致。
 __all__ = [
@@ -102,6 +108,10 @@ def __getattr__(name: str) -> Any:
     Raises :class:`AttributeError` (not :class:`ImportError`) for unknown names so
     that ``hasattr``/``getattr`` probing behaves normally.
     """
+    if name == "SCHEMA_VERSION":
+        value = __getattr_schema_version()
+        globals()["SCHEMA_VERSION"] = value
+        return value
     target = _LAZY_EXPORTS.get(name)
     if target is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
@@ -117,4 +127,4 @@ def __getattr__(name: str) -> Any:
 
 def __dir__() -> list:
     """Expose both real globals and the lazy exports for IDE/tab completion."""
-    return sorted(set(globals()) | set(_LAZY_EXPORTS))
+    return sorted(set(globals()) | set(_LAZY_EXPORTS) | {"SCHEMA_VERSION"})
