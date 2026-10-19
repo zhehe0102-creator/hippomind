@@ -24,7 +24,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from .hippocampus import token_sim
+from .textutil import token_sim
 from .ledger import CONTEXT_FIELDS, SQLiteLedger
 from .time_parse import parse_temporal_expression
 

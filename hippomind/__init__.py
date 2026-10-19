@@ -17,17 +17,36 @@
     h.reinforce(mid, +0.8)
     h.consolidate()
     h.save("memory.json"); h.load("memory.json")
+
+导入策略（重要）
+----------------
+本包同时承载两件事：**记忆中枢（hub）** 和 **网格世界演示（demo）**。
+两者以前都在这里急切导入，导致 ``import hippomind.ledger`` 会顺带加载
+1.4k 行的海马体演示、驱力引擎和网格世界。更糟的是存储层曾反向
+``from .hippocampus import token_sim``，形成循环依赖。
+
+现在 ``__init__`` 只做**惰性**导出：所有名字在首次访问时才解析，因此
+
+  * ``import hippomind.ledger`` 只加载存储层（毫秒级）；
+  * ``from hippomind import Hippocampus`` 仍然可用（向后兼容）；
+  * 不存在 hub → demo 的反向依赖。
+
+公共 API 见 ``__all__``。
 """
 
-from .memory import EpisodicMemory, SemanticMemory, Association
-from .hippocampus import Hippocampus
-from .drives import DriveEngine, DRIVE_LABELS
-from .mind import Mind
-from .grid_world import GridWorld
-from .agent import MemoryAgent
+from __future__ import annotations
 
-__version__ = "0.9.2"
+from typing import Any
+
+__version__ = "1.0.0"
+
+#: 源码支持的账本 schema 版本。写在这里而不是 ledger 里，是为了让
+#: ``hippomind version`` 与安装检查能在不打开数据库的前提下报告兼容范围。
+SCHEMA_VERSION = 9
+
+#: ``__all__`` 同时列出 hub 与 demo 的名字，保证 ``import *`` 与文档一致。
 __all__ = [
+    # --- demo / 记忆模型 ---
     "Hippocampus",
     "Mind",
     "DriveEngine",
@@ -37,6 +56,7 @@ __all__ = [
     "Association",
     "GridWorld",
     "MemoryAgent",
+    # --- hub ---
     "MemoryCommons",
     "CommonsHit",
     "CommonsMessage",
@@ -49,22 +69,52 @@ __all__ = [
     "AgentIdentity",
 ]
 
+#: ``name -> (submodule, attribute)``.  ``attribute`` may equal ``name`` for
+#: plain module members.  Everything here is resolved on first access only.
+_LAZY_EXPORTS = {
+    # demo package
+    "Hippocampus": ("hippocampus", None),
+    "Mind": ("mind", None),
+    "DriveEngine": ("drives", None),
+    "DRIVE_LABELS": ("drives", None),
+    "EpisodicMemory": ("memory", None),
+    "SemanticMemory": ("memory", None),
+    "Association": ("memory", None),
+    "GridWorld": ("grid_world", None),
+    "MemoryAgent": ("agent", None),
+    # hub package
+    "MemoryCommons": ("commons", None),
+    "CommonsHit": ("commons", None),
+    "CommonsMessage": ("commons", None),
+    "SharedMemory": ("commons", None),
+    "SQLiteLedger": ("ledger", None),
+    "ContextPackBuilder": ("context_pack", None),
+    "ContextPackOptions": ("context_pack", None),
+    "ArchiveWatcher": ("watcher", None),
+    "MemoryHubAgentAdapter": ("agent_adapter", None),
+    "AgentIdentity": ("agent_adapter", None),
+}
 
-def __getattr__(name):
-    """延迟加载共通层，避免 `python -m hippomind.commons` 的模块预载警告。"""
-    if name in {"MemoryCommons", "CommonsHit", "CommonsMessage", "SharedMemory"}:
-        from . import commons
-        return getattr(commons, name)
-    if name == "SQLiteLedger":
-        from .ledger import SQLiteLedger
-        return SQLiteLedger
-    if name in {"ContextPackBuilder", "ContextPackOptions"}:
-        from . import context_pack
-        return getattr(context_pack, name)
-    if name == "ArchiveWatcher":
-        from .watcher import ArchiveWatcher
-        return ArchiveWatcher
-    if name in {"MemoryHubAgentAdapter", "AgentIdentity"}:
-        from . import agent_adapter
-        return getattr(agent_adapter, name)
-    raise AttributeError(name)
+
+def __getattr__(name: str) -> Any:
+    """Resolve a public export lazily on first attribute access.
+
+    Raises :class:`AttributeError` (not :class:`ImportError`) for unknown names so
+    that ``hasattr``/``getattr`` probing behaves normally.
+    """
+    target = _LAZY_EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name = target[0]
+    import importlib
+
+    module = importlib.import_module(f".{module_name}", __name__)
+    value = getattr(module, name if target[1] is None else target[1])
+    # Cache on the module object so subsequent lookups skip __getattr__.
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list:
+    """Expose both real globals and the lazy exports for IDE/tab completion."""
+    return sorted(set(globals()) | set(_LAZY_EXPORTS))

@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 from collections import deque
 
-from .hippocampus import token_sim
+from .textutil import token_sim
 from .sanitize import MAX_ARCHIVE_MESSAGE_CHARS, sanitize_chat_content
 
 

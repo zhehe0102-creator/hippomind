@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence
 
-from .hippocampus import token_sim
+from .textutil import token_sim
 
 MAX_QUERY_CHARS = 2_000
 MAX_SHARED_CONTENT_CHARS = 12_000

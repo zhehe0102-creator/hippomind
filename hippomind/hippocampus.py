@@ -218,21 +218,10 @@ def gaussian_sim(a: List[float], b: List[float], sigma: float = 1.2) -> float:
     return math.exp(-d2 / (width * width))
 
 
-def token_sim(a: str, b: str) -> float:
-    """多语言词/字 bigram Jaccard，不依赖分词器。"""
-    def tokens(text: str) -> set:
-        parts = re.findall(r"[a-z0-9_]+|[\u3400-\u9fff]",
-                           _short_text(text).lower())
-        out = set(parts)
-        cjk = [p for p in parts if len(p) == 1 and "\u3400" <= p <= "\u9fff"]
-        out.update(cjk[i] + cjk[i + 1] for i in range(len(cjk) - 1))
-        return out
-
-    sa = tokens(a)
-    sb = tokens(b)
-    if not sa or not sb:
-        return 0.0
-    return len(sa & sb) / len(sa | sb)
+# ``token_sim`` is defined once in :mod:`hippomind.textutil` so the storage layer
+# no longer imports this demonstration module.  Re-exported here for the public
+# API and for backwards compatibility with existing callers and tests.
+from .textutil import token_sim  # noqa: E402  (kept next to its historical home)
 
 
 EMOTION_MAX_DIST = math.sqrt(2.0)  # Russell 环形最大欧氏距离
