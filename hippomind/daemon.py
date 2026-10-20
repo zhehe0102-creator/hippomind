@@ -263,8 +263,23 @@ class MemoryHubService:
     def access_policy(self, supplied: str) -> Optional[AccessPolicy]:
         policy = self._resolve_policy(supplied)
         if getattr(self, "read_only", False):
-            # 只读模式（LAN 镜像/巡检副本）：任何凭据都降级为只读共享视图。
-            return AccessPolicy.read_only_shared() if policy is not None else None
+            # Read-only mode (LAN mirror / inspection copy) downgrades every
+            # credential's *data plane*: no ingest, feedback, sync or reload.
+            if policy is None:
+                return None
+            if policy.admin:
+                # ...but the local operator who started this process must still
+                # be able to stop it.  Dropping shutdown together with the write
+                # verbs created a trap: the read-only daemon could never be
+                # stopped by `hippomind stop`, and `start --restart` onto it
+                # deadlocked in the 5-second stop wait ("拒绝并发启动第二个
+                # 服务").  Exactly one permission is added to the downgraded
+                # view -- admin stays False so /admin/reload remains refused and
+                # the data plane (scopes, raw-chat export) is untouched.
+                downgraded = AccessPolicy.read_only_shared()
+                return AccessPolicy(downgraded.agent_id, downgraded.scopes,
+                                    downgraded.permissions + ("shutdown",), False)
+            return AccessPolicy.read_only_shared()
         return policy
 
     def _resolve_policy(self, supplied: str) -> Optional[AccessPolicy]:
