@@ -264,7 +264,7 @@ def cmd_doctor(args) -> int:
     warnings = [item["detail"] for item in checks if item["severity"] == "warning"]
     errors = [item["detail"] for item in checks if item["severity"] == "error"]
     payload = {
-        "version": "0.9.2", "ready": not errors,
+        "version": SERVER_VERSION, "ready": not errors,
         "checks": checks, "warnings": warnings, "errors": errors,
         "ledger": {"events": stats.get("events", 0), "active": stats.get("active", 0),
                     "raw_chat": stats.get("raw_chat", 0), "kinds": kinds},
@@ -273,7 +273,7 @@ def cmd_doctor(args) -> int:
     if args.format == "json":
         _print(payload)
     else:
-        print("HippoMind doctor v0.9.2")
+        print(f"HippoMind doctor v{SERVER_VERSION}")
         for item in checks:
             marker = "OK" if item["severity"] == "ok" else "WARN" if item["severity"] == "warning" else "FAIL"
             print(f"[{marker}] {item['id']}: {item['detail']}")
