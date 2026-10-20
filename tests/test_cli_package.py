@@ -41,7 +41,15 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _rows(build_parser):
-    """Canonical, version-stable rows for one argparse tree."""
+    """Canonical, version-stable rows for one argparse tree.
+
+    Every field argparse renders its text from is included -- dest, default,
+    nargs, choices, type, required, metavar and help -- so the frozen digests
+    below also pin the visible ``--help`` wording.  ``prog`` is deliberately
+    left out: argparse renames its own section headings across releases
+    (3.11 turned ``optional arguments:`` into ``options:``), which is a CPython
+    change and not this CLI's contract.
+    """
     import argparse
 
     out = []
@@ -56,7 +64,8 @@ def _rows(build_parser):
             out.append("|".join([
                 path, opts, a.dest, repr(a.default), repr(a.nargs), choices,
                 str(getattr(a.type, "__name__", a.type)), type(a).__name__,
-                str(bool(a.required)),
+                str(bool(a.required)), "metavar=%r" % (a.metavar,),
+                "help=%r" % (a.help,),
             ]))
         sub = getattr(parser, "_subparsers", None)
         if sub is None:
@@ -92,45 +101,49 @@ def _digest(rows):
 
 #: Captured from the pre-split single-file ``hippomind/cli.py``: sub-command ->
 #: (sha256 of its option table, row count). '(root)' is the top-level parser.
+#: One deliberate exception, documented with the fix: ``pin``'s positional was
+#: rebound from the unusable dest ``memory-id`` to ``memory_id`` + metavar when
+#: the always-crashing ``hippomind pin`` was repaired.  Its *rendered* text did
+#: not move, and test_pin_help_text_is_unchanged pins that separately.
 PARSER_SURFACE = {
-    "(root)": ("204fed7438ee2ea4d2220bddd33e9c4effb653482b2533fb9487df6b0a8c0279", 39),
-    "agent-status": ("438e0a06002fac39467c14bc09b6babe6ee6d76c9dc41839d3c466f02cbc0bd1", 7),
-    "auto-context": ("7298c4afdd5e05e6d59db13549452c4e2a41bdde6a5b6dbb117da1fcf9614260", 22),
-    "backup": ("be21c2a2b809dfeb6c0265eaa0614bde22ef03cd0d27ed6fb06e5186c37abd47", 6),
-    "checkup": ("f9a15fc49afbaa1fdff02c2b0a102fdf0f4586b99a213d5504f79b2dc929a816", 7),
-    "conflicts": ("3e1a6772ff8b1815507ce04d31290a794832cdf248d898d8e5816528e4f75cad", 8),
-    "context": ("10720e7c6128c88ad80bb01973c0b641a9bc5cdb995ff37c005015dbeed98d5e", 22),
-    "discover-agents": ("c88800b68f735757f8888ee46c86bb4385d1652a607dece2ec463453a8922bf9", 6),
-    "doctor": ("e47583291643b78b4535e80aba4e7c3a10ace826ff44665d5b7405a288fd4035", 7),
-    "export": ("97d8bcc40d5a69fa8f9f508ef339b2460f174aa399b72b6687365759ece1044d", 13),
-    "facts": ("6fd7cde92b64265ee7ff9b845d1e7614c6030f6ede4b8970442cc2de5d33a904", 9),
-    "feedback": ("5f0c032c1a1356d01d4ae70b6297d006603bcc4a286225ae78c0e4f3e3986fe7", 10),
-    "forget": ("0ebec204a071c69fc896a053eb3b7e9210bbc38d7098b975fa34534dc7c2d2a8", 12),
-    "graph": ("0376060228ee1a21294ec2b69ebc1e75f3cd6fe4256b5dd29b84dbeeaacf95b2", 10),
-    "import": ("5237dee4dc9600a021235c9ddbd98c6c0ede826cda4a7647ea26aa304c95984f", 9),
-    "ingest": ("864dacc3187255bb93209ca9a6737d3f26de9995695424b21d8e2e60425251cf", 16),
-    "init": ("3b3d860d7c5d625e7a913677925cbb769b2fbbbe72c23eeb2121335384939c42", 7),
-    "inject": ("d4aaa78949c7b98f5b9e570a584c8a44385862613affa3b6e283aab274938234", 7),
-    "install-agents": ("4644ea500d1e8768ef6e3380675f2de770d0cfcd5518583c3569d66c8ab7442b", 10),
-    "install-auto": ("ab7c897c7e313710b7fab11fc725b123b4526c096367a12b344aa9a5144e3445", 5),
-    "login-install": ("802df563a3c2c63bdbde4efb154dff6b40480a2e531c8cd365c548dd7acdd527", 9),
-    "login-remove": ("4a83c8cac43e06b745b67176fbf08a9237b29b6167de671fcae51f876af27725", 1),
-    "maintain": ("c0d16821861d5afd67cf831ee3241cd146a2694222692fb9cb686dd19df6bbb6", 15),
-    "monitor": ("c4a7957b78d9d0fbf0aaf1e8251d2fd4f745ef75bec2049a2ea83cca569914b9", 8),
-    "pin": ("264a24dab4e195cd55882fc104da26cd0bcb5f489ebc9801f5a1922d04f86b21", 7),
-    "pins": ("a00513e24af6f4306d55b26d8b13ee3a8b54568cc2a14f0fc5c3507a698b2f4f", 8),
-    "recovery-check": ("a4d138fd21ed00340589b8a8678d22f01cf68afe1dbb965afa46795e18c41866", 5),
-    "redact-raw": ("97258ecdbfbbc538b84c34d97d37fbdb19e1d8ff66db2243616bfdf97d70d0dc", 7),
-    "resolve": ("11dc795afb3c71f14ae1aa21a5b02a1ffc4c2ff23daefe22ae8c621b7942c8f8", 8),
-    "restore": ("27ca55fe9f223db71c8e9a595fa21977005f9766736748c3e43362963c2296da", 7),
-    "scan-raw": ("b1b9d4565e993dc7ac230a5ab27f04cb15fdb1d5ff305677c0df293680608bb6", 6),
-    "skills": ("5dc3324b0c8f0018cc0984a1a5ba49c738a81ae3605a1e50a3a2d191a4d8e74a", 8),
-    "start": ("d18f69577166c6d0f533b94727f1eb0f1f7341499caa760f4b429315e9d8d21c", 11),
-    "status": ("d838a3ec04725c34468bc14675f982b34a500bf43452414f7da60a7c4aa12908", 5),
-    "stop": ("433fae3cc8c6e4fa1109d85b1968864d5b7beff8d9015c60e967b1f305622611", 5),
-    "sync": ("76a415aa7946d43012256400a1c86b6b05d4e80d2d78bdf4ccfbeeada26930fa", 7),
-    "version": ("044ee9154d69821de418f8b76c846c0ec0931749391eb38c0248f6adf620c557", 6),
-    "watch": ("a20b8887569ca48b5192f789b9a785f676ea3c96147fd4db98531a76b442e9bc", 8),
+    "(root)": ("91665cbe9271da755e7f41f7eac1aa771bfa60caf2f64fcecb83f5961fc81637", 39),
+    "agent-status": ("c6ce3680226dad9d5019b2ce233e1580998dfc861921c6e3ca1f02ff8e4ed5bf", 7),
+    "auto-context": ("bcd24f3b2a2dd0f637d61a2f1dc9744cf08d71cef0717f5dfc97203004d1af8c", 22),
+    "backup": ("3ba2b08b93a835ababbf4b62a644915a0df48e7e998837500580929290eadfd5", 6),
+    "checkup": ("f423e1adb4f6d6617acf985908bb9ffd532c4680269f621eaa066e566c5105c5", 7),
+    "conflicts": ("aef6f57aa52644e95131795e33dbc4b0882d949530e3d9504e584982c149c28f", 8),
+    "context": ("d3835f73f8eb2364e3b1e08e6281f45755352304564bd108ac8ec536f3b3b5ce", 22),
+    "discover-agents": ("2e0dbd54e137ff04e8f0e4a6659d7b161494d53088ff22f152227e8ea019bbf7", 6),
+    "doctor": ("b953cb2db3bf28e7d6b06c9fcc2a47ee04bd7218846ceadd934aa47702d93d7f", 7),
+    "export": ("a81c0f81a8cdb1b0739bf5a7e4dc23370113a13a422515cbfff1582897cc4790", 13),
+    "facts": ("e6a51afb9a8d74116eb93e92a8f52ef59f2ccc7d70bfff83018e8d32fcb324ea", 9),
+    "feedback": ("49fabd11ed0bf3931e58f04c5089040529ea1b11a5e6a0101fc2c5c4c9f3b376", 10),
+    "forget": ("09ae72b33f1514839b071275b26b6dcf675cbfdd0e54e219c825e7a600eecb39", 12),
+    "graph": ("d0de644b24f9fb148ec1aac11e4ec6f3588463af7f005e14075cf73ea53aa91f", 10),
+    "import": ("7cef9cf2068a62219b1e087179f1c9c82ddd24ca9f419902809f9ee099f89735", 9),
+    "ingest": ("fcbaaa978a7eb02003d9c59c155c2ada1046bbc303f4cd3f30a2badf471a0aa6", 16),
+    "init": ("fbb37d4a35997259544a616bd00864ce25d48e51c7ffbe5080cab0cf5e25a5a4", 7),
+    "inject": ("715fc66c32d10ce5a93b563cb0e119a73371e776b774881b404f4c397e1bc9a1", 7),
+    "install-agents": ("b66764b36408dc6961cde5d40cc84b0f8fa82cbf3d3ad9b7cf0054c17c646992", 10),
+    "install-auto": ("447f0eb79f1275d01df9140c413efa05515a0e03e7dc5a4f73ff1b512d83533d", 5),
+    "login-install": ("c2db242076f57925e4c0ae8615f316349b881aa5f5c5979b0d3606a2ea2bd2b2", 9),
+    "login-remove": ("9c3de441f2f0bdafae81d51c097cc6010804c9f51d328961caf66e9506243515", 1),
+    "maintain": ("af3e553a5c81b9756656953f61dfcd1c6036915f1e71775387c19b936c919d78", 15),
+    "monitor": ("2aa796bd4c54d9f4b08b7391a1f40cd2302628f2fd8b371939cc0a0ceaf000ca", 8),
+    "pin": ("013be85247f25382924bfa07631cb6e3bf105cd0ee3fc429672d714e0038466d", 7),
+    "pins": ("997fe940bdb19a55d118c315f5c20b3a89a20c157b56f789dc5634420a70f3f2", 8),
+    "recovery-check": ("705153b2fee3eeade6ec421a0e59a0513470f2e99a1ea2fad0daf616ec0f4ade", 5),
+    "redact-raw": ("625e61fc9227b0085936b70d89ed8d34503f9122957eb410383281e257074866", 7),
+    "resolve": ("f9d0a3664db5a0ea7220fbc3caefdaaa011efc491b1671746aef19ecc6e7b65d", 8),
+    "restore": ("64134b047bbeebb2eea83f238187a8b18c9aaeceb0294be017c388ed12e76217", 7),
+    "scan-raw": ("2bfcc94e26f159637996868cae972595c7d066b96e3fee9a864cc1cc4af4d703", 6),
+    "skills": ("6cc88b4798ca14e83f2fa204aee746991ad1d199c9bde035e1da858d51be7567", 8),
+    "start": ("2a5aeef5581011b717bb389df5afb58d739a33f18158b2b4c9fe4bd641c9dbcb", 11),
+    "status": ("03c64382fa63105c16bd68d6df76a5839be13fef7185d9dda3c386a3e1ca550e", 5),
+    "stop": ("602eebd0f3d42421f8b2eef6470d81c2c0b45f0bc02f65d99796e39a2796cf91", 5),
+    "sync": ("f0a185df340f6cfecbb8a2311ddb133311cc2159638d64142bbf72c99644389d", 7),
+    "version": ("676dd0d22db8422bdf37d73438e472a2e1172b201bcc8e89e1d1ca3a4f9972f0", 6),
+    "watch": ("a2964f1b7ccd6b0d2d93dd5429dadba056d4ecc7a7afd6b0edeb8567627ca315", 8),
 }
 
 #: Every public attribute name of the pre-split single-file module.  Names, not

@@ -232,7 +232,14 @@ def build_parser() -> argparse.ArgumentParser:
     ):
         command = sub.add_parser(name, help=help_text)
         _connection_arguments(command)
-        command.add_argument(argument)
+        if name == "pin":
+            # argparse derives a positional's dest from its name, so the
+            # dashed spelling bound ``memory-id`` while cmd_pin reads
+            # ``args.memory_id``.  The identifier is the dest; metavar keeps
+            # the help and usage text exactly as it was.
+            command.add_argument("memory_id", metavar=argument)
+        else:
+            command.add_argument(argument)
         if name == "import":
             command.add_argument("--source-agent", default="legacy-json")
         if name == "pin":
