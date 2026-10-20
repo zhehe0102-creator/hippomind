@@ -109,6 +109,22 @@ def _health(paths: RuntimePaths, port: int) -> Dict[str, Any]:
     return _request(paths, port, "GET", "/health", auth=False)
 
 
+def _daemon_reachable(paths: RuntimePaths, port: int) -> bool:
+    """True 仅当端口上确实有 daemon 在应答；本函数自身永不抛异常。
+
+    离线直写的唯一合法条件就是「daemon 不可达」。早先三处调用写作
+    ``try: _health(...); raise exc`` / ``except LedgerError: pass``，
+    而自己 raise 的正是自己 catch 的 LedgerError，于是这道守卫永远失效：
+    daemon 活着并且明确拒绝（权限不足、只读模式、403）时，CLI 照样绕过
+    daemon 直写主账本。探针不与被检查的异常共用一个 try，语义就清楚了。
+    """
+    try:
+        _health(paths, port)
+        return True
+    except LedgerError:
+        return False
+
+
 def _daemon_serves_ledger(paths: RuntimePaths, port: int) -> bool:
     """True 仅当端口上的 daemon 正在服务目标账本本身。
 

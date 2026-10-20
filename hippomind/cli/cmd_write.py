@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Mapping
 from ..ledger import LedgerError, SQLiteLedger
-from . import _agent_token, _health, _paths, _port, _request
+from . import (_agent_token, _daemon_reachable, _paths, _port, _request)
 from .common import _print, _reject_restricted_direct
 
 
@@ -127,13 +127,11 @@ def cmd_ingest(args) -> int:
     try:
         result = _request(paths, _port(args, paths), "POST", "/ingest", payload,
                           token=_agent_token(args, paths))
-    except LedgerError as exc:
-        # daemon 不可达时安全直写；若 daemon 实际在跑（错误另有原因）则原样抛出。
-        try:
-            _health(paths, _port(args, paths))
-            raise exc
-        except LedgerError:
-            pass
+    except LedgerError:
+        # daemon 不可达时安全直写；daemon 实际在跑（错误另有原因，例如权限
+        # 不足或只读模式拒绝）则原样抛出，绝不绕过 daemon 直写主账本。
+        if _daemon_reachable(paths, _port(args, paths)):
+            raise
         _reject_restricted_direct(args, "ingest 离线直写")
         ledger = SQLiteLedger(paths.ledger_path)
         ir = ledger.ingest(payload)
@@ -153,13 +151,10 @@ def cmd_feedback(args) -> int:
     try:
         result = _request(paths, _port(args, paths), "POST", "/feedback", body,
                           token=_agent_token(args, paths))
-    except LedgerError as exc:
-        # daemon 不可达时安全直写；daemon 在跑则原样抛出。
-        try:
-            _health(paths, _port(args, paths))
-            raise exc
-        except LedgerError:
-            pass
+    except LedgerError:
+        # daemon 不可达时安全直写；daemon 在跑（含明确拒绝）则原样抛出。
+        if _daemon_reachable(paths, _port(args, paths)):
+            raise
         ledger = SQLiteLedger(paths.ledger_path)
         updated = ledger.feedback(body["memory_id"], float(body["signal"]),
                                   str(body.get("note", "")),

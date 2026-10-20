@@ -13,7 +13,7 @@ from ..embeddings import HashingNGramEmbedding
 from ..injection import InjectionState
 from ..ledger import LedgerError, SQLiteLedger
 from ..watcher import ArchiveWatcher, default_dsh_sessions_root
-from . import _agent_token, _paths, _port, _request
+from . import (_agent_token, _daemon_reachable, _paths, _port, _request)
 from .common import _print, _reject_restricted_direct
 
 
@@ -67,6 +67,10 @@ def cmd_sync(args) -> int:
         result = _request(paths, _port(args, paths), "POST", "/sync", {},
                           token=_agent_token(args, paths))
     except LedgerError:
+        # sync_once 同样直写主账本，因此只有「daemon 不可达」才允许降级；
+        # daemon 在跑时它的拒绝（权限不足、只读模式）必须原样抛给调用方。
+        if _daemon_reachable(paths, _port(args, paths)):
+            raise
         _reject_restricted_direct(args, "sync")
         result = ArchiveWatcher(SQLiteLedger(paths.ledger_path), args.archive,
                                 poll_interval=args.watch_interval,
