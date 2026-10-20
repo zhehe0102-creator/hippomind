@@ -63,9 +63,27 @@
 - **未动**（明确决策）：Context Pack 8 项/6000 token/16000 字符预算契约；「记忆：」显式门控；loopback-only daemon 与 token 权限模型；raw 冷数据的 LIKE 审计通道。
 
 ## 四、验证状态
-- 全量单测：基线 384 → 483（+99）全绿；双语评测四类全 1.0。
-- `drill_schema_migration.py` 21 项 PASS；`scripts/lint.sh` gate 90/90、legacy 259/259。
+- 全量单测：基线 384 → **554** 全绿（+170）；双语评测四类全 1.0。
+- `drill_schema_migration.py` fixtures 模式 PASS（含「拒绝未来库必须字节不变」的负向验证）；
+- `scripts/lint.sh` gate 90/90、legacy 254/254（旧 cli.py 的 2 个 E501 随文件消失清零后，基线已 rebase 到真实值，零富余）。
 - 真实库：`PRAGMA quick_check = ok`，search/FTS/无孤儿行复核通过。
+
+## 四之二、审查之后又挖出的存量 bug（全部先于本轮改动存在，已修复）
+
+这些不在最初的审查清单里，是重构过程中被测试、冒烟或端到端验证撞出来的，
+每一条都先复现再修，并有负向控制（revert 后测试必须变红）：
+
+| 缺陷 | 后果 | 修复 |
+|---|---|---|
+| `pin <id>` 必崩（argparse dest 为 `memory-id`，代码读 `args.memory_id`） | 置顶功能从未可用，且裸 traceback 绕过 CLI 错误契约 | `24417e2`（10 项测试；冻结守卫同时从 9 字段升到 11 字段） |
+| `start --restart --read-only` 抛 `TypeError` | 只读模式的 restart 路径完全不可用 | `e293cf8`（参数真正接到底层启动路径，端到端验证 200→403） |
+| **daemon 明确拒绝时 CLI 绕过它直写主账本**（`raise exc` 被同一函数的 `except LedgerError` 吃掉；`cmd_sync` 连探针都没有） | 权限模型形同虚设 + 绕开单写者串行化，**安全缺陷** | `82c58e5`（探针 `_daemon_reachable`，3 处收口，12 项测试，主账本行数断言不变） |
+| `stop` 谎报成功（daemon 还在跑也 exit 0） | `stop && restore` 会在账本仍有写方时恢复 | `ff610e0`（exit 0/1/2 三态语义，5 项端到端） |
+| 只读 daemon 谁都停不掉（降级策略把 `shutdown` 也剥夺，操作员锁死自己起的进程，`--restart` 撞 5s 死锁） | 运维陷阱 | `e5a9cc9`（严格 additive：仅 +shutdown，scopes/admin=False 不变，/admin/reload 仍 403） |
+| `fts_sync_report` 二次复杂度（>14 分钟不收敛）+ cold 行误判 → 任何有冷数据的库**永久 warn** | 健康检查废掉，训练运维忽略告警 | `fix(health)`：线性反连接 + 正确不变量（136K 行 0.29s，6 项测试） |
+| 版本自述四处各自漂移（doctor `0.9.2`、MCP `0.9.1`、installer `0.7`、三处手抄 `0.9.2`） | 客户端与运维看到互相矛盾的"两个版本在跑" | `fa6adb1`+`fdb29db`+版本单一来源；AST 扫描禁止再写字面量 |
+| 测试硬编码端口（18890/18891/18791）与新增真 daemon 测试跨模块撞车 | 全套间歇性红（我自己踩过） | `ca1f430` 全部改动态端口；554 连跑两遍全绿 |
+| AppleDouble `._*` 渗进 `.git/` 内部（29 个，含被 git 当真 pack index 读的） | 每条 git 命令刷 non-monotonic index | 逐个验证魔术字节后删除，`git fsck` 通过 |
 
 ## 五、遗留风险（如实）
 1. semantic 折叠后 daemon 的「空闲巩固 +10」日志会停增，但若有人回退 identity 键会复发——已有 20+ 回归测试锁死。
