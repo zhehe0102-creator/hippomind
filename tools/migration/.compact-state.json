@@ -311,26 +311,26 @@
     "samples": 20,
     "integrity_check": {
       "status": "ok",
-      "elapsed_seconds": 1.9,
+      "elapsed_seconds": 2.0,
       "ok": true
     },
     "counts": {
-      "memories": 192327,
-      "ledger_events": 192327,
-      "memory_fts": 4137,
+      "memories": 136459,
+      "ledger_events": 136459,
+      "memory_fts": 5571,
       "raw_chat": 131270,
-      "non_raw": 61057,
-      "semantic": 56010,
+      "non_raw": 5189,
+      "semantic": 142,
       "semantic_distinct": 142,
       "schema_version": "8",
       "page_size": 4096,
-      "page_count": 169374,
-      "freelist_count": 0,
+      "page_count": 104128,
+      "freelist_count": 3136,
       "journal_mode": "wal",
       "min_created": "2026-08-09T12:33:01.714000+00:00",
-      "max_created": "2026-10-02T10:10:40.536474+00:00"
+      "max_created": "2026-10-02T09:50:38+00:00"
     },
-    "file_bytes": 693755904,
+    "file_bytes": 426508288,
     "file_bytes_wal": 0,
     "file_bytes_shm": 32768,
     "duplicate_plan_after": {
@@ -339,228 +339,140 @@
       "rows_inside_groups": 0,
       "redundant_rows": 0,
       "largest_group": null,
-      "memories_before": 192327,
-      "memories_after_expected": 192327,
+      "memories_before": 136459,
+      "memories_after_expected": 136459,
       "content_only_groups": 13590,
       "content_only_redundant_rows": 59876
     },
     "duplicates_eliminated": true,
     "fts_sync": {
-      "status": "warn",
-      "projections": 56768,
-      "fts_rows": 4137,
-      "unindexed": 185274,
-      "fts_cold_leak": 0,
-      "expected_by_rebuild_invariant": 61439,
-      "drift_vs_rebuild_invariant": true,
+      "status": "ok",
+      "fts_rows": 5571,
+      "active_accepted": 392,
+      "active_accepted_missing": 0,
+      "cold_rows_deliberately_unindexed": 132216,
+      "shipped_style_unindexed": 130888,
+      "fts_cold_leak": 1328,
       "active_claims": 0,
       "dangling_claims": 0,
-      "method": "linear temp-table anti-join (shipped fts_sync_report is quadratic)"
+      "method": "linear temp-table anti-join; invariant is active+accepted fully indexed"
     },
     "baseline_fts_sync": null,
     "fts_sync_unchanged_vs_baseline": false,
     "recall": {
-      "elapsed_seconds": 0.2,
-      "sample_size": 20,
-      "recalled": 4,
-      "at_rank_1": 0,
+      "elapsed_seconds": 0.0,
+      "sample_size": 10,
+      "recalled": 9,
+      "recalled_content_equivalent": 9,
+      "at_rank_1": 2,
+      "distinct_queries": 10,
       "details": [
         {
-          "memory_id": "mem_9b98cbe8914c590e86581fe6ec48f480",
-          "query": "的已证据化摘",
+          "memory_id": "mem_cd45c27c1f7e9e2fe993055140f68c6d",
+          "query": "的已证据化摘要",
           "found": false,
           "rank": null,
+          "content_equivalent": false,
           "returned": 80,
           "scope": "shared",
           "kind": "semantic",
           "lifecycle": "active"
         },
         {
-          "memory_id": "mem_5507ae296d1e6797c130c84185fe6229",
-          "query": "的已证据化摘",
-          "found": false,
-          "rank": null,
-          "returned": 80,
-          "scope": "shared",
-          "kind": "semantic",
-          "lifecycle": "active"
-        },
-        {
-          "memory_id": "mem_fdfb5bef1187c6b40e9124a69a8bf888",
-          "query": "的已证据化摘",
-          "found": false,
-          "rank": null,
-          "returned": 80,
-          "scope": "shared",
-          "kind": "semantic",
-          "lifecycle": "active"
-        },
-        {
-          "memory_id": "mem_bcef6dffd1faefd476ab190b82a2968c",
-          "query": "的已证据化摘",
-          "found": false,
-          "rank": null,
-          "returned": 80,
-          "scope": "shared",
-          "kind": "semantic",
-          "lifecycle": "active"
-        },
-        {
-          "memory_id": "mem_fb6e21c161a295487b0148ba671a8e9f",
-          "query": "的已证据化摘",
-          "found": false,
-          "rank": null,
-          "returned": 80,
-          "scope": "shared",
-          "kind": "semantic",
-          "lifecycle": "active"
-        },
-        {
-          "memory_id": "mem_20ee47d07a3944fcb48b0ce535a3e6c3",
-          "query": "的已证据化摘",
-          "found": false,
-          "rank": null,
-          "returned": 80,
-          "scope": "shared",
-          "kind": "semantic",
-          "lifecycle": "active"
-        },
-        {
-          "memory_id": "mem_3a1f909182d6c2ab0bc96d33b7919c5d",
-          "query": "的已证据化摘",
+          "memory_id": "mem_7e204d82984295dbf74a14f9a4345d3b",
+          "query": "project",
           "found": true,
-          "rank": 80,
-          "returned": 80,
+          "rank": 1,
+          "content_equivalent": true,
+          "returned": 1,
           "scope": "shared",
           "kind": "semantic",
           "lifecycle": "active"
         },
         {
-          "memory_id": "mem_7d2f256814691b29bb0999bc1b17eb09",
-          "query": "的已证据化摘",
+          "memory_id": "mem_44efda25c73e23cddc849e4af2e35ffc",
+          "query": "hippomind",
           "found": true,
-          "rank": 41,
-          "returned": 80,
-          "scope": "shared",
-          "kind": "semantic",
-          "lifecycle": "active"
-        },
-        {
-          "memory_id": "mem_90dfe79550441f0f03022ab3c52c799b",
-          "query": "的已证据化摘",
-          "found": false,
-          "rank": null,
-          "returned": 80,
-          "scope": "shared",
-          "kind": "semantic",
-          "lifecycle": "active"
-        },
-        {
-          "memory_id": "mem_4d257192cfc4d600c0574bef78bf4a24",
-          "query": "的已证据化摘",
-          "found": false,
-          "rank": null,
-          "returned": 80,
-          "scope": "shared",
-          "kind": "semantic",
-          "lifecycle": "active"
-        },
-        {
-          "memory_id": "mem_46165a2052483eb7f2da4ff5b54feadd",
-          "query": "的已证据化摘",
-          "found": false,
-          "rank": null,
-          "returned": 80,
-          "scope": "shared",
-          "kind": "semantic",
-          "lifecycle": "active"
-        },
-        {
-          "memory_id": "mem_bad164530e15eead1b69702695453beb",
-          "query": "的已证据化摘",
-          "found": true,
-          "rank": 46,
-          "returned": 80,
-          "scope": "shared",
-          "kind": "semantic",
-          "lifecycle": "active"
-        },
-        {
-          "memory_id": "mem_08aa00b543374f1c18d5bd7cacfe9281",
-          "query": "的已证据化摘",
-          "found": false,
-          "rank": null,
-          "returned": 80,
-          "scope": "shared",
-          "kind": "semantic",
-          "lifecycle": "active"
-        },
-        {
-          "memory_id": "mem_5ce4f83d8ba0f3dd62e9a16b690cfc90",
-          "query": "的已证据化摘",
-          "found": false,
-          "rank": null,
-          "returned": 80,
-          "scope": "shared",
-          "kind": "semantic",
-          "lifecycle": "active"
-        },
-        {
-          "memory_id": "mem_2635be84a2314ac8732340251fced256",
-          "query": "的已证据化摘",
-          "found": false,
-          "rank": null,
-          "returned": 80,
-          "scope": "shared",
-          "kind": "semantic",
-          "lifecycle": "active"
-        },
-        {
-          "memory_id": "mem_01f0d1346eb7c782dd1fcd88529e7487",
-          "query": "的已证据化摘",
-          "found": false,
-          "rank": null,
-          "returned": 80,
-          "scope": "shared",
-          "kind": "semantic",
-          "lifecycle": "active"
-        },
-        {
-          "memory_id": "mem_bd670cd08ce767c1a68a600676f52fb4",
-          "query": "的已证据化摘",
-          "found": false,
-          "rank": null,
-          "returned": 80,
-          "scope": "shared",
-          "kind": "semantic",
-          "lifecycle": "active"
-        },
-        {
-          "memory_id": "mem_91f43b52c32db4decabf6f1b1e6eb43c",
-          "query": "的已证据化摘",
-          "found": true,
-          "rank": 68,
-          "returned": 80,
+          "rank": 1,
+          "content_equivalent": true,
+          "returned": 20,
           "scope": "agent:deepseek",
           "kind": "semantic",
           "lifecycle": "active"
         },
         {
-          "memory_id": "mem_4dc5a8b71d6792a28d732966ab68be85",
-          "query": "的已证据化摘",
-          "found": false,
-          "rank": null,
-          "returned": 80,
+          "memory_id": "mem_a5fff262571d4c6ec44dc16ee70e413c",
+          "query": "审查首次启动",
+          "found": true,
+          "rank": 5,
+          "content_equivalent": true,
+          "returned": 9,
           "scope": "shared",
           "kind": "semantic",
           "lifecycle": "active"
         },
         {
-          "memory_id": "mem_755720dece2d6f9a4e82b3498a0c6b06",
-          "query": "的已证据化摘",
-          "found": false,
-          "rank": null,
-          "returned": 80,
+          "memory_id": "mem_690128c1569010c062a62af6b4ce1aef",
+          "query": "可信记忆系统修复",
+          "found": true,
+          "rank": 3,
+          "content_equivalent": true,
+          "returned": 5,
+          "scope": "shared",
+          "kind": "semantic",
+          "lifecycle": "active"
+        },
+        {
+          "memory_id": "mem_69d2df378114ac42ec14048e5774b7a2",
+          "query": "主仓库新增",
+          "found": true,
+          "rank": 2,
+          "content_equivalent": true,
+          "returned": 5,
+          "scope": "shared",
+          "kind": "semantic",
+          "lifecycle": "active"
+        },
+        {
+          "memory_id": "mem_4d0a86da9167e40fd15cb4c41a8fa9f5",
+          "query": "完整可信记忆交付",
+          "found": true,
+          "rank": 2,
+          "content_equivalent": true,
+          "returned": 4,
+          "scope": "shared",
+          "kind": "semantic",
+          "lifecycle": "active"
+        },
+        {
+          "memory_id": "mem_98ee23ca5000c8e5e057e4db934a0456",
+          "query": "验证任务文件和共",
+          "found": true,
+          "rank": 2,
+          "content_equivalent": true,
+          "returned": 4,
+          "scope": "shared",
+          "kind": "semantic",
+          "lifecycle": "active"
+        },
+        {
+          "memory_id": "mem_0da25127bdd85e0e5b1de8503ccc0853",
+          "query": "预算改为",
+          "found": true,
+          "rank": 2,
+          "content_equivalent": true,
+          "returned": 3,
+          "scope": "shared",
+          "kind": "semantic",
+          "lifecycle": "active"
+        },
+        {
+          "memory_id": "mem_ae85cd998b7dd6158f736231e9c0af2f",
+          "query": "技能记忆",
+          "found": true,
+          "rank": 3,
+          "content_equivalent": true,
+          "returned": 6,
           "scope": "shared",
           "kind": "semantic",
           "lifecycle": "active"
@@ -591,8 +503,8 @@
           "created_at": "2026-08-11T15:41:13.865000+00:00",
           "row_still_in_db": false,
           "event_still_in_db": false,
-          "survivor_memory_id": null,
-          "content_identical_to_survivor": false,
+          "survivor_memory_id": "mem_fe6212540fa56cb4d56dd68dc9737e8b",
+          "digest_matches_survivor_event": false,
           "recoverable": false
         },
         {
@@ -604,8 +516,8 @@
           "created_at": "2026-08-15T02:52:43.561000+00:00",
           "row_still_in_db": false,
           "event_still_in_db": false,
-          "survivor_memory_id": null,
-          "content_identical_to_survivor": false,
+          "survivor_memory_id": "mem_e68874e0b64c293aebec730b3ac87661",
+          "digest_matches_survivor_event": false,
           "recoverable": false
         },
         {
@@ -617,8 +529,8 @@
           "created_at": "2026-08-16T11:37:17.881000+00:00",
           "row_still_in_db": false,
           "event_still_in_db": false,
-          "survivor_memory_id": null,
-          "content_identical_to_survivor": false,
+          "survivor_memory_id": "mem_f1304fd8881dd4097c99f3af1d4cd968",
+          "digest_matches_survivor_event": false,
           "recoverable": false
         },
         {
@@ -630,8 +542,8 @@
           "created_at": "2026-08-12T00:33:16.883000+00:00",
           "row_still_in_db": false,
           "event_still_in_db": false,
-          "survivor_memory_id": null,
-          "content_identical_to_survivor": false,
+          "survivor_memory_id": "mem_f6a339f0b18da42113e61266d08b0583",
+          "digest_matches_survivor_event": false,
           "recoverable": false
         },
         {
@@ -643,8 +555,8 @@
           "created_at": "2026-08-14T16:59:05.701000+00:00",
           "row_still_in_db": false,
           "event_still_in_db": false,
-          "survivor_memory_id": null,
-          "content_identical_to_survivor": false,
+          "survivor_memory_id": "mem_faf367acd1cda7e1fb40305af1f253c4",
+          "digest_matches_survivor_event": false,
           "recoverable": false
         },
         {
@@ -656,8 +568,8 @@
           "created_at": "2026-08-11T15:19:00.975000+00:00",
           "row_still_in_db": false,
           "event_still_in_db": false,
-          "survivor_memory_id": null,
-          "content_identical_to_survivor": false,
+          "survivor_memory_id": "mem_c4afb1f616e113b7bec91565fe8c6dc0",
+          "digest_matches_survivor_event": false,
           "recoverable": false
         },
         {
@@ -669,8 +581,8 @@
           "created_at": "2026-08-10T06:22:09.185000+00:00",
           "row_still_in_db": false,
           "event_still_in_db": false,
-          "survivor_memory_id": null,
-          "content_identical_to_survivor": false,
+          "survivor_memory_id": "mem_d4cf183b9c5db449b561d04d07f3be3a",
+          "digest_matches_survivor_event": false,
           "recoverable": false
         },
         {
@@ -682,8 +594,8 @@
           "created_at": "2026-08-14T17:54:45.822000+00:00",
           "row_still_in_db": false,
           "event_still_in_db": false,
-          "survivor_memory_id": null,
-          "content_identical_to_survivor": false,
+          "survivor_memory_id": "mem_e15781b10218f1167af704e21c368d76",
+          "digest_matches_survivor_event": false,
           "recoverable": false
         },
         {
@@ -695,8 +607,8 @@
           "created_at": "2026-08-14T19:15:21.843000+00:00",
           "row_still_in_db": false,
           "event_still_in_db": false,
-          "survivor_memory_id": null,
-          "content_identical_to_survivor": false,
+          "survivor_memory_id": "mem_efd2dfa80de6e2be7c0b2511ba46c9d4",
+          "digest_matches_survivor_event": false,
           "recoverable": false
         },
         {
@@ -708,8 +620,8 @@
           "created_at": "2026-08-17T03:52:09.448000+00:00",
           "row_still_in_db": false,
           "event_still_in_db": false,
-          "survivor_memory_id": null,
-          "content_identical_to_survivor": false,
+          "survivor_memory_id": "mem_f246debe4d86def4a6295784722543fe",
+          "digest_matches_survivor_event": false,
           "recoverable": false
         },
         {
@@ -721,8 +633,8 @@
           "created_at": "2026-08-11T15:42:14.611000+00:00",
           "row_still_in_db": false,
           "event_still_in_db": false,
-          "survivor_memory_id": null,
-          "content_identical_to_survivor": false,
+          "survivor_memory_id": "mem_e427115b2326cba63f489a7bed10bcdd",
+          "digest_matches_survivor_event": false,
           "recoverable": false
         },
         {
@@ -734,8 +646,8 @@
           "created_at": "2026-08-27T01:12:08.371000+00:00",
           "row_still_in_db": false,
           "event_still_in_db": false,
-          "survivor_memory_id": null,
-          "content_identical_to_survivor": false,
+          "survivor_memory_id": "mem_f8e71f581fac447b72df8c3400d833bf",
+          "digest_matches_survivor_event": false,
           "recoverable": false
         },
         {
@@ -747,8 +659,8 @@
           "created_at": "2026-08-16T10:06:40.146000+00:00",
           "row_still_in_db": false,
           "event_still_in_db": false,
-          "survivor_memory_id": null,
-          "content_identical_to_survivor": false,
+          "survivor_memory_id": "mem_f9cc00a5838912d7266e350ac210f3b4",
+          "digest_matches_survivor_event": false,
           "recoverable": false
         },
         {
@@ -760,8 +672,8 @@
           "created_at": "2026-08-12T00:32:36.741000+00:00",
           "row_still_in_db": false,
           "event_still_in_db": false,
-          "survivor_memory_id": null,
-          "content_identical_to_survivor": false,
+          "survivor_memory_id": "mem_fc813ccb995337c355488b7ae31edd90",
+          "digest_matches_survivor_event": false,
           "recoverable": false
         },
         {
@@ -773,8 +685,8 @@
           "created_at": "2026-08-10T14:57:38.973000+00:00",
           "row_still_in_db": false,
           "event_still_in_db": false,
-          "survivor_memory_id": null,
-          "content_identical_to_survivor": false,
+          "survivor_memory_id": "mem_fb768996123ecbcc0db3b80d64cb420e",
+          "digest_matches_survivor_event": false,
           "recoverable": false
         },
         {
@@ -786,8 +698,8 @@
           "created_at": "2026-08-11T16:22:50.357000+00:00",
           "row_still_in_db": false,
           "event_still_in_db": false,
-          "survivor_memory_id": null,
-          "content_identical_to_survivor": false,
+          "survivor_memory_id": "mem_ff05bb095da3b65649ca0c89d7d5b024",
+          "digest_matches_survivor_event": false,
           "recoverable": false
         },
         {
@@ -799,8 +711,8 @@
           "created_at": "2026-08-14T19:46:11.991000+00:00",
           "row_still_in_db": false,
           "event_still_in_db": false,
-          "survivor_memory_id": null,
-          "content_identical_to_survivor": false,
+          "survivor_memory_id": "mem_fdcf6c9bec05a887edaf6fa304c94ec1",
+          "digest_matches_survivor_event": false,
           "recoverable": false
         },
         {
@@ -812,8 +724,8 @@
           "created_at": "2026-08-14T17:21:53.559000+00:00",
           "row_still_in_db": false,
           "event_still_in_db": false,
-          "survivor_memory_id": null,
-          "content_identical_to_survivor": false,
+          "survivor_memory_id": "mem_f75ccd0d1af16aac2ebc353068ce2d3c",
+          "digest_matches_survivor_event": false,
           "recoverable": false
         },
         {
@@ -825,8 +737,8 @@
           "created_at": "2026-08-11T15:41:13.857000+00:00",
           "row_still_in_db": false,
           "event_still_in_db": false,
-          "survivor_memory_id": null,
-          "content_identical_to_survivor": false,
+          "survivor_memory_id": "mem_b3539aa30245df1a2c4922cefa7102ed",
+          "digest_matches_survivor_event": false,
           "recoverable": false
         },
         {
@@ -838,13 +750,130 @@
           "created_at": "2026-08-14T17:33:14.315000+00:00",
           "row_still_in_db": false,
           "event_still_in_db": false,
-          "survivor_memory_id": null,
-          "content_identical_to_survivor": false,
+          "survivor_memory_id": "mem_e5efa94e01a885adc67968d04896bcf6",
+          "digest_matches_survivor_event": false,
           "recoverable": false
         }
       ],
-      "elapsed_seconds": 5.3
+      "elapsed_seconds": 6.0
     },
-    "recorded_at": "2026-10-19T17:11:26.841324+00:00"
+    "recall_ab": {
+      "probe_source": "/tmp/hm-migration/precompact-control.sqlite",
+      "sample_size": 10,
+      "control": {
+        "recalled": 4,
+        "recalled_content_equivalent": 10,
+        "at_rank_1": 0,
+        "distinct_queries": 10
+      },
+      "live": {
+        "recalled": 0,
+        "recalled_content_equivalent": 10,
+        "at_rank_1": 0,
+        "distinct_queries": 10
+      },
+      "parity": true,
+      "details": [
+        {
+          "memory_id": "mem_05cd6b8f87f9570137f917ccf64ccfcc",
+          "query": "的已证据化摘要",
+          "control_rank": null,
+          "live_rank": null,
+          "control_equiv": true,
+          "live_equiv": true
+        },
+        {
+          "memory_id": "mem_010ad56f851e5bb594a325df428c4911",
+          "query": "主仓库新增",
+          "control_rank": 56,
+          "live_rank": null,
+          "control_equiv": true,
+          "live_equiv": true
+        },
+        {
+          "memory_id": "mem_001f16af28e3c591afe304a8ee0c3538",
+          "query": "project",
+          "control_rank": null,
+          "live_rank": null,
+          "control_equiv": true,
+          "live_equiv": true
+        },
+        {
+          "memory_id": "mem_0211736cc4501504d4fa7ee09b63a9c5",
+          "query": "可信记忆系统修复",
+          "control_rank": null,
+          "live_rank": null,
+          "control_equiv": true,
+          "live_equiv": true
+        },
+        {
+          "memory_id": "mem_0077c212150aaab4eda303addac1871a",
+          "query": "审查首次启动",
+          "control_rank": 5,
+          "live_rank": null,
+          "control_equiv": true,
+          "live_equiv": true
+        },
+        {
+          "memory_id": "mem_00bf7cb472224074ac09143ed5ed7c9f",
+          "query": "预算改为",
+          "control_rank": 74,
+          "live_rank": null,
+          "control_equiv": true,
+          "live_equiv": true
+        },
+        {
+          "memory_id": "mem_0039efa9ff9f93d0a3f7a42787d31898",
+          "query": "完整可信记忆交付",
+          "control_rank": null,
+          "live_rank": null,
+          "control_equiv": true,
+          "live_equiv": true
+        },
+        {
+          "memory_id": "mem_010ed1d4bb6dd20262ab8ffb43a802e8",
+          "query": "技能记忆",
+          "control_rank": null,
+          "live_rank": null,
+          "control_equiv": true,
+          "live_equiv": true
+        },
+        {
+          "memory_id": "mem_001b866f9e2ffbce096f82a1a6b961c7",
+          "query": "验证任务文件和共",
+          "control_rank": null,
+          "live_rank": null,
+          "control_equiv": true,
+          "live_equiv": true
+        },
+        {
+          "memory_id": "mem_02169198f03feb8ee8e78477a002a73b",
+          "query": "继续现有未提交修",
+          "control_rank": 21,
+          "live_rank": null,
+          "control_equiv": true,
+          "live_equiv": true
+        }
+      ]
+    },
+    "provenance_gap": {
+      "control_db": "/tmp/hm-migration/precompact-control.sqlite",
+      "deleted_rows": 1344314,
+      "deleted_metadata_json_bytes": 697321940,
+      "deleted_evidence_json_bytes": 28185351,
+      "deleted_rows_with_archive_rowid": 1343851,
+      "distinct_archive_rowid_lost": 789649,
+      "archive_carries_metadata_json": false,
+      "content_recoverable_from_archive": true,
+      "external_archive": {
+        "path": "/Users/zps/Library/Application Support/Agent-Chat-Archive/index/index.sqlite",
+        "present": true,
+        "sampled_pointers": 500,
+        "resolved": 55,
+        "content_identical": 54,
+        "note": "per-copy provenance pointers are only partly re-resolvable from the external archive; the pre-compaction backup remains the authoritative source for them"
+      }
+    },
+    "recorded_at": "2026-10-19T17:40:03.016377+00:00"
   }
 }

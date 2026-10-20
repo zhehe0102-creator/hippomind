@@ -58,3 +58,42 @@ daemon 的维护周期现在会：
 - `/stats` 与 Prometheus 暴露 `raw_purged_total`、`bytes_reclaimed_total`、`freelist_pages`、`reclaimable_bytes`
 
 因此本次是**一次性收口**，之后靠自动策略维持，不会再次膨胀到 4.5 GB。
+
+## Provenance boundary (from the migration engineer)
+
+`collapse_duplicate_rows` archives store **identity + content + digest only — not
+`metadata_json`**. The 1,344,314 deleted raw rows carried 697,321,940 B of
+metadata; 1,343,851 of them held an `archive_rowid` (789,649 distinct values)
+pointing back into the external `Agent-Chat-Archive`. Sampling 500 such pointers,
+only 55 could be re-resolved against the external archive today (54 content-identical).
+
+**Conclusion: content is 100% recoverable from the gzip archives, but per-row
+external provenance pointers are not. Rollback and provenance therefore treat the
+4.27 GB pre-compaction backup as the authority; the archives guarantee content
+recovery only.** (`ledger_events` rows are likewise deleted together with their
+projections — the backup, not the archive, is the audit-preserving artifact.)
+
+## fts_sync_report defect found during verification (fixed)
+
+The shipped `fts_sync_report()` was unusable as a health gate on a real ledger,
+and both halves were fixed in this pass (see `tests/test_fts_sync_report.py`):
+
+1. **Quadratic scan.** `memory_fts.memory_id` is declared `UNINDEXED`, so the
+   correlated `NOT EXISTS` re-scanned the whole FTS content table once per
+   projection — O(memories × fts_rows) ≈ 8.7e9 comparisons on the 1.53 M-row
+   ledger; measured >14 minutes of CPU without converging. The FTS ids are now
+   materialised once into a temp table and anti-joined, which is linear; the
+   post-compaction 136 K-row ledger reports in **0.29 s**.
+2. **Wrong `unindexed` semantics.** The old predicate counted
+   `lifecycle IN ('active','cold')`, but `maintain` deliberately removes cold
+   rows from FTS — so any ledger with cold data (this one has 1,328 cold
+   non-raw rows) reported `warn` forever, training operators to ignore the
+   check. Only `quality_state='accepted' AND lifecycle='active'` rows missing
+   from FTS count as `unindexed` now; leftovers that should have been pruned are
+   reported separately as `stale` (capacity waste, not a recall defect) and FTS
+   entries whose projection vanished as `orphan`.
+
+Current live-ledger report: `{status: ok, projections: 392, fts_rows: 5571,
+unindexed: 0, stale: 5179, orphan: 0}`. The 5,179 stale rows are FTS entries for
+raw/semantic rows that fell cold before the compaction; `maintain` prunes them
+incrementally and they do not affect correctness.

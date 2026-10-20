@@ -3092,21 +3092,74 @@ class SQLiteLedger:
         return {"status": str(status), "wal_bytes": wal.stat().st_size if wal.exists() else 0}
 
     def fts_sync_report(self) -> Dict[str, Any]:
-        """投影与 FTS 行数差：>0 表示有记忆未被索引（可经 maintain 重建）。"""
+        """Report projections that *should* be in FTS but are not.
+
+        Two defects made the previous implementation unusable as a health gate
+        on a real ledger (both found during the 2026-10-19 production compaction
+        and fixed here):
+
+        1. **Quadratic scan.** ``memory_fts.memory_id`` is declared
+           ``UNINDEXED``, so the correlated ``NOT EXISTS`` subquery re-scanned
+           the whole FTS content table once per projection:
+           O(memories x fts_rows).  On the 1.53M-row ledger that is ~8.7e9
+           comparisons and measured >14 minutes of CPU without converging.
+           The FTS ids are now materialised once into a temp table and
+           anti-joined against it, which is linear in the FTS row count.
+
+        2. **Wrong ``unindexed`` semantics.** The predicate counted
+           ``lifecycle IN ('active','cold')``, but ``maintain`` deliberately
+           removes cold rows from FTS ("Cold projections remain auditable in
+           SQLite, but must leave the hot FTS index").  Every ledger holding
+           cold rows therefore reported ``warn`` forever, which trains
+           operators to ignore the check.  Only rows that *must* be indexed —
+           ``quality_state='accepted' AND lifecycle='active'`` — count as
+           missing now.
+
+        ``status`` is ``ok`` when nothing that should be indexed is missing.
+        Rows in FTS that should not be there (cold/quarantined leftovers) are
+        reported separately as ``stale``: they waste index space but do not
+        make recall incorrect, so they do not by themselves fail the check.
+        """
         with self._reading() as conn:
-            proj = conn.execute(
-                "SELECT COUNT(*) FROM memories WHERE quality_state='accepted' "
-                "AND lifecycle IN ('active','cold') AND NOT (raw_chat=1 AND lifecycle!='active')"
-            ).fetchone()[0]
-            fts_rows = conn.execute("SELECT COUNT(*) FROM memory_fts").fetchone()[0]
-            missing = conn.execute(
-                "SELECT COUNT(*) FROM memories m WHERE m.quality_state='accepted' "
-                "AND m.lifecycle IN ('active','cold') AND NOT EXISTS "
-                "(SELECT 1 FROM memory_fts f WHERE f.memory_id=m.memory_id)"
-            ).fetchone()[0]
+            # One pass over the FTS table, then a linear anti-join.  A temp
+            # table (not an IN-list) keeps this bounded regardless of size.
+            conn.execute("DROP TABLE IF EXISTS temp._fts_sync_ids")
+            conn.execute("CREATE TEMP TABLE _fts_sync_ids(memory_id TEXT PRIMARY KEY)")
+            conn.execute("INSERT INTO _fts_sync_ids SELECT memory_id FROM memory_fts")
+            fts_rows = int(conn.execute(
+                "SELECT COUNT(*) FROM _fts_sync_ids").fetchone()[0])
+            expected = int(conn.execute(
+                "SELECT COUNT(*) FROM memories "
+                "WHERE quality_state='accepted' AND lifecycle='active'"
+            ).fetchone()[0])
+            missing = int(conn.execute(
+                "SELECT COUNT(*) FROM memories m "
+                "WHERE m.quality_state='accepted' AND m.lifecycle='active' "
+                "AND NOT EXISTS (SELECT 1 FROM _fts_sync_ids f "
+                "                WHERE f.memory_id=m.memory_id)"
+            ).fetchone()[0])
+            # Index entries that maintenance should have removed.  These are
+            # capacity waste, not a recall correctness problem.
+            stale = int(conn.execute(
+                "SELECT COUNT(*) FROM _fts_sync_ids f JOIN memories m "
+                "ON m.memory_id=f.memory_id "
+                "WHERE NOT (m.quality_state='accepted' AND m.lifecycle='active')"
+            ).fetchone()[0])
+            orphan = int(conn.execute(
+                "SELECT COUNT(*) FROM _fts_sync_ids f WHERE NOT EXISTS "
+                "(SELECT 1 FROM memories m WHERE m.memory_id=f.memory_id)"
+            ).fetchone()[0])
+            conn.execute("DROP TABLE IF EXISTS temp._fts_sync_ids")
         status = "ok" if missing == 0 else "warn"
-        return {"status": status, "projections": int(proj), "fts_rows": int(fts_rows),
-                "unindexed": int(missing),
+        return {"status": status,
+                # ``projections`` keeps its historical name (it is the count of
+                # rows that ought to be indexed) but now uses the correct
+                # predicate, so it is comparable with ``fts_rows``.
+                "projections": expected,
+                "fts_rows": fts_rows,
+                "unindexed": missing,
+                "stale": stale,
+                "orphan": orphan,
                 "hint": None if missing == 0 else "运行 hippomind maintain 可重建 FTS"}
 
     def claims_consistency_report(self) -> Dict[str, Any]:
