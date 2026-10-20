@@ -23,7 +23,6 @@ tools/capture_gui_screenshots.py E402 5
 [legacy]
 hippomind/agent_install.py E501 1
 hippomind/auto_context.py E501 8
-hippomind/cli.py E501 2
 hippomind/context_pack.py F402 3
 hippomind/daemon.py E402 7
 hippomind/dsh_sessions.py F401 1
