@@ -32,9 +32,6 @@ hippomind/embeddings.py F841 1
 hippomind/hippocampus.py F401 1
 hippomind/hub_client.py E501 1
 hippomind/hub_client.py F401 1
-hippomind/ledger.py E501 13
-hippomind/ledger.py F401 3
-hippomind/ledger.py F841 1
 hippomind/mcp.py E501 2
 hippomind/network_visualizer.py F821 2
 hippomind/raw_extract.py E501 2
@@ -44,6 +41,12 @@ hippomind/visualizer.py F401 1
 hippomind/visualizer.py F821 1
 hippomind/watcher.py E501 4
 hippomind/watcher.py F401 1
+hippomind/ledger/_helpers.py E501 2
+hippomind/ledger/archive.py E501 1
+hippomind/ledger/clients.py E501 5
+hippomind/ledger/graph.py E501 1
+hippomind/ledger/identity.py E501 4
+hippomind/ledger/lifecycle.py F841 1
 integrations/query.py E501 1
 integrations/query.py E702 20
 integrations/query.py F541 2
