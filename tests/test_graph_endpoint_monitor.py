@@ -66,6 +66,24 @@ class GraphEndpointTests(unittest.TestCase):
         self.assertFalse(body["found"])
 
 
+def _reap(proc: "subprocess.Popen") -> None:
+    """Stop a detached test daemon and wait for it to actually exit."""
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    proc.kill()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:  # pragma: no cover - last resort
+        pass
+
+
+
 class MonitorCommandTests(unittest.TestCase):
     def test_monitor_rounds_against_daemon(self):
         tmp = tempfile.TemporaryDirectory(prefix="hippo-mon-test-")
@@ -83,7 +101,13 @@ class MonitorCommandTests(unittest.TestCase):
              "--no-watch", "--no-auth"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True, cwd=str(ROOT))
-        self.addCleanup(proc.terminate)
+        # The daemon is started with start_new_session=True and is only ever
+        # stopped by this test.  ``addCleanup(proc.terminate)`` alone leaked it:
+        # terminate() is asynchronous, so the TemporaryDirectory cleanup that
+        # runs immediately afterwards tried to remove a directory whose SQLite
+        # file was still open, and 77 ``hippo-mon-test-*`` dirs piled up in TMPDIR.
+        # Reap properly -- terminate, wait, escalate -- *before* the rmtree.
+        self.addCleanup(_reap, proc)
         time.sleep(2.0)
         r = subprocess.run(
             [sys.executable, "-m", "hippomind.cli", "monitor",
