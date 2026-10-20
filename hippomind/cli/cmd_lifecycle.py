@@ -118,7 +118,10 @@ def cmd_stop(args) -> int:
     except LedgerError:
         result["running"] = False
     _print(result)
-    return 0
+    # 停机失败必须让调用方看出来：restore/backup/maintain 一类操作的前提就是
+    # "账本没有并发写方"。此前无论 daemon 是否还在跑都返回 0，脚本里的
+    # `hippomind stop && hippomind restore` 会在服务仍在写账本时继续执行。
+    return 1 if result["running"] else 0
 
 
 def _monitor_snapshot(paths, port, args) -> Dict[str, Any]:

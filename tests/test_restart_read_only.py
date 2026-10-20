@@ -129,9 +129,12 @@ class RestartReadOnlyIntegrationTests(unittest.TestCase):
         self.ledger_rows = self._count()
 
     def tearDown(self):
-        # Read-only mode refuses POST /shutdown by design (the policy is
-        # downgraded for *every* credential), so reap the process the test
-        # started, by the pid the daemon itself recorded.
+        # SIGTERM is used instead of `hippomind stop` on purpose: this daemon is
+        # spawned with --no-watch on a port this test chose, and reaping it by
+        # the pid the daemon recorded in its own runtime state is what guarantees
+        # no orphan survives the run even if an assertion fails halfway.
+        # (Read-only /shutdown was refused until e5a9cc9 restored shutdown for
+        # the local admin; test_stop_exit_code.py now covers stopping one.)
         pid = self.daemon_pid or load_runtime_state(self.paths).get("pid")
         if pid:
             try:
