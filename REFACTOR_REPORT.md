@@ -49,7 +49,8 @@
 - CI 四门：单测 + **fixtures 迁移演练** + lint 增量棘轮 + 基准冒烟；`scripts/lint.sh`（无 ruff 优雅跳过）、`backup.sh`/`restore.sh`（SQLite online backup API + sha256，实测 cp 会漏 20 行 WAL 数据）。
 - `tests/drill_schema_migration.py`：拒绝未来库必须**字节级不变**（SHA-256），并修掉了「假绿」与「-1 哨兵」两个探针缺陷。
 - `hippomind version --json`；daemon 收敛性指标；`fts_sync_report` 线性化 + 语义修正（0.29s/136K 行）。
-- ledger.py → `hippomind/ledger/` 包、cli.py → `hippomind/cli/` 包（本次收尾，mixin/子命令机械拆分，全部外部导入符号 re-export，三门验证）。
+- **ledger.py → `hippomind/ledger/` 包**（9 个 mixin，最大文件 888 行；AST 自由名分析机械搬家，成员逐字保留；旧导入面全量 re-export，487 测试零改动通过；ruff --fix 清掉 6 个拆包后才显形的重复 `import re`，基线按精确计数 rebase：17→14 净降 3）。
+- **cli.py → `hippomind/cli/` 包**（11 个文件：app/parser/common + 6 组子命令；零行为/参数/输出变化；`hippomind.cli:main` 入口与 `python3 -m hippomind` 均验证通过）。
 
 **数据收口**（先备份后动手，全程可回滚）
 - 4,483.3MB → **406.8MB（-91%）**；1,536,641 → 136,459 行；freelist 归零；quick_check ok。
@@ -71,4 +72,5 @@
 2. 冲突双下线的语义未变：连续两条 decision 会让旧那条进入 conflict（知识更新收敛），运营需知晓 `conflicts/resolve` 工作流。
 3. 归档不含 metadata_json（溯源以备份为权威，已写入压缩报告）。
 4. distill 的因果深度按设计取 2；超深链需显式 max_depth。
-5. ledger/cli 包化刚完成，真实 daemon 长跑（含 launchd 自启）建议观察一个维护周期再依赖自动缩容指标。
+5. ledger/cli 包化已完成并通过全部门禁；但 launchd 自启项仍指向 PiDeck 旧路径（`~/Library/LaunchAgents/com.hippomind.*.plist` 的 PYTHONPATH 写死 `pi-desktop/...`，该目录已不存在）——启用重构版前需先 `login-install` 重装自启项指向新工作区。
+6. `raw-archive` 与压缩归档合计约 201MB 保留在库旁目录；如需异地留存请纳入备份策略。
