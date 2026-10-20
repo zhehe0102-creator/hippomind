@@ -231,7 +231,8 @@ def _start_or_reuse_daemon_locked(paths: RuntimePaths, port: int, *, archive: Op
 
 def _restart_daemon(paths: RuntimePaths, port: int, *, archive: Optional[str] = None,
                     watch_interval: float = 30.0, no_watch: bool = False,
-                    verify_token: str = "") -> tuple[Dict[str, Any], bool, Path]:
+                    verify_token: str = "",
+                    read_only: bool = False) -> tuple[Dict[str, Any], bool, Path]:
     """Restart a locally managed daemon after a binary/schema upgrade.
 
     The caller must already have local administrator authority. This helper is
@@ -271,7 +272,8 @@ def _restart_daemon(paths: RuntimePaths, port: int, *, archive: Optional[str] = 
         else:
             raise LedgerError("hippomindd 未在 5 秒内停止，拒绝并发启动第二个服务")
         return _start_or_reuse_daemon_locked(paths, port, archive=archive,
-                                              watch_interval=watch_interval, no_watch=no_watch)
+                                              watch_interval=watch_interval,
+                                              no_watch=no_watch, read_only=read_only)
 
 
 def _verified_scoped_credential(args, paths: RuntimePaths) -> bool:
