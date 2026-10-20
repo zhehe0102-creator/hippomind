@@ -22,6 +22,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from .agent_config import agent_config_path, load_agent_config, safe_agent_name, write_agent_config
 from .auto_context import RULES_BEGIN, RULES_END, install_agent_rules
 from .daemon import RuntimePaths
+from . import __version__ as _PACKAGE_VERSION
 from .dsh_install import dsh_integration_status, install_dsh_integration
 from .ledger import AGENT_PERMISSIONS, AgentCredential, LedgerError, SQLiteLedger
 from .mcp_register import mcp_registration_path, mcp_registration_status, register_mcp_server
@@ -37,6 +38,13 @@ CODEX_HOOK_MODULE = "hippomind.codex_hook"
 CODEX_HOOK_MARKER = "--managed"
 CODEX_HOOK_TIMEOUT_SECONDS = 12
 CODEX_APP_SERVER_TIMEOUT_SECONDS = 8.0
+
+
+#: Self-reported identity for the Codex app-server handshake.  This used to be
+#: a frozen v0.7 literal that matched no released version; the package version
+#: is now the single source (pinned by tests/test_self_reported_versions.py).
+INSTALLER_CLIENT_INFO = {"name": "hippomind-hook-installer",
+                         "version": _PACKAGE_VERSION}
 
 
 def codex_hooks_path(*, home: Optional[Path] = None) -> Path:
@@ -189,7 +197,7 @@ def _inspect_codex_user_prompt_hook(package_root: Path, hook_path: Path, *,
         process = _codex_app_server(root)
         _codex_app_server_request(
             process, 1, "initialize",
-            {"clientInfo": {"name": "hippomind-hook-installer", "version": "0.7"},
+            {"clientInfo": INSTALLER_CLIENT_INFO,
              "capabilities": {"experimentalApi": True}},
             timeout=CODEX_APP_SERVER_TIMEOUT_SECONDS,
         )
@@ -237,7 +245,7 @@ def _write_codex_hook_trust(package_root: Path, hook_path: Path, hook_key: str,
         process = _codex_app_server(root)
         _codex_app_server_request(
             process, 1, "initialize",
-            {"clientInfo": {"name": "hippomind-hook-installer", "version": "0.7"},
+            {"clientInfo": INSTALLER_CLIENT_INFO,
              "capabilities": {"experimentalApi": True}},
             timeout=CODEX_APP_SERVER_TIMEOUT_SECONDS,
         )

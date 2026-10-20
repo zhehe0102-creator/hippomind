@@ -20,9 +20,13 @@ from .context_pack import DEFAULT_MAX_CHARS, DEFAULT_MAX_TOKENS, ContextPackBuil
 from .injection import InjectionState, normalise_agent
 from .ledger import LedgerError, SQLiteLedger
 from .watcher import ArchiveWatcher
+from . import __version__ as _PACKAGE_VERSION
 
 
-SERVER_INFO = {"name": "hippomind-memory-hub", "version": "0.9.1"}
+#: Reported to MCP clients in the initialize handshake.  It used to be a
+#: hand-maintained literal and had drifted two releases behind; the package
+#: version is the single source (pinned by tests/test_self_reported_versions.py).
+SERVER_INFO = {"name": "hippomind-memory-hub", "version": _PACKAGE_VERSION}
 SUPPORTED_PROTOCOLS = ("2024-11-05", "2025-03-26", "2025-06-18")
 
 
