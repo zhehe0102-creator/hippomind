@@ -15,6 +15,22 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _free_port() -> int:
+    """Bind port 0 and use what the kernel hands back.
+
+    Hard-coded 18791 made this test collide with any other module that happens
+    to start a daemon at the same moment (the suite intermittently failed with
+    'daemon 提前退出' / address-in-use once test_daemon_refusal_not_bypassed.py
+    and the read-only tests joined in).  A dedicated free port removes the
+    cross-module dependency entirely.
+    """
+    import socket
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+
+
+
 class GracefulShutdownTests(unittest.TestCase):
     def test_sigterm_exits_cleanly_with_zero_wal(self):
         tmp = Path(tempfile.mkdtemp(prefix="hippo-shutdown-test-"))
@@ -22,7 +38,7 @@ class GracefulShutdownTests(unittest.TestCase):
             ["rm", "-rf", str(tmp)], check=False))
         ledger = tmp / "sd.sqlite"
         runtime = tmp / "runtime"
-        port = 18791
+        port = _free_port()
 
         proc = subprocess.Popen(
             [sys.executable, "-m", "hippomind.daemon", "--ledger", str(ledger),

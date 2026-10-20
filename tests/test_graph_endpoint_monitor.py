@@ -16,6 +16,23 @@ from hippomind.daemon import MemoryHubHTTPServer, MemoryHubService, RuntimePaths
 from hippomind.ledger import SQLiteLedger
 
 
+def _free_port() -> int:
+    """Ask the kernel for a port nobody is listening on.
+
+    This file used to hard-code 18890/18891.  Once other test modules started
+    launching real daemons (tests/test_daemon_refusal_not_bypassed.py,
+    test_restart_read_only.py, test_stop_exit_code.py), a fixed port became a
+    cross-module race: the whole suite intermittently failed depending on
+    whether two modules happened to overlap.  The offline probe needs a port
+    that is *free*, which a fixed number cannot guarantee either.
+    """
+    import socket
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+
+
+
 class GraphEndpointTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="hippo-graph-ep-")
@@ -94,7 +111,7 @@ class MonitorCommandTests(unittest.TestCase):
         for i in range(5):
             led.ingest({"content": f"巡检数据 {i}", "kind": "fact",
                         "source_agent": "t", "evidence": [f"t:{i}"]})
-        port = 18890
+        port = _free_port()
         proc = subprocess.Popen(
             [sys.executable, "-m", "hippomind.daemon", "--ledger", str(led_path),
              "--runtime-dir", str(root / "rt"), "--port", str(port),
@@ -125,7 +142,7 @@ class MonitorCommandTests(unittest.TestCase):
         r = subprocess.run(
             [sys.executable, "-m", "hippomind.cli", "monitor",
              "--ledger", str(root / "d.sqlite"),
-             "--runtime-dir", str(root / "rt"), "--port", "18891",
+             "--runtime-dir", str(root / "rt"), "--port", str(_free_port()),
              "--interval", "1", "--rounds", "1"],
             capture_output=True, text=True, timeout=30, cwd=str(ROOT))
         self.assertEqual(r.returncode, 0)
