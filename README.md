@@ -11,9 +11,49 @@
 原有实验使用说明见 [USAGE_GUIDE.md](USAGE_GUIDE.md)；长期运行的 daemon、迁移、隐私和接入见 [MEMORY_HUB_GUIDE.md](MEMORY_HUB_GUIDE.md)。跨电脑安装、恢复和安全迁移见 [docs/PORTABILITY.md](docs/PORTABILITY.md)；发布前检查和 GitHub 发布清单见 [docs/RELEASE.md](docs/RELEASE.md)。
 第一次阅读建议从 [详细拆解指南](docs/DETAILED_GUIDE.md) 开始；它用流程图、生命周期图和 GUI 截图解释从安装到排错的完整路径。
 
+## v1.0.0 全面重构（2026-10-19）
+
+一次针对**真实线上账本实测问题**的重构，全部改动带回归测试，完整审查与取舍见
+[REFACTOR_REPORT.md](REFACTOR_REPORT.md)，压缩过程与可恢复边界见
+[docs/benchmarks/compaction-2026-10-19.md](docs/benchmarks/compaction-2026-10-19.md)。
+
+- **存储治本**：原始证据改用稳定身份键（`source_agent|session_id|role|规范化内容`，剥离
+  harness 包裹与时间戳）——此前去重哈希含 `occurred_at`，同一消息每次重抓都成一行，实测
+  147 万 raw 行、单会话 70,508 行仅 3,573 种内容。保留期现在会**真正删除**：先写 gzip
+  归档 → fsync → 回读校验每个 `memory_id` → 才分批删除，任一步失败即放弃删除（fail-closed）；
+  API 默认仍只降级为 cold 以保住可审计契约，daemon 显式开启 TTL 删除。
+- **巩固防自噬**：摘要按来源集合的稳定指纹幂等，来源未变不再新增行（此前 56,010 条
+  semantic 只有 142 种内容）。
+- **自动缩容**：维护周期按 freelist 阈值做有界 VACUUM，删除量与可回收字节进 `/stats`
+  与 Prometheus 指标，长跑可见收敛趋势。
+- **检索质量**：横幅/命令回显/单字应答这类无信息原始行隔离在 0.15 质量分，不再按满分
+  挤占 Context Pack 的 8 项预算；内容键区分「容器标签」（`<USER_REQUEST>` 只去壳留肉）与
+  「易变块」（`<ADDITIONAL_METADATA>` 等连内容一起去），使同一句话的多次抓取能真正折叠。
+  混合重排通道为词法主导、向量有界加成，双语评测（中 40 + 英 32 例 × 四类指标）证明不劣
+  之后才允许改默认值。
+- **激活未兑现能力**：`memory_claims` / `memory_relations` / `memory_feedback` /
+  `kind='procedural'` 在生产库里曾是 **0 行**。现在 adapter 会自动串因果链、保守派生
+  claim（多值/超长/低置信/不可信来源/无 task 一律不派生）、`complete(outcome=...)` 对
+  因果祖先做 ±0.3 有界信用（幂等，且召回绝不等于信用），并提供 `skill()` /
+  `distill_skill()`（只存步骤、绝不执行）。
+- **架构解耦**：`ledger.py`(4,129 行) → `hippomind/ledger/` mixin 包；`cli.py`(2,004 行)
+  → `hippomind/cli/` 包；文本原语与 schema/迁移链分别抽到 `textutil.py`、`schema.py`；
+  存储层不再反向 import Grid World 演示模块，`__init__` 全惰性——`import hippomind.ledger`
+  不再加载 matplotlib，边界由 `tests/test_architecture_boundaries.py` 锁死。
+- **工程化**：CI 四道门（单测 / schema 迁移演练 / lint 增量棘轮 / 基准冒烟）；
+  `scripts/backup.sh`、`scripts/restore.sh` 走 SQLite 在线备份 API + sha256（`cp` 会漏 WAL
+  中的数据）；`SCHEMA_VERSION` 与 `__version__` 单一来源；`hippomind version --json`；
+  配置声明的路径由 `tests/test_config_paths.py` 守卫（曾是 schema 断档与 mypy 空跑的根因）。
+- **数据收口**：先建一致性备份（sha256 校验、`quick_check=ok`）再原地压缩，**4.48GB →
+  406.8MB（-91%）**，1,536,641 → 136,459 行；删除内容 100% 在 gzip 归档中，逐行外部溯源
+  指针以备份为权威。
+
+> 升级后务必用当前代码重启 daemon（`hippomind start --restart`），并重新注册自启项
+> `hippomind login-install`：历史 launchd 配置里的 `PYTHONPATH` 仍可能指向已失效的旧路径。
+
 ## v0.9.3 检索·凝练·注入·长跑 全面升级
 
-在 v0.9.2 的账本与接入之上，本轮完成一轮系统性优化（全部带回归测试，218+ 项全绿）：
+在 v0.9.2 的账本与接入之上，完成一轮系统性优化（全部带回归测试）：
 
 - **检索**：FTS 与 LIKE 双通道 RRF 融合加分；候选稀疏时自动做实体扩展二次检索；
   CJK LIKE 碎片下探到 3 字（词序不同的自然问句此前会完全漏召回）；通道候选上限

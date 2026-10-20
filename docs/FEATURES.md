@@ -21,7 +21,7 @@
 
 ```
 采集层   ArchiveWatcher（轮询归档目录，30s）→ 新会话自动入库
-存储层   SQLiteLedger（SQLite/WAL，schema v7，事件溯源：ledger_events 只追加）
+存储层   SQLiteLedger（SQLite/WAL，schema v8，事件溯源：ledger_events 只追加）
 服务层   hippomindd daemon（localhost HTTP + token 鉴权）
 消费层   CLI / MCP 工具 / HTTP API / GUI 工作台 / 自动注入钩子
 ```
@@ -30,7 +30,7 @@
   （`memories` 表）可随时从事件重建——改错可回滚，历史不可篡改。
 - **单文件部署**：整个记忆就是一个 `.sqlite` 文件（+wal/shm），备份=复制文件。
 
-## 3. CLI 全部子命令（38 个）
+## 3. CLI 全部子命令（37 个）
 
 ### 3.1 生命周期
 | 命令 | 干什么 | 典型用法 |
