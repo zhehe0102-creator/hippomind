@@ -26,6 +26,7 @@ from .cmd_write import (
 )
 from .common import _connection_arguments
 
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="hippomind", description="HippoMind 本机 Memory Hub")
     sub = parser.add_subparsers(dest="command", required=True)

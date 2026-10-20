@@ -54,6 +54,7 @@ from ..provider_manifest import (
 from ..watcher import ArchiveWatcher as ArchiveWatcher, default_dsh_sessions_root as default_dsh_sessions_root
 from .common import _agent_settings, _print
 
+
 def _paths(args) -> RuntimePaths:
     config = _agent_settings(args)
     ledger = getattr(args, "ledger", None) or config.get("ledger") or None

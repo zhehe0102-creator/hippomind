@@ -12,6 +12,7 @@ from ..ledger import LedgerError, SQLiteLedger
 from . import _agent_token, _health, _paths, _port, _request
 from .common import _print, _reject_restricted_direct
 
+
 def cmd_graph(args) -> int:
     """实体图谱：从 claim 主语出发的因果/关联邻域（1–2 跳）。"""
     _reject_restricted_direct(args, "graph")

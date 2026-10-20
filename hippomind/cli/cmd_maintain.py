@@ -13,6 +13,7 @@ from ..ledger import LedgerError, SQLiteLedger, utc_now
 from . import _daemon_serves_ledger, _paths, _port
 from .common import _print, _reject_restricted_direct
 
+
 def cmd_checkup(args) -> int:
     """账本深度体检：完整性/FTS 同步/游标健康/声明一致性（默认只读）。"""
     _reject_restricted_direct(args, "checkup")

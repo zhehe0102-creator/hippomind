@@ -13,6 +13,7 @@ from ..provider_manifest import AgentDiscovery, integration_tier, provider_manif
 from . import _paths
 from .common import _print, _reject_restricted_direct
 
+
 def cmd_install_auto(args) -> int:
     """Install a managed explicit-marker rule for one configured Agent."""
     target = Path(args.agents_file).expanduser() if args.agents_file else Path.home() / ".codex" / "AGENTS.md"

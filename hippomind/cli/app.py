@@ -6,6 +6,7 @@ import sys
 from ..ledger import LedgerError
 from .parser import build_parser
 
+
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)

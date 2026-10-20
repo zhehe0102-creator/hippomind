@@ -14,6 +14,7 @@ from typing import Any, Dict
 from ..agent_config import load_agent_config
 from ..ledger import LedgerError
 
+
 def _print(value: Any) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False))
 

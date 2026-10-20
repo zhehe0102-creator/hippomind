@@ -20,6 +20,7 @@ from . import (
 )
 from .common import _print, _reject_restricted_direct, _secure_local_file
 
+
 def cmd_version(args) -> int:
     """输出版本/schema/环境信息（诊断与支持用）。"""
     try:

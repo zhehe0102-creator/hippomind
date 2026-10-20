@@ -16,6 +16,7 @@ from ..watcher import ArchiveWatcher, default_dsh_sessions_root
 from . import _agent_token, _paths, _port, _request
 from .common import _print, _reject_restricted_direct
 
+
 def _pack_body(args) -> Dict[str, Any]:
     return {
         "query": args.query,
