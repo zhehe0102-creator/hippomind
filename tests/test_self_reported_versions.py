@@ -93,7 +93,10 @@ class SelfReportedVersionTests(unittest.TestCase):
                 self.assertEqual(0, main(["version", "--json"] + base))
             second = io.StringIO()
             with redirect_stdout(second):
-                self.assertEqual(0, main(["doctor", "--format", "json"] + base))
+                # ``doctor`` is a readiness gate: it exits 1 when a check fails
+                # (the daemon is unreachable in this fixture).  What this test
+                # pins is that the *reported version* agrees, not the exit code.
+                main(["doctor", "--format", "json"] + base)
             version = json.loads(first.getvalue())["package"]
             doctor = json.loads(second.getvalue())
         self.assertEqual(version, hippomind.__version__)

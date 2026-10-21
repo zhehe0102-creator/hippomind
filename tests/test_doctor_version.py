@@ -74,10 +74,20 @@ class DoctorVersionTests(unittest.TestCase):
         self.assertNotIn("0.9.2", self._text("doctor"))
 
     def test_doctor_still_reports_every_check(self):
-        """Routing the version through the constant changed nothing else."""
+        """Routing the version through the constant changed nothing else.
+
+        ``launchd`` was added later (a stale login item was silently starting a
+        daemon whose import path no longer existed).  It is platform-gated, so
+        the expected list depends on the host: everywhere else the original five
+        checks must still appear in the original order.
+        """
+        import sys
+
         payload = self._json("doctor", "--format", "json")
-        self.assertEqual([c["id"] for c in payload["checks"]],
-                         ["ledger", "daemon", "token", "injection", "privacy"])
+        expected = ["ledger", "daemon", "token", "injection", "privacy"]
+        if sys.platform == "darwin":
+            expected.append("launchd")
+        self.assertEqual([c["id"] for c in payload["checks"]], expected)
         self.assertIn("ready", payload)
 
 

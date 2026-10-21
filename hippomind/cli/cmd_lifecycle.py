@@ -264,6 +264,11 @@ def cmd_doctor(args) -> int:
     checks.append({"id": "privacy", "ok": raw_severity == "ok", "severity": raw_severity,
                    "detail": raw_detail})
 
+    launchd_ok, launchd_severity, launchd_detail = _launchd_check()
+    if launchd_severity != "skipped":
+        checks.append({"id": "launchd", "ok": launchd_ok,
+                       "severity": launchd_severity, "detail": launchd_detail})
+
     warnings = [item["detail"] for item in checks if item["severity"] == "warning"]
     errors = [item["detail"] for item in checks if item["severity"] == "error"]
     payload = {
@@ -281,7 +286,105 @@ def cmd_doctor(args) -> int:
             marker = "OK" if item["severity"] == "ok" else "WARN" if item["severity"] == "warning" else "FAIL"
             print(f"[{marker}] {item['id']}: {item['detail']}")
         print("结论: " + ("READY，可正常使用" if payload["ready"] else "NEEDS ATTENTION，请先处理 FAIL 项"))
-    return 0
+    # A readiness gate that cannot fail is not a gate.  This used to return 0
+    # unconditionally, so `hippomind doctor && deploy` proceeded while doctor
+    # printed `[FAIL] daemon: 不可达` — the same defect class as `stop`
+    # reporting success while the daemon was alive (ff610e0).  Warnings stay
+    # non-fatal: they are advisory, and the existing suite asserts 0 for a
+    # healthy-but-warned temporary ledger.
+    return 1 if errors else 0
+
+
+def _launchd_check() -> tuple[bool, str, str]:
+    """Report a stale macOS login item without ever mutating it.
+
+    ``hippomind login-install`` writes the current package root into
+    ``PYTHONPATH``/``WorkingDirectory``, but a plist installed by an older
+    release keeps pointing at whatever path that release lived in.  After the
+    workspace moved, launchd kept starting a daemon whose import path no longer
+    exists — it fails at every login, silently.  Doctor is the command an
+    operator pastes into a bug report, so it must surface that drift instead of
+    reporting READY.
+
+    The GUI job (``com.hippomind.gui``) is checked too: it is written by hand
+    rather than by ``login-install``, so it is the one most likely to keep a
+    dead path forever (it did: it still pointed at the pre-move
+    ``pi-desktop/chat-workspace/hippocampus-agent`` directory).
+
+    **External-volume login items are reported separately.**  When the package
+    lives outside the boot volume (an external drive, a network mount), macOS
+    privacy protection denies a launchd *background* job the right to read that
+    path even though the same interpreter can read it from a terminal.  The job
+    then dies at every login with ``PermissionError: [Errno 1] Operation not
+    permitted`` inside ``_find_spec`` — measured, and reproduced with a
+    minimal probe outside this project.  Rewriting the plist cannot fix it, so
+    the check reports it as a distinct warning that names the real remedy
+    instead of blaming the paths.
+
+    Read-only by construction: it reads the plists and stats the paths they
+    name.  It never creates, rewrites, bootstraps or bootouts a job.
+    """
+    if sys.platform != "darwin":
+        return True, "skipped", "非 macOS，无 launchd 登录项"
+    package_root = Path(__file__).resolve().parents[2]
+    external_volume = _is_external_volume(package_root)
+    labels = (("com.hippomind.daemon.plist", True), ("com.hippomind.gui.plist", False))
+    problems: list = []
+    found = 0
+    for name, owned_by_installer in labels:
+        plist_path = _launch_agent_path().parent / name
+        try:
+            with plist_path.open("rb") as handle:
+                config = plistlib.load(handle)
+        except FileNotFoundError:
+            continue
+        except (OSError, plistlib.InvalidFileException, ValueError) as exc:
+            problems.append(f"{name} 不可读：{type(exc).__name__}: {exc}"[:120])
+            continue
+        if not isinstance(config, Mapping):
+            problems.append(f"{name} 格式异常（不是字典）")
+            continue
+        found += 1
+        environment = config.get("EnvironmentVariables")
+        environment = environment if isinstance(environment, Mapping) else {}
+        declared_pythonpath = str(environment.get("PYTHONPATH", "") or "")
+        if declared_pythonpath and not Path(declared_pythonpath).is_dir():
+            problems.append(f"{name} PYTHONPATH 指向不存在的目录 {declared_pythonpath}")
+        elif (declared_pythonpath and owned_by_installer
+              and Path(declared_pythonpath).resolve() != package_root.resolve()):
+            problems.append(f"{name} PYTHONPATH 指向 {declared_pythonpath}，"
+                            f"当前包根是 {package_root}")
+        working = str(config.get("WorkingDirectory", "") or "")
+        if working and not Path(working).is_dir():
+            problems.append(f"{name} WorkingDirectory 指向不存在的目录 {working}")
+        program = config.get("ProgramArguments")
+        if isinstance(program, (list, tuple)) and program:
+            executable = str(program[0])
+            if executable and not Path(executable).exists():
+                problems.append(f"{name} 解释器不存在 {executable}")
+    if problems:
+        return False, "warning", ("登录项已过期：" + "；".join(problems) +
+                                  "（daemon 项运行 login-install 重装；GUI 项需手工修正）")
+    if not found:
+        return True, "ok", "未安装登录自启项（按需运行 login-install）"
+    if external_volume:
+        return False, "warning", (
+            f"登录项路径有效，但工作区在外置卷（{package_root}）：macOS 隐私保护会拒绝 "
+            "launchd 后台任务读取该卷，登录自启会在每次登录时以 PermissionError 失败。"
+            "开机自启不可用，请改用 `hippomind start`（或把工作区移到内置盘）")
+    return True, "ok", f"登录项存在且路径有效（{package_root}）"
+
+
+def _is_external_volume(path: Path) -> bool:
+    """True when ``path`` lives on a volume other than the boot volume.
+
+    Used only to explain a launchd failure mode that no plist edit can fix; the
+    check itself never assumes it (it still verifies every path).
+    """
+    try:
+        return os.stat(str(path)).st_dev != os.stat(os.sep).st_dev
+    except OSError:
+        return False
 
 
 def _launch_agent_path() -> Path:

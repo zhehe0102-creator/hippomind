@@ -40,7 +40,7 @@
 | `stop` | 优雅停机（WAL 检查点后退出） | `hippomind stop` |
 | `status` | daemon 健康+账本规模 | `hippomind status` |
 | `version` | 版本/schema 版本/概要 | `hippomind version` |
-| `doctor` | 不泄露凭据的可用性自检 | 排障第一步 |
+| `doctor` | 不泄露凭据的可用性自检；**有 FAIL 时 exit 1**（可作脚本门）；含 launchd 登录项路径漂移检查 | 排障第一步 / CI 门 |
 | `monitor` | 只读巡检循环；`--json` 单次快照供 cron | `hippomind monitor --json`（离线 exit 1） |
 
 ### 3.2 写入与反馈
