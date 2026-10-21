@@ -13,6 +13,15 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 
+def _free_port() -> int:
+    """A port nothing is listening on, so the CLI takes its offline path."""
+    import socket
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+
+
 class ExportSinceTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="hippo-since-test-")
@@ -21,9 +30,13 @@ class ExportSinceTests(unittest.TestCase):
         self.rt = Path(self.tmp.name) / "rt"
 
     def _run(self, *args):
+        # Pin a free port: without it the CLI resolves the global default 8765
+        # and a daemon serving a *different* ledger (the live one) answers 401,
+        # so the write path under test is never reached.
         return subprocess.run(
             [sys.executable, "-m", "hippomind.cli", *args,
-             "--ledger", str(self.led), "--runtime-dir", str(self.rt)],
+             "--ledger", str(self.led), "--runtime-dir", str(self.rt),
+             "--port", str(_free_port())],
             capture_output=True, text=True, cwd=str(ROOT))
 
     def _ingest(self, content, evidence):

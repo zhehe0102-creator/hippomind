@@ -9,6 +9,24 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _free_port() -> int:
+    """Bind port 0 and use what the kernel hands back.
+
+    These tests assert the *offline-direct* fallback, which only happens when no
+    daemon answers.  Without ``--port`` the CLI resolves the port from runtime
+    state and then falls back to the global default 8765, so the test silently
+    talked to whatever daemon happened to own that port — a real one serving the
+    live ledger answered ``401 local authorization token required`` and the test
+    failed for a reason that had nothing to do with the code under test.  A
+    dedicated free port makes "nothing is listening" true by construction.
+    """
+    import socket
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+
+
 class OfflineFallbackTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="hippo-off-test-"))
@@ -23,7 +41,9 @@ class OfflineFallbackTests(unittest.TestCase):
         return subprocess.run(
             [sys.executable, "-m", "hippomind.cli", "ingest" if args[0] != "fb"
              else "feedback",
-             "--ledger", str(self.ledger_path), *args[1:]],
+             "--ledger", str(self.ledger_path),
+             "--runtime-dir", str(self.tmp / "rt"),
+             "--port", str(_free_port()), *args[1:]],
             capture_output=True, text=True, cwd=str(ROOT))
 
     def test_ingest_offline_direct_marks_mode(self):
