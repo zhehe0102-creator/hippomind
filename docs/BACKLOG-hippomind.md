@@ -3,6 +3,20 @@
 > 规则：按优先级从上往下取任务；完成后标记 `[x] 日期 证据`；剩余 <10 项时必须补足 ≥15。
 > 补充来源：a 缺陷 b 调研差距 c 文档承诺 d 性能瓶颈 e 多 Agent 体验。
 
+## 已完成（2026-10-21 第二轮二次开发，详见 REFACTOR_REPORT_ROUND2.md）
+
+- [x] 2026-10-21 **FTS 索引不变量统一**：四个互不相同的定义收敛为 `schema.FTS_INDEXED_PREDICATE`；
+  线上库 4,036→185 行、stale 3,851→0、drift True→False、maintain 0.13s。
+  证据：`tests/test_fts_invariant.py`(16)、负向控制全红。
+- [x] 2026-10-21 **resolve_claim 翻案重裁**：恢复 lifecycle 而不只是 quality_state（此前胜者永久不可召回）。
+  证据：`tests/test_resolve_recrown.py`(4)，负向控制 revert 后 3 项变红。
+- [x] 2026-10-21 **归档溯源 + 崩溃窗口**：归档补 `metadata`（溯源指针随内容留存）；
+  `_dedupe_groups` 无条件重建（陈旧快照曾致误删幸存行）。证据：`tests/test_archive_provenance.py`(14)。
+- [x] 2026-10-21 **doctor 成为真正的门**：有 FAIL 时 exit 1；新增只读 `launchd` 检查（含手写的 GUI plist）。
+  证据：`tests/test_doctor_gate.py`(12)。
+- [x] 2026-10-21 **测试隔离残余**：`--port` 缺省会静默连上环境任意 daemon，2 个测试文件补动态端口。
+- [x] 2026-10-21 **备份文件误入 git**：`.gitignore` 补 `backups/` 与 `*.sha256`。
+
 ## 进行中
 
 - [ ] **P0 GUI 密度调优**：共振边阈值 0.14→0.08、每规则 top-4→top-6，加同层高相似互连

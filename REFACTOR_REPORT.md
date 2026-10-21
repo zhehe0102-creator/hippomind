@@ -86,9 +86,18 @@
 | AppleDouble `._*` 渗进 `.git/` 内部（29 个，含被 git 当真 pack index 读的） | 每条 git 命令刷 non-monotonic index | 逐个验证魔术字节后删除，`git fsck` 通过 |
 
 ## 五、遗留风险（如实）
+
+> **2026-10-21 更新**：本节的第 3、5 条已在**第二轮二次开发**中修复；第 1、2、4、6 条维持。
+> 第二轮报告见 `REFACTOR_REPORT_ROUND2.md`（11 项实测缺陷，596 测试全绿）。
+> 第 5 条的真实根因比本节记录的更深：工作区在外置卷时 macOS 隐私保护会拒绝
+> launchd 后台任务读取该卷，**改 plist 无法修复**——`doctor` 现已把该限制显式报出。
+
 1. semantic 折叠后 daemon 的「空闲巩固 +10」日志会停增，但若有人回退 identity 键会复发——已有 20+ 回归测试锁死。
 2. 冲突双下线的语义未变：连续两条 decision 会让旧那条进入 conflict（知识更新收敛），运营需知晓 `conflicts/resolve` 工作流。
-3. 归档不含 metadata_json（溯源以备份为权威，已写入压缩报告）。
+3. ~~归档不含 metadata_json（溯源以备份为权威，已写入压缩报告）。~~
+   **已修复（第二轮）**：purge/collapse 归档 payload 均新增 `metadata` 键，溯源指针随内容一起留存。
 4. distill 的因果深度按设计取 2；超深链需显式 max_depth。
-5. ledger/cli 包化已完成并通过全部门禁；但 launchd 自启项仍指向 PiDeck 旧路径（`~/Library/LaunchAgents/com.hippomind.*.plist` 的 PYTHONPATH 写死 `pi-desktop/...`，该目录已不存在）——启用重构版前需先 `login-install` 重装自启项指向新工作区。
+5. ~~launchd 自启项仍指向 PiDeck 旧路径，启用前需 `login-install` 重装。~~
+   **已处理（第二轮）**：plist 路径已重装指向当前工作区，并新增 `doctor` 的 `launchd` 检查
+   （只读）持续监视漂移。**但**外置卷上的开机自启受 TCC 限制，本身不可用——见第二轮报告第四节。
 6. `raw-archive` 与压缩归档合计约 201MB 保留在库旁目录；如需异地留存请纳入备份策略。
