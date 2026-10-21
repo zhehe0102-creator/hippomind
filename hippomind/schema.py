@@ -34,6 +34,43 @@ SCHEMA_VERSION = 8
 #: columns are shaped around them.
 RAW_KINDS = frozenset({"raw_chat", "tool_output", "system_message"})
 
+#: **The** definition of "this memory belongs in ``memory_fts``".
+#:
+#: Every FTS writer, auditor and pruner must derive its membership test from
+#: this one string.  Before it existed there were four incompatible definitions:
+#:
+#: * the write path indexed ``quality_state='accepted'`` (regardless of lifecycle);
+#: * ``fts_sync_report`` counted ``accepted`` + ``active``;
+#: * ``health_overview.fts.expected`` and :func:`_rebuild_fts` used
+#:   "not (raw and non-active)" — i.e. they expected quarantined, conflicted,
+#:   superseded, expired and cold rows to stay in the hot index;
+#: * ``maintain`` pruned only ``lifecycle!='active'``, so quarantined-but-active
+#:   rows were never removed.
+#:
+#: Measured consequence on the 136,459-row live ledger (2026-10-20): 5,571 FTS
+#: rows, of which only 392 could ever be returned by a recall query — 5,179
+#: (93%) permanent index garbage, while ``checkup --repair`` re-added it and
+#: ``maintain`` reported a healthy ledger as drifted.
+#:
+#: The single rule: a row is indexed **iff** it is accepted quality *and* on the
+#: active lifecycle.  Cold/audit rows leave the hot index but stay retrievable
+#: through the bounded LIKE fallback in ``search(include_cold=True)``.
+FTS_INDEXED_PREDICATE = "quality_state='accepted' AND lifecycle='active'"
+
+
+def fts_indexed_predicate(table: str = "") -> str:
+    """Return :data:`FTS_INDEXED_PREDICATE`, optionally table-qualified.
+
+    ``fts_indexed_predicate("m")`` yields
+    ``m.quality_state='accepted' AND m.lifecycle='active'`` so a query that
+    joins ``memories`` can use the same single definition without copying it.
+    """
+    if not table:
+        return FTS_INDEXED_PREDICATE
+    prefix = str(table) + "."
+    return (prefix + "quality_state='accepted' AND "
+            + prefix + "lifecycle='active'")
+
 
 def _fts_tokenizer() -> str:
     """trigram needs SQLite >= 3.34; older builds fall back to unicode61.
@@ -279,22 +316,39 @@ def _migrate_v5(conn: sqlite3.Connection) -> None:
     """)
 
 
-def _rebuild_fts(conn: sqlite3.Connection) -> None:
-    """Recreate memory_fts from the memories table (shared by migrations).
+def _fts_indexed_where(conn: sqlite3.Connection, table: str = "") -> str:
+    """Return the indexed-set predicate for this connection's schema age.
 
-    Callers must have already (re)created the virtual table with the
-    desired tokenizer. Old raw-chat derivatives quarantined by v5 keep
-    their audit LIKE path but stay out of routine FTS, mirroring normal
-    maintenance.
+    ``quality_state`` is only added by ``_migrate_v4``, but ``_migrate_v3`` has
+    to rebuild the (then empty) index *before* that column exists.  At v3 every
+    surviving row predates the quality dimension and v4 defaults it to
+    ``accepted``, so "all active rows" and the full predicate coincide; from v4
+    on the single :data:`FTS_INDEXED_PREDICATE` rule applies.  This keeps the
+    migration chain contiguous without weakening the v4+ invariant.
+    """
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(memories)")}
+    if "quality_state" not in columns:
+        prefix = (str(table) + ".") if table else ""
+        return prefix + "lifecycle='active'"
+    return fts_indexed_predicate(table)
+
+
+def _rebuild_fts(conn: sqlite3.Connection) -> None:
+    """Recreate memory_fts from exactly the indexed set (shared by migrations).
+
+    Callers must have already (re)created the virtual table with the desired
+    tokenizer.  The backfill is restricted to :data:`FTS_INDEXED_PREDICATE`:
+    cold, expired, superseded, conflicted and quarantined rows keep their audit
+    LIKE path but stay out of the hot index, which is what normal maintenance
+    converges to.  A rebuild must never re-add a row that maintenance would
+    immediately prune — that made ``checkup --repair`` grow stale rows.
     """
     rows = conn.execute("""
-        SELECT memory_id,content,task_id,project,source_agent,kind,metadata_json,raw_chat,lifecycle
-        FROM memories
+        SELECT memory_id,content,task_id,project,source_agent,kind,metadata_json
+        FROM memories WHERE """ + _fts_indexed_where(conn) + """
     """).fetchall()
     conn.execute("DELETE FROM memory_fts")
     for row in rows:
-        if row["raw_chat"] and row["lifecycle"] != "active":
-            continue
         try:
             metadata = json.loads(row["metadata_json"] or "{}")
         except (TypeError, ValueError):

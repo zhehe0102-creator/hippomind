@@ -14,6 +14,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+from ..schema import fts_indexed_predicate
 from ._helpers import (
     CONTEXT_FIELDS,
     DEFAULT_AUTO_VACUUM_FREELIST_RATIO,
@@ -363,16 +364,37 @@ class LifecycleMixin:
                 raise LedgerError("胜者不在该冲突组内")
             loser_ids = sorted(group_ids - {winner_memory_id})
 
-            # 胜者：组内全部 claim 激活、memory 恢复 accepted（缺失时补回 FTS）
+            # 胜者：组内全部 claim 激活、memory 恢复 accepted，**并恢复 lifecycle**。
+            #
+            # 只恢复 quality_state 是一个实测缺陷：翻案重裁（先判 B 胜使 A 进入
+            # superseded，再重裁 A 胜）时 A 会变成 quality_state='accepted' 但
+            # lifecycle 仍停在 'superseded'。所有召回都要求 lifecycle='active'，
+            # 于是「胜出」的那条记忆永久不可召回（search 返回 []），
+            # health_overview 还会报 drift=True。裁决必须让胜者真正回到可召回态。
             conn.execute(f"""
                 UPDATE memory_claims SET state='active'
                 WHERE memory_id=? AND state!='active' AND {slot_m}
             """, (winner_memory_id, *slot_params))
-            conn.execute("UPDATE memories SET quality_state='accepted',updated_at=? "
-                         "WHERE memory_id=?", (now, winner_memory_id))
+            # 只从 'superseded' 恢复：那是「裁决让位」的产物，胜出即应撤销。
+            # 'expired' 是时间窗口语义（valid_until 已过），裁决不改窗口，
+            # 因此不在这里改它的 lifecycle——否则会出现 lifecycle=active 但
+            # valid_until 已过期的不一致状态。quality_state 恢复 accepted 是
+            # 既有契约（见 BACKLOG「裁决后胜者恢复 accepted」）：裁决本身就是
+            # 一次显式的人工确认。
+            conn.execute("UPDATE memories SET quality_state='accepted',"
+                         "lifecycle=CASE WHEN lifecycle='superseded' THEN 'active' "
+                         "ELSE lifecycle END,"
+                         "superseded_by=CASE WHEN lifecycle='superseded' THEN '' "
+                         "ELSE superseded_by END,"
+                         "updated_at=? WHERE memory_id=?",
+                         (now, winner_memory_id))
+            # 索引成员由单一不变量决定：只有 accepted+active 才该在热索引里。
             has_fts = conn.execute("SELECT 1 FROM memory_fts WHERE memory_id=?",
                                    (winner_memory_id,)).fetchone()
-            if has_fts is None:
+            should_index = conn.execute(
+                "SELECT 1 FROM memories WHERE memory_id=? AND "
+                + fts_indexed_predicate(), (winner_memory_id,)).fetchone() is not None
+            if should_index and has_fts is None:
                 fts_text = _fts_text(winner["content"],
                                      json.loads(winner["metadata_json"] or "{}"))
                 conn.execute(
@@ -457,18 +479,35 @@ class LifecycleMixin:
         now_epoch = _epoch(now)
 
         def write(conn: sqlite3.Connection) -> Dict[str, int]:
-            # Upgrade cleanup: older releases kept already-cold projections in
-            # FTS. Remove them idempotently on every maintenance pass so a
-            # long-running ledger converges without requiring a full rebuild.
-            legacy_cold_fts = int(conn.execute("""
-                SELECT count(*) FROM memory_fts f JOIN memories m ON m.memory_id=f.memory_id
-                WHERE m.lifecycle!='active'
-            """).fetchone()[0])
-            conn.execute("""
-                DELETE FROM memory_fts WHERE memory_id IN (
-                    SELECT memory_id FROM memories WHERE lifecycle!='active'
-                )
-            """)
+            # Index convergence: memory_fts must hold *exactly* the rows that
+            # satisfy schema.FTS_INDEXED_PREDICATE (accepted + active).  Older
+            # releases only pruned ``lifecycle!='active'``, so quarantined,
+            # conflicted and superseded-but-active leftovers survived every
+            # maintenance pass forever (live ledger: 3,851 quarantined+active
+            # rows out of 5,571 index rows, of which only 392 were recallable).
+            # The same pass also drops orphan index rows whose memory is gone.
+            # Idempotent, so a long-running ledger converges without a rebuild.
+            indexed_m = fts_indexed_predicate("m")
+            legacy_stale_fts = int(conn.execute(
+                "SELECT count(*) FROM memory_fts f WHERE NOT EXISTS ("
+                "SELECT 1 FROM memories m WHERE m.memory_id=f.memory_id AND "
+                + indexed_m + ")").fetchone()[0])
+            conn.execute(
+                "DELETE FROM memory_fts WHERE NOT EXISTS ("
+                "SELECT 1 FROM memories m WHERE m.memory_id=memory_fts.memory_id AND "
+                + indexed_m + ")")
+            # Duplicate index rows: ``memory_id`` is declared UNINDEXED, so the
+            # same memory can be inserted twice (an interrupted redact/repair
+            # pass is the observed cause).  They cost space and make
+            # ``fts_rows`` disagree with ``expected`` forever, so the same pass
+            # collapses each memory_id to its first rowid.
+            legacy_stale_fts += int(conn.execute(
+                "SELECT COALESCE(SUM(c - 1), 0) FROM ("
+                "SELECT COUNT(*) AS c FROM memory_fts GROUP BY memory_id"
+                ")").fetchone()[0])
+            conn.execute(
+                "DELETE FROM memory_fts WHERE rowid NOT IN ("
+                "SELECT MIN(rowid) FROM memory_fts GROUP BY memory_id)")
             # 审计事件压缩归档：主表超 events_keep 时把最旧行移入侧表。
             # ledger_events 仍是审计事实来源——侧表同构保留全部列，可查证。
             events_archived = 0
@@ -620,7 +659,7 @@ class LifecycleMixin:
             return {"decayed": decayed, "expired": expired, "archived": archived,
                     "raw_archived": raw_archived, "active_limit": active_limit,
                     "raw_active_limit": raw_active_limit,
-                    "fts_pruned": legacy_cold_fts,
+                    "fts_pruned": legacy_stale_fts,
                     "events_archived": events_archived}
 
         result = self._transaction(write)
@@ -793,7 +832,15 @@ class LifecycleMixin:
 
         采用 DROP+CREATE 结构性重建：外部工具直接改动 FTS 表可能留下
         残缺的内部结构（integrity_check 报 fts5 corruption），仅 DELETE+重插
-        不保证清除。DROP 后按当前分词器原样建表并回填全部投影。
+        不保证清除。DROP 后按当前分词器原样建表并回填。
+
+        回填集合**不是**全部投影，而是 ``schema.FTS_INDEXED_PREDICATE``
+        （accepted + active）——与写路径、``_rebuild_fts``、``fts_sync_report``、
+        ``health_overview`` 和 ``maintain`` 的清理共用同一个判定。修复前这里
+        回填「除 raw 且非 active 外全部行」，于是 repair 会把隔离/冲突/被取代
+        行重新写回索引：干净库上实测 ``stale`` 从 0 变 1，索引垃圾越修越多。
+        冷/审计行不重建索引，仍可经 ``search(include_cold=True)`` 的 LIKE
+        回退通道检索。
         """
         with self._local_lock:
             conn = self._connect(write=True)

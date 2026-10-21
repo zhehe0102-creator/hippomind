@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 from pathlib import Path
 from typing import Any, Dict
+from ..schema import fts_indexed_predicate
 from ._helpers import (
     DEFAULT_RAW_CAPACITY,
     DEFAULT_RAW_RETENTION_DAYS,
@@ -45,9 +46,12 @@ class HealthMixin:
            removes cold rows from FTS ("Cold projections remain auditable in
            SQLite, but must leave the hot FTS index").  Every ledger holding
            cold rows therefore reported ``warn`` forever, which trains
-           operators to ignore the check.  Only rows that *must* be indexed —
-           ``quality_state='accepted' AND lifecycle='active'`` — count as
-           missing now.
+           operators to ignore the check.
+
+        Membership now comes from :data:`hippomind.schema.FTS_INDEXED_PREDICATE`
+        — the same single definition used by the write path, ``_rebuild_fts``,
+        ``health_overview`` and ``maintain``'s prune.  Keeping a private copy
+        here is what let the audit call a 93%-garbage ledger healthy.
 
         ``status`` is ``ok`` when nothing that should be indexed is missing.
         Rows in FTS that should not be there (cold/quarantined leftovers) are
@@ -57,34 +61,50 @@ class HealthMixin:
         with self._reading() as conn:
             # One pass over the FTS table, then a linear anti-join.  A temp
             # table (not an IN-list) keeps this bounded regardless of size.
+            #
+            # ``memory_id`` is declared UNINDEXED in the fts5 table, so a
+            # duplicate index row is representable — and has been observed
+            # after an interrupted redact/maintenance pass.  The audit must
+            # *report* that, not crash on it: a ``PRIMARY KEY`` insert aborted
+            # the whole health check with `UNIQUE constraint failed`, turning a
+            # diagnosable index defect into an opaque traceback.  Counting raw
+            # rows and distinct ids separately keeps the invariant comparable
+            # while the duplication shows up as ``duplicate_rows``.
             conn.execute("DROP TABLE IF EXISTS temp._fts_sync_ids")
             conn.execute("CREATE TEMP TABLE _fts_sync_ids(memory_id TEXT PRIMARY KEY)")
-            conn.execute("INSERT INTO _fts_sync_ids SELECT memory_id FROM memory_fts")
+            conn.execute("INSERT OR IGNORE INTO _fts_sync_ids "
+                         "SELECT memory_id FROM memory_fts")
             fts_rows = int(conn.execute(
+                "SELECT COUNT(*) FROM memory_fts").fetchone()[0])
+            duplicate_rows = fts_rows - int(conn.execute(
                 "SELECT COUNT(*) FROM _fts_sync_ids").fetchone()[0])
+            indexed = fts_indexed_predicate()
+            indexed_m = fts_indexed_predicate("m")
             expected = int(conn.execute(
-                "SELECT COUNT(*) FROM memories "
-                "WHERE quality_state='accepted' AND lifecycle='active'"
-            ).fetchone()[0])
+                "SELECT COUNT(*) FROM memories WHERE " + indexed).fetchone()[0])
             missing = int(conn.execute(
-                "SELECT COUNT(*) FROM memories m "
-                "WHERE m.quality_state='accepted' AND m.lifecycle='active' "
-                "AND NOT EXISTS (SELECT 1 FROM _fts_sync_ids f "
+                "SELECT COUNT(*) FROM memories m WHERE " + indexed_m +
+                " AND NOT EXISTS (SELECT 1 FROM _fts_sync_ids f "
                 "                WHERE f.memory_id=m.memory_id)"
             ).fetchone()[0])
             # Index entries that maintenance should have removed.  These are
             # capacity waste, not a recall correctness problem.
             stale = int(conn.execute(
                 "SELECT COUNT(*) FROM _fts_sync_ids f JOIN memories m "
-                "ON m.memory_id=f.memory_id "
-                "WHERE NOT (m.quality_state='accepted' AND m.lifecycle='active')"
+                "ON m.memory_id=f.memory_id WHERE NOT (" + indexed_m + ")"
             ).fetchone()[0])
             orphan = int(conn.execute(
                 "SELECT COUNT(*) FROM _fts_sync_ids f WHERE NOT EXISTS "
                 "(SELECT 1 FROM memories m WHERE m.memory_id=f.memory_id)"
             ).fetchone()[0])
             conn.execute("DROP TABLE IF EXISTS temp._fts_sync_ids")
-        status = "ok" if missing == 0 else "warn"
+        status = "ok" if missing == 0 and duplicate_rows == 0 else "warn"
+        if missing:
+            hint = "运行 hippomind maintain 可重建 FTS"
+        elif duplicate_rows:
+            hint = "FTS 存在重复索引行，运行 hippomind maintain 可清理"
+        else:
+            hint = None
         return {"status": status,
                 # ``projections`` keeps its historical name (it is the count of
                 # rows that ought to be indexed) but now uses the correct
@@ -94,7 +114,10 @@ class HealthMixin:
                 "unindexed": missing,
                 "stale": stale,
                 "orphan": orphan,
-                "hint": None if missing == 0 else "运行 hippomind maintain 可重建 FTS"}
+                # Duplicate index rows: capacity waste and a sign of an
+                # interrupted writer, never a missing projection.
+                "duplicate_rows": duplicate_rows,
+                "hint": hint}
 
     def claims_consistency_report(self) -> Dict[str, Any]:
         """活跃 claim 指向的记忆必须存在且为 accepted。"""
@@ -119,11 +142,13 @@ class HealthMixin:
             events = conn.execute("SELECT COUNT(*) FROM ledger_events").fetchone()[0]
             fts_rows = conn.execute(
                 "SELECT COUNT(*) FROM memory_fts").fetchone()[0]
-            # 审计口径必须与 _rebuild_fts 的不变量一致：除「raw 且非 active」
-            # 外全部入索引。用全表做分母会在 raw 归档占多数的真实库上永远误报。
+            # 审计口径与 _rebuild_fts / maintain 共用同一个不变量常量：
+            # FTS 恰好是 {accepted AND active}。此前这里用「除 raw 且非 active
+            # 外全部入索引」，与 fts_sync_report 的 accepted+active 互相矛盾，
+            # 真实库上 5,571 行索引里 5,179 行不可召回却被判为「无漂移」。
             expected_indexed = conn.execute(
-                "SELECT COUNT(*) FROM memories "
-                "WHERE NOT (raw_chat=1 AND lifecycle!='active')").fetchone()[0]
+                "SELECT COUNT(*) FROM memories WHERE " + fts_indexed_predicate()
+            ).fetchone()[0]
             try:
                 page_size = conn.execute("PRAGMA page_size").fetchone()[0]
                 page_count = conn.execute("PRAGMA page_count").fetchone()[0]
@@ -132,14 +157,23 @@ class HealthMixin:
                 db_bytes = 0
         # FTS 体积审计：对照应索引集合检测漂移；占比供容量规划。
         drift = int(fts_rows) != int(expected_indexed)
+        if not drift:
+            note = "ok"
+        elif int(fts_rows) < int(expected_indexed):
+            # 行数偏少 = 应索引的行缺失，只有结构性重建能补回。
+            note = "FTS 行数与应索引集合不一致，建议 checkup --repair"
+        else:
+            # 行数偏多 = 不可召回的陈旧索引行。``checkup --repair`` 只在
+            # ``unindexed>0`` 时触发（它负责补缺失，不负责清理），所以这里
+            # 必须指向真正会收敛索引的命令；否则提示会让人跑一个空操作。
+            note = "FTS 存在不可召回的陈旧索引行，建议运行 hippomind maintain"
         return {"memories": int(memories), "quarantined": int(quarantined),
                 "pinned": int(pinned), "events": int(events),
                 "fts": {"rows": int(fts_rows),
                         "expected": int(expected_indexed),
                         "drift": drift,
                         "db_bytes": db_bytes,
-                        "note": ("FTS 行数与应索引集合不一致，建议 checkup --repair"
-                                 if drift else "ok")},
+                        "note": note},
                 "schema_version": SCHEMA_VERSION}
 
     def stats(self) -> Dict[str, Any]:
