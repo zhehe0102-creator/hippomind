@@ -15,6 +15,7 @@ from ..sanitize import MAX_ARCHIVE_MESSAGE_CHARS, sanitize_chat_content
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
+from ..schema import fts_indexed_predicate
 from ._helpers import (
     DEFAULT_RAW_ARCHIVE_MAX_BYTES,
     DEFAULT_RAW_RETENTION_DAYS,
@@ -27,6 +28,41 @@ from ._helpers import (
     _json,
     utc_now,
 )
+
+
+def _archive_metadata(encoded: Optional[str]) -> Dict[str, Any]:
+    """Decode one row's ``metadata_json`` for an archive payload.
+
+    The archive is the *only* surviving copy once rows are deleted, so the
+    provenance blob has to travel with the content: ``archive_rowid`` /
+    ``agent_chat_path`` are the pointers back into the external Agent-Chat
+    archive, and the 4.27GB pre-compaction backup that also holds them is a
+    temporary authority, not a permanent one.
+
+    Decoding is deliberately fail-safe.  ``metadata_json`` is written by
+    :func:`._json` for every live row, so malformed values can only be legacy
+    corruption; returning ``{}`` there keeps the archive pass from aborting
+    (the fail-closed rule protects the *delete*, not the operator's ability to
+    retire a row) instead of silently preventing a purge forever.
+    """
+    try:
+        value = json.loads(encoded or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _fts_indexed(conn: sqlite3.Connection, memory_id: str) -> bool:
+    """Whether ``memory_id`` satisfies the shared hot-index predicate.
+
+    Reading it back from the database (instead of trusting a column already
+    selected by the caller) keeps every FTS writer on the single definition in
+    :data:`hippomind.schema.FTS_INDEXED_PREDICATE`.
+    """
+    return conn.execute(
+        "SELECT 1 FROM memories WHERE memory_id=? AND " + fts_indexed_predicate(),
+        (memory_id,)).fetchone() is not None
+
 
 class ArchiveMixin:
     """Raw evidence tiering: archive, purge, collapse, redact and scan."""
@@ -116,6 +152,12 @@ class ArchiveMixin:
         Any failure in 2 or 3 leaves the database untouched and is reported in
         ``error``; deletion is attempted on the next maintenance pass.
 
+        Each archived record is a full provenance copy, not just a content dump:
+        it carries the row's ``metadata`` (decoded ``metadata_json``) alongside
+        the existing identity/content/digest fields, because after step 4 the
+        archive is the only place ``archive_rowid`` / ``agent_chat_path`` still
+        exist.  Keys are additive — no existing key is renamed or dropped.
+
         Returns counts only — never content — so it is safe to log.
         """
         before_days = _clamp_int(before_days, DEFAULT_RAW_RETENTION_DAYS, 1, 36_500)
@@ -178,6 +220,11 @@ class ArchiveMixin:
                             "evidence": row["evidence_json"],
                             "created_at": row["created_at"],
                             "occurred_at": row["occurred_at"],
+                            # Provenance: without this key the archive is the only
+                            # copy of the content but carries none of the pointers
+                            # (archive_rowid / agent_chat_path) that make the deleted
+                            # row auditable against the external chat archive.
+                            "metadata": _archive_metadata(row["metadata_json"]),
                             "purged_at": utc_now(),
                         }
                         handle.write((json.dumps(payload, ensure_ascii=False,
@@ -452,7 +499,12 @@ class ArchiveMixin:
                     # FTS is a separate copy of the content. Delete first so
                     # a secret cannot survive in an old full-text segment.
                     conn.execute("DELETE FROM memory_fts WHERE memory_id=?", (row["memory_id"],))
-                    if row["lifecycle"] == "active":
+                    # Re-index only if the row belongs in the hot index.  This
+                    # used to test ``lifecycle == 'active'`` alone, which
+                    # re-inserted quarantined/conflicted rows and re-created the
+                    # garbage the single predicate exists to keep out
+                    # (measured: stale 0 -> 1, drift True after one redact).
+                    if _fts_indexed(conn, row["memory_id"]):
                         conn.execute("""
                             INSERT INTO memory_fts(memory_id,content,task_id,project,source_agent,kind)
                             VALUES(?,?,?,?,?,?)
@@ -484,6 +536,10 @@ class ArchiveMixin:
           * The survivor is the earliest row (stable, reproducible ordering).
           * Every removed row is first written to the same verified gzip archive
             used by :meth:`purge_expired_raw`, so nothing becomes unrecoverable.
+            Each record also carries the row's ``metadata``, so provenance
+            pointers survive the delete.
+          * The grouping table is rebuilt from scratch on every run.  A crash
+            cannot leave a stale snapshot that a later run would trust.
           * ``dry_run`` reports the exact counts and touches nothing.
 
         Returns counts only.
@@ -491,13 +547,28 @@ class ArchiveMixin:
         batch_size = _clamp_int(batch_size, 5_000, 100, 50_000)
         summary: Dict[str, Any] = {"duplicate_groups": 0, "collapsed": 0,
                                    "archive_path": "", "dry_run": bool(dry_run)}
-        self._transaction(lambda conn: conn.execute("""
-            CREATE TABLE IF NOT EXISTS _dedupe_groups AS
-            SELECT MAX(memory_id) AS survivor_id, content, source_agent, session_id,
-                   role, COUNT(*) AS n
-            FROM memories WHERE raw_chat=1 AND content!=''
-            GROUP BY content, source_agent, session_id, role HAVING COUNT(*)>1
-        """))
+
+        def rebuild_groups(conn: sqlite3.Connection) -> None:
+            # Crash-window guard.  ``_dedupe_groups`` is a *persistent* table and
+            # the drop only happens in the ``finally`` below, so a process killed
+            # mid-run leaves a stale snapshot behind.  ``CREATE TABLE IF NOT
+            # EXISTS`` then silently keeps that snapshot, and the delete JOIN
+            # below trusts it: a stale row whose survivor was already removed
+            # makes every remaining copy look like a loser, so rows that must
+            # survive get deleted (measured: 3 duplicate rows -> 0 left instead
+            # of 1).  Each run therefore starts from an unconditional rebuild;
+            # DROP+CREATE in one transaction means a crash leaves no table at
+            # all, which is the safe state, rather than a plausible-looking lie.
+            conn.execute("DROP TABLE IF EXISTS _dedupe_groups")
+            conn.execute("""
+                CREATE TABLE _dedupe_groups AS
+                SELECT MAX(memory_id) AS survivor_id, content, source_agent, session_id,
+                       role, COUNT(*) AS n
+                FROM memories WHERE raw_chat=1 AND content!=''
+                GROUP BY content, source_agent, session_id, role HAVING COUNT(*)>1
+            """)
+
+        self._transaction(rebuild_groups)
         try:
             with self._connect() as conn:
                 summary["duplicate_groups"] = int(conn.execute(
@@ -517,7 +588,7 @@ class ArchiveMixin:
                         batch = conn.execute("""
                             SELECT m.memory_id,m.origin_event_id,m.content,m.source_agent,
                                    m.session_id,m.task_id,m.project,m.role,m.scope,
-                                   m.created_at,e.occurred_at,e.content_hash
+                                   m.created_at,m.metadata_json,e.occurred_at,e.content_hash
                             FROM memories AS m
                             JOIN ledger_events AS e ON e.event_id=m.origin_event_id
                             JOIN _dedupe_groups g
@@ -542,6 +613,10 @@ class ArchiveMixin:
                             "source_agent": row["source_agent"],
                             "session_id": row["session_id"],
                             "created_at": row["created_at"],
+                            # Same provenance rule as purge_expired_raw: a
+                            # collapsed row's metadata (notably archive_rowid)
+                            # exists nowhere else after the delete.
+                            "metadata": _archive_metadata(row["metadata_json"]),
                             "collapsed_at": utc_now(),
                         }, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8"))
                         removed.append(str(row["memory_id"]))
