@@ -8,6 +8,12 @@ __pycache__/
 *.sqlite-*
 *.sqlite-shm
 *.sqlite-wal
+# Backups (scripts/backup.sh) are local recovery artifacts, never source.
+# The .sha256 sidecar was not matched by the *.sqlite rules and would have
+# been committed next to a ledger it describes; RELEASE.md forbids committing
+# anything under the backup directory.
+backups/
+*.sha256
 hippocampus_memory.json
 output/
 tmp/
