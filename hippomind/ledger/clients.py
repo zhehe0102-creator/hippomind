@@ -13,6 +13,7 @@ import sqlite3
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from ..schema import fts_indexed_predicate
 from ._helpers import (
     AGENT_PERMISSIONS,
     AgentCredential,
@@ -385,8 +386,15 @@ class ClientsMixin:
                         "weight", "importance", "touch_count", "utility",
                         "confidence", "success_count", "failure_count",
                         "pinned")) + ");")
+        # Rebuild only the hot index, using the same single predicate as every
+        # other writer.  The unconditional ``SELECT ... FROM memories`` used to
+        # copy cold/quarantined/conflicted rows into the target ledger's FTS,
+        # which the target immediately reported as drift.  A dump carries only
+        # ``accepted`` rows in ``active``/``cold`` lifecycle (see the clause
+        # above), so this is exactly "the active subset".
         out.append("INSERT INTO memory_fts(memory_id, content) "
-                   "SELECT memory_id, content FROM memories;")
+                   "SELECT memory_id, content FROM memories WHERE "
+                   + fts_indexed_predicate() + ";")
         out.append("COMMIT;")
         return "\n".join(out) + "\n"
 

@@ -33,7 +33,15 @@ CREATE TABLE memories (memory_id TEXT PRIMARY KEY,
  weight REAL NOT NULL DEFAULT 0.5, importance INTEGER NOT NULL DEFAULT 5,
  touch_count INTEGER NOT NULL DEFAULT 0, utility REAL NOT NULL DEFAULT 0.0,
  confidence REAL NOT NULL DEFAULT 0.5, success_count INTEGER NOT NULL DEFAULT 0,
- failure_count INTEGER NOT NULL DEFAULT 0, pinned INTEGER NOT NULL DEFAULT 0);
+ failure_count INTEGER NOT NULL DEFAULT 0, pinned INTEGER NOT NULL DEFAULT 0,
+ -- v4 quality dimension: the dump's FTS rebuild filters on it, and the real
+ -- target is documented as a *same-schema-version* empty database.  The
+ -- reduced fixture predates this column and silently diverged from the
+ -- schema the exporter targets.
+ valid_from TEXT NOT NULL DEFAULT '', asserted_at TEXT NOT NULL DEFAULT '',
+ agent_trust REAL NOT NULL DEFAULT 0.5,
+ quality_score REAL NOT NULL DEFAULT 1.0,
+ quality_state TEXT NOT NULL DEFAULT 'accepted');
 CREATE VIRTUAL TABLE memory_fts USING fts5(memory_id UNINDEXED, content);
 """
 
