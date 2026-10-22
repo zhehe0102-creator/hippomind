@@ -10,7 +10,10 @@
 # 默认只启动/复用后台服务和低频 watcher
 ./start-hippomind.command
 
-# 按需打开 GUI
+# 打开 Web 控制台（HippoMind Atlas，推荐）
+./start-hippomind.command --web
+
+# 按需打开旧版 matplotlib GUI（保留）
 ./start-hippomind.command --gui
 
 # 一次性安装各 Agent 的显式记忆接入；Codex 会启用原生提交 Hook

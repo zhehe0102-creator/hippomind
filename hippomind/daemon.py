@@ -24,15 +24,17 @@ from datetime import datetime, timezone
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import mimetypes
 from typing import Any, Dict, Mapping, Optional
 
 # 空闲睡眠巩固：连续无外部活动（请求 + watcher 增量）达到该秒数后触发。
 SLEEP_IDLE_SECONDS = 600.0
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from .access import AccessDenied, AccessPolicy
 from .context_pack import DEFAULT_MAX_CHARS, DEFAULT_MAX_TOKENS, ContextPackBuilder, ContextPackOptions
 from .injection import InjectionState
+from .gui_api import GuiApi, GuiApiError  # noqa: E402  (module keeps its legacy import block)
 from .ledger import LedgerError, SQLiteLedger, default_ledger_path, utc_now
 from .provider_manifest import DEFAULT_DISCOVERY_INTERVAL_SECONDS, AgentDiscovery
 from .watcher import ArchiveWatcher, default_dsh_sessions_root
@@ -227,6 +229,9 @@ class MemoryHubService:
         # written by the discovery loop, read by status endpoints.
         self.auto_install: Dict[str, Any] = {}
         self.token = self._load_or_create_token() if self.require_auth else ""
+        # Read-only admin console API (/api/v1); it shares the hub's single
+        # ledger handle and never opens a second writer.
+        self.gui = GuiApi(self)
         self.started_at = utc_now()
         self._server: Optional[ThreadingHTTPServer] = None
         self._watch_thread: Optional[threading.Thread] = None
@@ -802,12 +807,104 @@ class MemoryHubRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
             return
+        if path == "/api/v1" or path.startswith("/api/v1/"):
+            policy = self._require_auth()
+            if policy is None:
+                return
+            params_ = parse_qs(urlsplit(self.path).query)
+            try:
+                self._write(200, self.hub.gui.get(path, params_, policy))
+            except GuiApiError as exc:
+                self._write(exc.status, {"error": str(exc)})
+            except LedgerError as exc:
+                self._write(400, {"error": str(exc)})
+            except (TypeError, ValueError) as exc:
+                self._write(400, {"error": str(exc)})
+            except Exception as exc:
+                sys.stderr.write(
+                    "[hippomindd] gui api failure: %s: %s\n" % (type(exc).__name__, exc))
+                self._write(500, {"error": "internal server error"})
+            return
+        if path == "/ui" or path.startswith("/ui/"):
+            self._serve_ui(path)
+            return
         self._write(404, {"error": "unknown endpoint"})
+
+    # ------------------------------------------------------------------
+    # Web GUI (static, same-origin)
+    # ------------------------------------------------------------------
+    # The browser app is served by the daemon itself rather than opened as a
+    # file:// page: a file page has an opaque origin, so every fetch to the
+    # loopback API would be a cross-origin request the daemon never agreed to
+    # (no CORS headers, and adding them would widen the attack surface for a
+    # page anyone could host).  Serving from the same origin keeps the token
+    # header same-origin and lets the UI use relative URLs.
+    #
+    # Only files inside ``hippomind/web/`` are reachable, resolved paths are
+    # checked against traversal, and the token is never embedded in the HTML.
+    UI_ROOT = Path(__file__).resolve().parent / "web"
+
+    #: A strict same-origin policy for the console. Scripts come only from this
+    #: daemon; inline style is allowed because charts set computed style through
+    #: CSSOM (CSP style-src also governs style attributes). The frame/objects
+    #: directives make clickjacking and plugin embedding impossible.
+    UI_CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+              "img-src 'self' data:; connect-src 'self'; font-src 'self'; "
+              "base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'")
+
+    def _serve_ui(self, path: str) -> None:
+        relative = unquote(path[len("/ui"):].lstrip("/")) or "index.html"
+        if not relative or relative.startswith("."):
+            self._write(400, {"error": "invalid UI asset path"})
+            return
+        candidate = (self.UI_ROOT / relative).resolve()
+        try:
+            candidate.relative_to(self.UI_ROOT.resolve())
+        except ValueError:
+            self._write(403, {"error": "path outside the UI root"})
+            return
+        if not candidate.is_file():
+            self._write(404, {"error": "no such UI asset"})
+            return
+        try:
+            payload = candidate.read_bytes()
+        except OSError:
+            self._write(500, {"error": "UI asset unreadable"})
+            return
+        content_type = mimetypes.guess_type(candidate.name)[0] or "application/octet-stream"
+        if content_type.startswith("text/") or content_type in {
+                "application/javascript", "application/json", "image/svg+xml"}:
+            content_type += "; charset=utf-8"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        # The app is local and versioned with the daemon; revalidate every load
+        # so an upgraded daemon never serves a stale bundle from the browser.
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        self.send_header("Content-Security-Policy", self.UI_CSP)
+        self.end_headers()
+        self.wfile.write(payload)
 
     def _handle_post(self) -> None:
         path = urlsplit(self.path).path.rstrip("/") or "/"
         if path == "/health":
             self._write(405, {"error": "use GET /health"})
+            return
+        if path == "/api/v1/ui-token/exchange":
+            # The URL opened by the CLI carries a single-use nonce in the
+            # fragment; the page exchanges it for the local token. Unknown or
+            # expired nonces get 401 and no timing oracle beyond one dict pop.
+            data = self._read_json()
+            if data is None:
+                return
+            try:
+                self._write(200, self.hub.gui.exchange_ui_token(data))
+            except GuiApiError as exc:
+                self._write(exc.status, {"error": str(exc)})
             return
         policy = self._require_auth()
         if policy is None:
@@ -816,7 +913,9 @@ class MemoryHubRequestHandler(BaseHTTPRequestHandler):
         if data is None:
             return
         try:
-            if path == "/ingest":
+            if path.startswith("/api/v1/"):
+                self._write(200, self.hub.gui.post(path, data, policy))
+            elif path == "/ingest":
                 records = data.get("records", [data])
                 if not isinstance(records, list) or not records or len(records) > 128:
                     raise LedgerError("records 必须是 1 到 128 条对象")
@@ -897,6 +996,8 @@ class MemoryHubRequestHandler(BaseHTTPRequestHandler):
                                  name="hippomind-delayed-shutdown", daemon=True).start()
             else:
                 self._write(404, {"error": "unknown endpoint"})
+        except GuiApiError as exc:
+            self._write(exc.status, {"error": str(exc)})
         except AccessDenied as exc:
             self._write(403, {"error": str(exc)})
         except LedgerError as exc:

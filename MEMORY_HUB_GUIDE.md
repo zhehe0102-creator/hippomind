@@ -39,6 +39,14 @@ Agent-Chat-Archive watcher (低频增量游标，原始聊天只作证据)
 ./start-hippomind.command --gui
 ```
 
+推荐直接打开 Web 控制台（HippoMind Atlas）：
+
+```bash
+./start-hippomind.command --web
+# 或
+python3 -m hippomind ui
+```
+
 重复运行不会创建第二个服务。也可以直接使用 CLI：
 
 ```bash
@@ -167,7 +175,7 @@ curl -sS -X POST http://127.0.0.1:8765/context-pack \
   -d '{"query":"继续 Memory Hub","options":{"max_items":8,"max_chars":16000,"max_tokens":6000}}'
 ```
 
-端点：`/health`、`/ingest`、`/recall`、`/context-pack`、`/feedback`、`/sync`、`/stats`、`/shutdown`。请求上限 1 MiB，响应上限 512 KiB，并发上限 16。`/ingest` 每批最多 128 条，并在一个 SQLite 事务中提交。
+端点：`/health`、`/ingest`、`/recall`、`/context-pack`、`/feedback`、`/sync`、`/stats`、`/shutdown`；控制台额外提供 `GET /ui`（静态、同源、无令牌）与 `GET /api/v1/*`（只读数据面，管理员令牌）及 `POST /api/v1/pin`、`/api/v1/feedback`、`/api/v1/ui-token`。请求上限 1 MiB，响应上限 512 KiB，并发上限 16。`/ingest` 每批最多 128 条，并在一个 SQLite 事务中提交。
 
 ## Watcher 与生命周期
 
@@ -221,6 +229,20 @@ python3 -m hippomind start
 恢复前 CLI 会检查 daemon 已停止；备份 schema 会先验证，随后使用 SQLite backup API 复制。迁移和恢复不删除 Agent-Chat-Archive 原始聊天。
 
 ## GUI 与性能
+
+### Web 控制台（HippoMind Atlas，主界面）
+
+daemon 在 `/ui` 同源提供新控制台（零构建、原生 ES Modules、无 CDN）。``hippomind ui``
+会申请一次性引导令牌（120 秒、单次有效，经 URL fragment 交给页面，不写进命令行历史）
+并打开浏览器；也可以直接打开 /ui 手动粘贴 0600 token 文件内容。十个视图覆盖脉搏、
+记忆库、检索、上下文、图谱、事实、年轮、端点、体检、参考；浅色纸本为默认，night
+为深色主题；`⌘K` 命令面板、1–0 切视图、R 刷新、T 主题。
+
+数据面是 `GET /api/v1/*`：管理员令牌限定、分页有界、内容截断、GET 只读；唯一写操作
+是置顶/反馈。静态服务只读 `hippomind/web/` 且带 CSP、frame-ancestors、nosniff 头，
+页面不含 token 或账本路径。设计与接口契约见 [docs/GUI_ATLAS.md](docs/GUI_ATLAS.md)。
+
+### 旧版 matplotlib 工作台
 
 `--gui` 只启动一个独立 matplotlib 进程。全屏六层网络保留简体中文、稳定二次贝塞尔曲线、节点/边预算、边采样、缩放和视口裁剪。它每约 300 帧才检查一次 daemon 状态；按 `H` 显示最多 4 项、900 字符的 Context Pack。GUI 不参与 watcher、账本写入或 Grid World 学习路径，因此不会改变实验结果。
 

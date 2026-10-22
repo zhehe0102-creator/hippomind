@@ -46,7 +46,7 @@ MCP resources are an additional explicit control surface. The active-context tem
 
 ## Operational model
 
-The daemon binds only to `127.0.0.1`, validates ledger ownership, enforces token and ACL boundaries, reconstructs watcher cursors after failures, and uses bounded retry/backoff for privacy permissions. SQLite uses WAL, busy timeouts, batched writes, incremental FTS updates, pagination, caches, and checkpoints. The GUI is optional: it samples graph edges and redraws incrementally so it cannot become a daemon dependency.
+The daemon binds only to `127.0.0.1`, validates ledger ownership, enforces token and ACL boundaries, reconstructs watcher cursors after failures, and uses bounded retry/backoff for privacy permissions. SQLite uses WAL, busy timeouts, batched writes, incremental FTS updates, pagination, caches, and checkpoints. The legacy matplotlib GUI is optional and samples graph edges incrementally so it cannot become a daemon dependency. The primary GUI is the same-origin Atlas web console served at `/ui`; its read model lives in `hippomind/gui_api.py` behind `/api/v1/*`, requires the local admin token, is bounded and read-only except audited pin/feedback operations, and the static asset server only exposes files inside `hippomind/web/` with CSP/frame-ancestors headers.
 
 ## Portability and release
 

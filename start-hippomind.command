@@ -1,7 +1,8 @@
 #!/bin/zsh
-# Double-click starts/reuses the local Memory Hub. Add --gui for the on-demand
-# Chinese workbench visualizer, or --network for the full-screen layered
-# memory network; the GUI never remains a background dependency.
+# Double-click starts/reuses the local Memory Hub. Add --web to open the
+# HippoMind Atlas web console (recommended), --gui for the legacy matplotlib
+# workbench, or --network for the legacy full-screen layered memory network.
+# GUI windows are never a background dependency.
 set -u
 
 PROJECT_DIR="${0:A:h}"
@@ -12,9 +13,11 @@ else
 fi
 OPEN_GUI=0
 OPEN_NETWORK=0
+OPEN_WEB=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --web) OPEN_WEB=1; shift ;;
     --gui) OPEN_GUI=1; shift ;;
     --network) OPEN_NETWORK=1; shift ;;
     *) break ;;
@@ -35,6 +38,10 @@ fi
 # agents are report-only and are never modified automatically.
 "$PYTHON_BIN" -m hippomind discover-agents >/dev/null 2>&1 || true
 
+if [[ "$OPEN_WEB" -eq 1 ]]; then
+  exec "$PYTHON_BIN" -m hippomind.cli ui
+fi
+
 if [[ "$OPEN_GUI" -eq 1 || "$OPEN_NETWORK" -eq 1 ]]; then
   MPL_CACHE="${TMPDIR:-/tmp}/hippomind-matplotlib"
   mkdir -p "$MPL_CACHE"
@@ -49,4 +56,4 @@ if [[ "$OPEN_GUI" -eq 1 || "$OPEN_NETWORK" -eq 1 ]]; then
   exec "$PYTHON_BIN" -m hippomind.main --one-click
 fi
 
-echo "HippoMind Memory Hub 已运行。使用 '$0 --gui' 打开工作台，'$0 --network' 打开全屏记忆网络。"
+echo "HippoMind Memory Hub 已运行。使用 '$0 --web' 打开 Web 控制台，旧版可视化用 --gui/--network。"

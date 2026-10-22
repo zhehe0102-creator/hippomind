@@ -30,13 +30,14 @@
   （`memories` 表）可随时从事件重建——改错可回滚，历史不可篡改。
 - **单文件部署**：整个记忆就是一个 `.sqlite` 文件（+wal/shm），备份=复制文件。
 
-## 3. CLI 全部子命令（37 个）
+## 3. CLI 全部子命令（38 个）
 
 ### 3.1 生命周期
 | 命令 | 干什么 | 典型用法 |
 |---|---|---|
 | `init` | 初始化账本 | `hippomind init` |
 | `start` | 启动/复用 daemon；`--read-only` 只读模式（LAN 镜像）；`--restart` 升级后重启 | `hippomind start --restart` |
+| `ui` | 在浏览器打开 HippoMind Atlas Web 控制台；签发一次性登录链接（120s、单次有效，token 不进命令行历史） | `hippomind ui --no-open` |
 | `stop` | 优雅停机（WAL 检查点后退出） | `hippomind stop` |
 | `status` | daemon 健康+账本规模 | `hippomind status` |
 | `version` | 版本/schema 版本/概要 | `hippomind version` |
@@ -100,6 +101,9 @@
 | GET | `/stats` | 账本/归档/来源/缓存命中率统计 |
 | GET | `/graph?subject=&scope=&hops=&limit=` | 实体图谱（缺 subject→400，无 token→401） |
 | GET | `/metrics` | Prometheus 文本（memories/events/claims_active/conflict/pinned/wal/cache） |
+| GET | `/ui` | HippoMind Atlas 静态控制台（同源、零构建；HTML 不含令牌或账本路径） |
+| GET | `/api/v1/*` | 控制台只读数据面：meta/overview/memories/timeline/claims/conflicts/facts/skills/subjects/graph/agents/health（管理员令牌） |
+| POST | `/api/v1/pin` · `/api/v1/feedback` · `/api/v1/ui-token` | 置顶/反馈/一次性 UI 登录令牌 |
 | POST | `/ingest` | 批量写入（≤预算，超长 413 且客户端必能读到错误响应） |
 | POST | `/recall` · `/context-pack` · `/feedback` · `/sync` | 对应 CLI 能力 |
 | POST | `/admin/reload` | 热重载归档扫描（SIGHUP 同效） |
@@ -108,7 +112,40 @@
 并发语义：HTTP/1.1 keep-alive、backlog 128、请求槽位信号量限流；
 8 客户端压测 48,000 行零错误零丢失。
 
-## 6. GUI 工作台（`python3 -m hippomind.main`）
+## 6. GUI：HippoMind Atlas Web 控制台（主界面）
+
+控制台由 daemon 在 **http://127.0.0.1:8765/ui** 同源提供：零构建、零第三方依赖
+（原生 ES Modules），不引入 npm、CDN 或外链字体。``hippomind ui`` 会向 daemon
+申请一次性引导令牌并打开浏览器，令牌只在页面内存/localStorage 中、从不写进 URL
+或命令行历史；也可以直接打开 /ui 后手动粘贴本机 token（0600 文件）。
+
+十个视图（编号即键盘快捷键 1–9、0）：
+
+| # | 视图 | 内容 |
+|---|---|---|
+| 01 | 脉搏 | 活跃记忆/事件/增长 sparkline、kind 与 Agent 构成、最近入档、健康 flags |
+| 02 | 记忆库 | 结构化记忆分页浏览、筛选、raw 开关、详情抽屉（来源/claims/关系/反馈/置顶） |
+| 03 | 检索 | 关键词召回（FTS + LIKE）、过滤器、命中高亮、评分与证据 |
+| 04 | 上下文 | Context Pack 组装器：预算、结构化字段、文本/XML 输出、injection 状态 |
+| 05 | 图谱 | claim 主语实体图：Canvas 力导向、缩放/平移/选中、邻域详情 |
+| 06 | 事实 | 冲突/claims/事实投影/程序性技能四个页签，含可复制的 `hippomind resolve` 命令 |
+| 07 | 年轮 | 按日/周堆叠的时间序列，可下钻到具体时段并跳转记忆库 |
+| 08 | 端点 | Agent 来源、采集游标、发现/自动安装状态、注入与凭据统计 |
+| 09 | 体检 | 完整性、FTS 同步、claims 一致性、存储/WAL、可复制的维护命令 |
+| 10 | 参考 | 接口目录（来自 /api/v1/meta）、主题/刷新/分页设置、版本信息 |
+
+- **视觉**：纸本档案馆风格（浅色默认 + night 深色），衬线标题 + 等宽数据 +
+  索引编号 + 细线表格；无玻璃拟态、无渐变霓虹。
+- **键盘**：`⌘K` 命令面板、1–0 切视图、R 刷新、T 主题、Esc 关闭抽屉/面板。
+- **数据面**：GET /api/v1/* 只读、分页有界、内容截断、管理员令牌限定；
+  唯一写操作是置顶与反馈（复用账本审计操作）。详见
+  [GUI_ATLAS.md](GUI_ATLAS.md) 与 [ARCHITECTURE.md](ARCHITECTURE.md)。
+- **安全**：/ui 仅服务 `hippomind/web/` 内文件（路径包含校验），响应带 CSP/
+  frame-ancestors/nosniff；页面源码不含 token 或账本路径。
+
+### 6.1 旧版 matplotlib 工作台（保留，非主界面）
+
+仍可用 `python3 -m hippomind.main` 或 `./start-hippomind.command --gui` 启动：
 
 - **网格世界+海马体模拟**：Agent 在网格觅食，情景→语义巩固全程可视
   （权重/效用/触碰/回忆次数分解面板）

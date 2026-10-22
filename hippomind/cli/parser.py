@@ -20,6 +20,7 @@ from .cmd_maintain import (
     cmd_backup, cmd_checkup, cmd_maintain, cmd_recovery_check, cmd_redact_raw, cmd_restore, cmd_scan_raw,
 )
 from .cmd_read import cmd_context, cmd_inject, cmd_sync, cmd_watch
+from .cmd_ui import cmd_ui
 from .cmd_write import (
     cmd_conflicts, cmd_facts, cmd_feedback, cmd_forget, cmd_graph, cmd_ingest, cmd_pin, cmd_pins, cmd_resolve,
     cmd_skills,
@@ -47,6 +48,12 @@ def build_parser() -> argparse.ArgumentParser:
                        help="只读模式：所有凭据降级为共享只读视图（LAN 镜像/巡检副本）")
     start.add_argument("--foreground", action="store_true")
     start.set_defaults(func=cmd_start)
+
+    ui = sub.add_parser("ui", help="在浏览器打开 Web 控制台（一次性令牌登录）")
+    _connection_arguments(ui)
+    ui.add_argument("--no-open", action="store_true",
+                    help="只打印一次性登录 URL，不打开浏览器")
+    ui.set_defaults(func=cmd_ui)
 
     for name, func, help_text in (("stop", cmd_stop, "停止本机 daemon"),
                                                                      ("status", cmd_status, "查看 daemon 与账本状态")):

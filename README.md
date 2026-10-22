@@ -103,7 +103,12 @@ python3 -m hippomind discover-agents
 printf '%s\n' "检查服务状态。记忆：检查 daemon API 的并发限制" | \
   python3 -m hippomind auto-context --stdin --trigger-mode anywhere --cwd "$PWD" --format text
 
-# 按需启动完整中文图形网络
+# 打开 Web 控制台（HippoMind Atlas，推荐；自动完成一次性令牌登录）
+./start-hippomind.command --web
+# 也可直接由 CLI 打开（--no-open 只打印一次性 URL）
+python3 -m hippomind ui
+
+# 按需启动旧版 matplotlib 全屏网络（保留）
 ./start-hippomind.command --gui
 ```
 
@@ -276,7 +281,31 @@ hippomind version            # 版本/schema/账本概要
 同一系统账号下的共享账本不是 ACL 或签名服务，关键事实必须回到来源核验。完整的威胁模型、
 残余风险与使用建议见 [USAGE_GUIDE.md](USAGE_GUIDE.md)。
 
-## GUI 交互
+## HippoMind Atlas Web 控制台（主界面）
+
+daemon 在 **http://127.0.0.1:8765/ui** 同源提供新的 Web 控制台。它零构建、零第三方
+依赖（原生 ES Modules），视觉是纸本档案馆风格：浅色纸底 + 墨色排版 + 朱砂信号色，
+可切换 night 深色；衬线标题、等宽数据、索引编号与细线表格取代了旧版的玻璃拟态。
+
+```bash
+./start-hippomind.command --web   # 启动并打开控制台
+python3 -m hippomind ui           # 或由 CLI 打开（一次性令牌，120s 单次有效）
+python3 -m hippomind ui --no-open # 只打印一次性登录 URL
+```
+
+十个视图覆盖整条记忆链路：脉搏（体征收敛）、记忆库（分页浏览 + 详情抽屉：来源、
+claims、关系、反馈、置顶）、检索（FTS + LIKE、命中高亮）、上下文（Context Pack
+预算与文本/XML 输出）、图谱（claim 主语邻域力导向图）、事实（冲突/claims/事实/
+技能）、年轮（按日/周生长时序 + 下钻）、端点（Agent/游标/自动安装/注入状态）、
+体检（完整性/FTS/claims/容量 + 可复制维护命令）、参考（接口目录与界面设置）。
+快捷键：`⌘K` 命令面板、1–0 视图、R 刷新、T 主题、Esc 关闭。
+
+控制台的读数据面是 `GET /api/v1/*`（管理员令牌、分页有界、内容截断）；唯一
+写操作是置顶与反馈（复用账本审计路径）。/ui 只服务 `hippomind/web/` 内的文件并
+带 CSP/frame-ancestors 头，页面不嵌入 token 或账本路径。设计与接口契约见
+[docs/GUI_ATLAS.md](docs/GUI_ATLAS.md)。
+
+## 旧版 matplotlib GUI 交互（保留）
 
 - **Space** 学习开关 · **C** 巩固 · **P** 剪枝 · **M** 手动回忆（看联想扩散）· **D** 梦境消化
 - **R** 重置 · **S** 保存 · **L** 读取（记忆+驱力一并持久化到 JSON）
@@ -391,6 +420,8 @@ hippomind/
   visualizer.py   # 完整可视化界面（记忆网络+驱力+权重曲线+控制面板）
   network_visualizer.py # 全屏层状海马拓扑（动态权重、扩散、检查、缩放平移）
   main.py         # 入口：gui / headless / llm
+  web/            # HippoMind Atlas Web 控制台（index.html + css/ + js/，daemon 同源服务）
+  gui_api.py      # /api/v1 控制台只读数据面（管理员令牌、分页有界）
 
 参考仓库：xinchao-nian/（心潮·念：动态心智 + Ombre Brain 记忆库，已装入工作区）
 ```
