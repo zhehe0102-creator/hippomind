@@ -567,7 +567,7 @@ error, info, menu。
 - 后端：`hippomind/gui_api.py`（25 个端点目录、13 个 GET 读模型、pin/feedback 写操作、
   一次性 UI 引导令牌）；`hippomind/daemon.py` 的 /api/v1 路由、/ui 静态服务、
   /ui → /ui/ 规范跳转与 CSP/frame-ancestors/nosniff/referrer 头。
-- 前端：`hippomind/web/`（index.html + 4 个 CSS + 20 个 ES Modules；零构建、零依赖）。
+- 前端：`hippomind/web/`（index.html + 5 个 CSS + 24 个 ES Modules；零构建、零依赖）。
   十个视图全部实现：pulse / archive / recall / compose / graph / facts / timeline /
   agents / health / reference；记忆详情抽屉由 archive/recall 共用。
 - CLI：`hippomind ui`（一次性 nonce，120s、单次有效，URL 经 fragment 传递）；
