@@ -22,7 +22,8 @@ class GraphMixin:
     """Claims, causality, entities, skill/fact views, cursors, duplicate audit."""
 
     def list_claims(self, *, memory_id: str = "", scope: str = "shared",
-                    state: str = "", limit: int = 200) -> List[Dict[str, Any]]:
+                    state: str = "", subject: str = "",
+                    limit: int = 200) -> List[Dict[str, Any]]:
         clauses = ["scope=?"]
         params: List[object] = [_short(scope, 128) or "shared"]
         if memory_id:
@@ -31,6 +32,9 @@ class GraphMixin:
         if state:
             clauses.append("state=?")
             params.append(_short(state, 32))
+        if subject:
+            clauses.append("subject=?")
+            params.append(_short(subject, 256))
         limit = _clamp_int(limit, 200, 1, 2_000)
         with self._reading() as conn:
             rows = conn.execute("SELECT * FROM memory_claims WHERE " + " AND ".join(clauses) +

@@ -270,6 +270,12 @@ class GuiApiTests(unittest.TestCase):
         self.assertTrue(claims["items"])
         self.assertTrue(any(item.get("memory_preview") for item in claims["items"]))
 
+        by_subject = self.get("/api/v1/claims?subject=HippoMind")
+        self.assertTrue(by_subject["items"])
+        self.assertTrue(all(item["subject"] == "HippoMind" for item in by_subject["items"]))
+        other = self.get("/api/v1/claims?subject=No-Such-Subject")
+        self.assertEqual([], other["items"])
+
         conflicts = self.get("/api/v1/conflicts")
         self.assertTrue(conflicts["items"])
         self.assertLessEqual(len(conflicts["items"][0]["content"]), 120)
@@ -347,7 +353,7 @@ class GuiApiTests(unittest.TestCase):
     def test_ui_token_flow_is_single_use(self):
         minted = self.post("/api/v1/ui-token", {})
         self.assertTrue(minted["nonce"])
-        self.assertIn("/ui#", minted["url"])
+        self.assertIn("/ui/#", minted["url"])
         exchanged = self._request("/api/v1/ui-token/exchange", method="POST",
                                   body={"nonce": minted["nonce"]}, expect=200)
         self.assertEqual(self.token, exchanged["token"])

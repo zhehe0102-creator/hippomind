@@ -106,7 +106,7 @@ def _digest(rows):
 #: the always-crashing ``hippomind pin`` was repaired.  Its *rendered* text did
 #: not move, and test_pin_help_text_is_unchanged pins that separately.
 PARSER_SURFACE = {
-    "(root)": ("91665cbe9271da755e7f41f7eac1aa771bfa60caf2f64fcecb83f5961fc81637", 39),
+    "(root)": ("447d4433aea65a56956dc4b5d5b09a920723abc2be0cf08e0a0aac49dbf997a4", 40),
     "agent-status": ("c6ce3680226dad9d5019b2ce233e1580998dfc861921c6e3ca1f02ff8e4ed5bf", 7),
     "auto-context": ("bcd24f3b2a2dd0f637d61a2f1dc9744cf08d71cef0717f5dfc97203004d1af8c", 22),
     "backup": ("3ba2b08b93a835ababbf4b62a644915a0df48e7e998837500580929290eadfd5", 6),
@@ -142,6 +142,7 @@ PARSER_SURFACE = {
     "status": ("03c64382fa63105c16bd68d6df76a5839be13fef7185d9dda3c386a3e1ca550e", 5),
     "stop": ("602eebd0f3d42421f8b2eef6470d81c2c0b45f0bc02f65d99796e39a2796cf91", 5),
     "sync": ("f0a185df340f6cfecbb8a2311ddb133311cc2159638d64142bbf72c99644389d", 7),
+    "ui": ("80c93fc2ac46263085db6ba5ea85617b69513e3231cfe690ded5b10fc9f52098", 6),
     "version": ("676dd0d22db8422bdf37d73438e472a2e1172b201bcc8e89e1d1ca3a4f9972f0", 6),
     "watch": ("a2964f1b7ccd6b0d2d93dd5429dadba056d4ecc7a7afd6b0edeb8567627ca315", 8),
 }
@@ -174,7 +175,7 @@ CLI_FACE = frozenset([
     "cmd_login_install", "cmd_login_remove", "cmd_maintain", "cmd_monitor",
     "cmd_pin", "cmd_pins", "cmd_recovery_check", "cmd_redact_raw",
     "cmd_resolve", "cmd_restore", "cmd_scan_raw", "cmd_skills",
-    "cmd_start", "cmd_status", "cmd_stop", "cmd_sync",
+    "cmd_start", "cmd_status", "cmd_stop", "cmd_sync", "cmd_ui",
     "cmd_version", "cmd_watch", "contextlib", "default_dsh_sessions_root",
     "extract_memory_request", "fetch_auto_context", "getpass", "hashlib",
     "install_agent_rules", "install_agents", "integration_tier", "json",
@@ -219,7 +220,7 @@ class CliPackageSurfaceTests(unittest.TestCase):
             if "|SUBCOMMAND " in row:
                 name = row.split("|SUBCOMMAND ")[1].split("|")[0]
                 handlers[name] = row.rsplit("func=", 1)[1]
-        self.assertEqual(37, len(handlers))
+        self.assertEqual(38, len(handlers))
         for name, handler in sorted(handlers.items()):
             self.assertTrue(callable(getattr(self.cli, handler)),
                             "%s -> %s is not reachable on hippomind.cli"

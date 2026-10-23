@@ -68,7 +68,7 @@ class UiCommandTests(unittest.TestCase):
                 ])
                 self.assertEqual(0, code, err)
                 self.assertIn("HippoMind Atlas", out)
-                match = re.search(r"/ui#/pulse\?boot=([A-Za-z0-9_-]+)", out)
+                match = re.search(r"/ui/#/pulse\?boot=([A-Za-z0-9_-]+)", out)
                 self.assertIsNotNone(match, out)
                 nonce = match.group(1)
                 request = urllib.request.Request(
@@ -119,7 +119,7 @@ class UiCommandTests(unittest.TestCase):
                     "--runtime-dir", str(root / "rt"), "--port", str(port),
                 ])
                 self.assertEqual(0, code)
-                self.assertIn("/ui#/pulse", out)
+                self.assertIn("/ui/#/pulse", out)
                 self.assertIn("令牌", out)
                 self.assertIn("无法签发一次性 UI 令牌", err)
             finally:

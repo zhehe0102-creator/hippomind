@@ -39,7 +39,7 @@ def cmd_ui(args) -> int:
         print("无法签发一次性 UI 令牌（%s）。" % exc, file=sys.stderr)
         print("将打开控制台；首次使用时请在页面里粘贴本机令牌。", file=sys.stderr)
 
-    path = str(minted.get("url") or "/ui#/pulse")
+    path = str(minted.get("url") or "/ui/#/pulse")
     target = base + path if path.startswith("/") else path
     tokenized = bool(minted.get("nonce"))
     if tokenized:

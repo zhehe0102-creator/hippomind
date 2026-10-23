@@ -826,7 +826,11 @@ class MemoryHubRequestHandler(BaseHTTPRequestHandler):
                 self._write(500, {"error": "internal server error"})
             return
         if path == "/ui" or path.startswith("/ui/"):
-            self._serve_ui(path)
+            # Preserve the trailing slash: it decides whether index.html is
+            # served or redirected, and relative asset URLs depend on it.
+            # The routing path above was right-stripped.
+            raw_ui_path = urlsplit(self.path).path or "/"
+            self._serve_ui(raw_ui_path)
             return
         self._write(404, {"error": "unknown endpoint"})
 
@@ -853,6 +857,17 @@ class MemoryHubRequestHandler(BaseHTTPRequestHandler):
               "base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'")
 
     def _serve_ui(self, path: str) -> None:
+        # /ui without the trailing slash would make every relative asset URL
+        # resolve against / (css/app.js 404). Redirect to the canonical root
+        # instead of rewriting the HTML, so the page stays cacheable as a
+        # plain static file.
+        if path == "/ui":
+            self.send_response(302)
+            self.send_header("Location", "/ui/")
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            return
         relative = unquote(path[len("/ui"):].lstrip("/")) or "index.html"
         if not relative or relative.startswith("."):
             self._write(400, {"error": "invalid UI asset path"})

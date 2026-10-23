@@ -703,9 +703,11 @@ class GuiApi:
         state = _text_param(params, "state", "all", 32) or "all"
         if state not in {"active", "conflict", "superseded"}:
             state = "all"
+        subject = _text_param(params, "subject", "", 256)
         limit = _clamp_int(params, "limit", 100, 1, 200)
         items = self.ledger.list_claims(
-            scope=scope, state="" if state == "all" else state, limit=limit)
+            scope=scope, state="" if state == "all" else state,
+            subject=subject, limit=limit)
         with self.ledger._reading() as conn:
             rows = conn.execute(
                 "SELECT state, COUNT(*) AS count FROM memory_claims WHERE scope=? "
@@ -972,7 +974,7 @@ class GuiApi:
             "nonce": nonce,
             "expires_at": datetime.fromtimestamp(expiry, timezone.utc).isoformat(timespec="seconds"),
             "ttl_seconds": UI_NONCE_TTL_SECONDS,
-            "url": "/ui#/pulse?boot=" + nonce,
+            "url": "/ui/#/pulse?boot=" + nonce,
         }
 
 

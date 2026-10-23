@@ -28,6 +28,9 @@ exclude = ["*.tests", "*.tests.*", "*.test", "*.test.*", "*.__pycache__", "*.__p
 include-package-data = false
 
 [tool.setuptools.package-data]
+# The Atlas console is served from the package itself; without this, a wheel
+# install would ship a daemon whose /ui answers 404.
+hippomind = ["web/**/*"]
 integrations = ["*.md", "*.json", "dsh-plugin/**/*"]
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 # GUI 全面重构：HippoMind Atlas（记忆图志）
 
-> 状态：设计契约 v1 · 2026-10-22
+> 状态：实现 v1.0（已验收）· 2026-10-23
 > 本文件是团队协作的唯一契约。旧 GUI（hippomind/web 的 Observatory 设计与
 > matplotlib 工作台）的视觉与信息架构被废弃；旧实现只保留可直接复用的能力。
 
@@ -296,7 +296,7 @@ facets=1 时返回 facets。
 
 ### 4.6 GET /api/v1/claims
 
-参数：state=all|active|conflict|superseded（默认 all）、subject、limit(1–200)、
+参数：state=all|active|conflict|superseded（默认 all）、subject（可选，精确匹配）、limit(1–200)、
 scope(默认 shared)。附 counts:{active,conflict,superseded,total}，items 中每条附
 memory_preview（≤400，若无则空）。按 asserted_at 倒序。
 
@@ -325,7 +325,7 @@ item 含 claim 字段 + memory content ≤120（沿用现有 /conflicts 语义�
 ### 4.12 GET /api/v1/agents
 
     {"agents":[{"agent":"codex","memories":205945,"active":9000,"events":205945,
-      "last_seen":"ISO","trust":0.5,"credentials":0,"cursors":3}],
+      "last_seen":"ISO","trust":0.5,"credentials":0}],
      "cursors":[{"source_id":"...","updated_at":"","last_success_at":"",
        "last_error":"","cursor_length":42}],
      "discovery":{...},"auto_install":{...},"watcher":{...},
@@ -355,7 +355,7 @@ body {"memory_id":"...","signal":-1|0|1,"note":"≤400"} → 200 {"updated":true
 
 ### 4.16 UI 会话令牌（可选增强，P1）
 
-- POST /api/v1/ui-token（token 认证）→ {"nonce":"...","expires_at":"ISO","url":"/ui#/pulse?boot=..."}
+- POST /api/v1/ui-token（token 认证）→ {"nonce":"...","expires_at":"ISO","url":"/ui/#/pulse?boot=..."}
 - POST /api/v1/ui-token/exchange（无需 token）body {"nonce":"..."} → {"token":"..."}。
   nonce 一次性、60s TTL、最多 8 个待用、只存内存。
 - CLI hippomind ui [--no-open]：读本地 token → mint nonce → 打开浏览器 → 打印 URL；
@@ -363,8 +363,8 @@ body {"memory_id":"...","signal":-1|0|1,"note":"≤400"} → 200 {"updated":true
 
 ## 5. 静态服务（/ui）契约
 
-- /ui、/ui/ → hippomind/web/index.html；/ui/<path> → 根内文件；
-  越界 403、缺失 404、目录 404。
+- /ui → 302 到 /ui/（相对资源 URL 需要规范根）；/ui/ → hippomind/web/index.html；
+  /ui/<path> → 根内文件；越界 403、缺失 404、目录 404。
 - 允许的 MIME 由 mimetypes 推断；text/js/json/svg 追加 ; charset=utf-8。
 - 响应头：Cache-Control: no-cache、X-Content-Type-Options: nosniff、
   Referrer-Policy: no-referrer、X-Frame-Options: DENY、
@@ -534,13 +534,13 @@ error, info, menu。
 ## 7. 质量门槛（验收）
 
 1. python3 -m unittest discover -s tests -p 'test_gui*.py' 全绿（新增测试）。
-2. python3 -m unittest discover -s tests 全绿（现有 596+ 不回归）。
+2. python3 -m unittest discover -s tests 全绿（2026-10-23 实测 644 项）。
 3. scripts/lint.sh exit 0。
 4. 前端静态检查：index.html 引用的每个资源存在；每个 ES 模块可 node --check；
    无外链 http(s) 资源；无内联 <script>；无 innerHTML = <接口数据> 模式。
-5. 截图 QA：seed 数据下 10 个视图各一张 1440×900 PNG + 浅/深色各一张，
+5. 截图 QA：seed 数据下 10 个视图 × paper/night 共 20 张 1440×900 PNG（output/gui/final/），
    无 console error、无 401、无布局溢出（documentElement.scrollWidth ≤ innerWidth）。
-6. 真实生产库只读验证：新端点对 248k 生产账本响应 < 1.5s（除 integrity=1），
+6. 真实生产库只读验证：新端点对 248k 生产账本实测 overview 0.53s / health 0.66s / agents 0.15s / memories 8ms（除 integrity=1），
    不写库、不触发维护；PRAGMA quick_check 保持 ok。
 7. 安全：越界路径 403；/ui HTML 无 token/路径；所有写端点需管理员；XSS 用
    el()/文本节点（QA 用 <img src=x onerror=...> 种子内容验证不执行）。
@@ -558,3 +558,42 @@ error, info, menu。
 | scripts/gui_seed.py、scripts/gui_shot.mjs、tests/test_gui_frontend.py、截图与 QA 报告 | qa 队友 |
 
 约定：任何人不得修改他人范围内文件；跨范围需求发消息给 owner。集成由 lead 负责。
+
+
+## 9. 实现与验收记录（2026-10-23）
+
+### 9.1 交付物
+
+- 后端：`hippomind/gui_api.py`（25 个端点目录、13 个 GET 读模型、pin/feedback 写操作、
+  一次性 UI 引导令牌）；`hippomind/daemon.py` 的 /api/v1 路由、/ui 静态服务、
+  /ui → /ui/ 规范跳转与 CSP/frame-ancestors/nosniff/referrer 头。
+- 前端：`hippomind/web/`（index.html + 4 个 CSS + 20 个 ES Modules；零构建、零依赖）。
+  十个视图全部实现：pulse / archive / recall / compose / graph / facts / timeline /
+  agents / health / reference；记忆详情抽屉由 archive/recall 共用。
+- CLI：`hippomind ui`（一次性 nonce，120s、单次有效，URL 经 fragment 传递）；
+  `start-hippomind.command --web`。
+- 文档：本文件、README、MEMORY_HUB_GUIDE、USAGE_GUIDE、FEATURES、ARCHITECTURE。
+- QA：`scripts/gui_seed.py`（隔离 seed）、`scripts/gui_shot.mjs`（Chrome CDP 截图）、
+  `scripts/gui_dev.py`（一键 seed→截图→清理）、`tests/test_gui_frontend.py`。
+
+### 9.2 实测证据
+
+| 门 | 结果 |
+|---|---|
+| 全量单测 | 644 项 OK（2026-10-23，含新增 GUI API 15 / serving 8 / CLI 4 / frontend 17） |
+| lint | gate 90/90、legacy 254/254，exit 0（ruff 0.16.3） |
+| 截图 | seed 720 条 × 10 视图 × 2 主题 = 20/20 PASS，0 console error / 0 HTTP≥400 / 0 溢出 / 0 XSS |
+| 生产库截图 | 真实 248,523 事件 × 10 视图 = 10/10 PASS |
+| 生产端点时延 | overview 0.53s、health 0.66s、agents 0.15s、memories 8ms、quick_check 1.8s（按需） |
+| 引导令牌 | 无 localStorage 打开 /ui#/pulse?boot=…：自动换 token、fragment 清理、无连接面板、数据正常 |
+| 安全 | /ui HTML 无 token/路径；越界路径 400/403；CSP/frame DENY/nosniff；XSS seed 6 条全部按文本渲染 |
+| 生产体检 | `hippomind doctor` READY（privacy/launchd 为已知 warning），daemon v1.0.0 pid 70237 |
+
+### 9.3 已知边界
+
+1. 生产账本当前 claims/relations 为空（历史采集主要写 raw_chat/progress），因此 graph/facts
+   在真实库上展示空态；seed 数据（108 claims/64 relations/40 skills）用于证明非空路径。
+2. GUI 只接受管理员本机 token；scoped agent 凭据访问 /api/v1/* 返回 403（有意）。
+3. 唯一写操作是置顶/反馈；遗忘/裁决等仍只给可复制的 CLI 命令。
+4. 旧 matplotlib 工作台保留（`--gui` / `--network`），但文档主界面已切换为 Web 控制台。
+5. 工作区在外置卷时 launchd 开机自启仍受 macOS TCC 限制（既有平台限制，doctor 会提示）。

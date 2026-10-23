@@ -64,7 +64,7 @@ class GuiServingTests(unittest.TestCase):
         return response.status, dict(response.headers), response.read()
 
     def test_index_is_served_without_auth_with_security_headers(self):
-        status, headers, body = self._fetch("/ui")
+        status, headers, body = self._fetch("/ui/")
         self.assertEqual(200, status)
         self.assertIn(b"<!doctype html>", body)
         self.assertIn("text/html", headers.get("Content-Type", ""))
@@ -85,6 +85,23 @@ class GuiServingTests(unittest.TestCase):
         status, _headers, body = self._fetch("/ui/")
         self.assertEqual(200, status)
         self.assertIn(b"<div id=\"app\">", body)
+
+    def test_bare_ui_redirects_to_canonical_root(self):
+        # Relative asset URLs need /ui/ as the document base path; without the
+        # redirect every css/js request resolved against / and 404ed.
+        import urllib.request as _request
+
+        class NoRedirect(_request.HTTPRedirectHandler):
+            def redirect_request(self, *args, **kwargs):
+                return None
+
+        opener = _request.build_opener(NoRedirect)
+        try:
+            opener.open(self.base + "/ui", timeout=10)
+            self.fail("expected a redirect")
+        except urllib.error.HTTPError as error:
+            self.assertEqual(302, error.code)
+            self.assertEqual("/ui/", error.headers.get("Location"))
 
     def test_asset_mime_and_charset(self):
         status, headers, body = self._fetch("/ui/assets/app.js")

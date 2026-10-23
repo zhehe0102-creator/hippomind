@@ -1,0 +1,257 @@
+/* ============================================================================
+   HippoMind Atlas — design tokens & base elements
+   One ledger, two registers: paper (default) and night. Every component below
+   derives from these tokens; nothing hard-codes a colour.
+   ========================================================================== */
+
+:root {
+  color-scheme: light;
+
+  /* ---- paper register (default) ---- */
+  --paper: #F2EEE4;
+  --paper-2: #E9E3D5;
+  --surface: #FBF8F0;
+  --surface-2: #F5F1E6;
+  --ink: #1A1916;
+  --ink-2: #4D483D;
+  --ink-3: #7C7466;
+  --ink-4: #A89F8C;
+  --rule: #D9D1BF;
+  --rule-strong: #BCB29C;
+  --accent: #C4471E;
+  --accent-soft: #F0D9CC;
+  --link: #1E43B2;
+  --link-soft: #D9E0F5;
+  --ok: #2E6A4D;
+  --warn: #9A640F;
+  --danger: #9E2626;
+  --highlight: #F1DEA6;
+  --shadow: 26 25 22;
+  --skeleton-sheen: rgb(255 255 255 / .55);
+
+  /* ---- type ---- */
+  --font-serif: "Songti SC", "STSong", "Noto Serif SC", "Iowan Old Style", Georgia, "Times New Roman", serif;
+  --font-sans: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "SF Mono", "SFMono-Regular", Menlo, "JetBrains Mono", ui-monospace, monospace;
+
+  /* ---- rhythm: base 4 ---- */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-7: 32px;
+  --space-8: 40px;
+  --space-9: 56px;
+  --space-10: 72px;
+
+  /* ---- geometry ---- */
+  --radius-control: 2px;
+  --radius-card: 3px;
+  --rail-w: 248px;
+  --rail-w-compact: 72px;
+  --topbar-h: 88px;
+  --statusbar-h: 30px;
+  --content-max: 1560px;
+  --content-pad: 40px;
+
+  /* ---- motion ---- */
+  --ease: cubic-bezier(.2, .7, .3, 1);
+  --dur-fast: 120ms;
+  --dur: 180ms;
+
+  /* ---- layers ---- */
+  --z-sticky: 10;
+  --z-drawer: 60;
+  --z-palette: 70;
+  --z-confirm: 75;
+  --z-connect: 80;
+  --z-toast: 90;
+}
+
+html[data-theme="night"] {
+  color-scheme: dark;
+
+  --paper: #14120E;
+  --paper-2: #1B1812;
+  --surface: #1F1B14;
+  --surface-2: #26211A;
+  --ink: #F2EBD9;
+  --ink-2: #CCC2AC;
+  --ink-3: #968B74;
+  --ink-4: #6D6452;
+  --rule: #332D22;
+  --rule-strong: #4D4433;
+  --accent: #F06B3A;
+  --accent-soft: #3A2418;
+  --link: #8FA8FF;
+  --link-soft: #222B4A;
+  --ok: #6FBF97;
+  --warn: #E0A74C;
+  --danger: #E07070;
+  --highlight: #4A3A17;
+  --shadow: 0 0 0;
+  --skeleton-sheen: rgb(255 255 255 / .06);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur-fast: 0ms;
+    --dur: 0ms;
+  }
+}
+
+/* ============================================================================
+   Base elements
+   ========================================================================== */
+
+*,
+*::before,
+*::after { box-sizing: border-box; }
+
+html { height: 100%; }
+
+body {
+  height: 100%;
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  tab-size: 2;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  margin: 0;
+  font-family: var(--font-serif);
+  font-weight: 600;
+  line-height: 1.2;
+  letter-spacing: .01em;
+}
+
+p { margin: 0; }
+ul, ol { margin: 0; padding: 0; }
+
+a {
+  color: var(--link);
+  text-decoration: none;
+}
+a:hover { text-decoration: underline; text-underline-offset: 2px; }
+
+button { cursor: pointer; }
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+button:disabled { cursor: not-allowed; opacity: .5; }
+
+code, kbd, samp, pre { font-family: var(--font-mono); }
+
+kbd {
+  display: inline-block;
+  min-width: 16px;
+  padding: 0 4px;
+  border: 1px solid var(--rule);
+  border-bottom-width: 2px;
+  border-radius: 2px;
+  background: var(--surface);
+  color: var(--ink-3);
+  font-size: 10px;
+  line-height: 15px;
+  text-align: center;
+}
+
+::selection { background: var(--highlight); color: var(--ink); }
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+[hidden] { display: none !important; }
+
+/* Thin, quiet scrollbars — the scrollbar is furniture, not chrome. */
+* { scrollbar-width: thin; scrollbar-color: var(--rule-strong) transparent; }
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb {
+  background: var(--rule-strong);
+  border: 3px solid var(--paper);
+  border-radius: 2px;
+}
+*::-webkit-scrollbar-thumb:hover { background: var(--ink-4); }
+
+/* ============================================================================
+   Utilities shared by shell, components and views
+   ========================================================================== */
+
+.serif { font-family: var(--font-serif); }
+.mono { font-family: var(--font-mono); }
+.tabular { font-variant-numeric: tabular-nums; }
+.muted { color: var(--ink-3); }
+.dim { color: var(--ink-4); }
+.num { text-align: right; font-variant-numeric: tabular-nums; }
+.nowrap { white-space: nowrap; }
+.break { overflow-wrap: anywhere; }
+
+.tone-neutral { color: var(--ink-3); }
+.tone-accent { color: var(--accent); }
+.tone-ok { color: var(--ok); }
+.tone-warn { color: var(--warn); }
+.tone-danger { color: var(--danger); }
+.tone-link { color: var(--link); }
+
+.eyebrow {
+  font-family: var(--font-sans);
+  font-size: 10px;
+  letter-spacing: .16em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+.visually-hidden {
+  position: absolute !important;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+.skip-link {
+  position: fixed;
+  top: -48px;
+  left: 12px;
+  z-index: 200;
+  padding: 6px 12px;
+  border: 1px solid var(--rule-strong);
+  border-radius: 2px;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 12px;
+  transition: top var(--dur-fast) var(--ease);
+}
+.skip-link:focus { top: 12px; text-decoration: none; }
+
+/* Respect the operator's motion preference everywhere. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
