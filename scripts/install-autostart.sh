@@ -44,7 +44,10 @@ cat > "$PLIST" <<PLIST_EOF
   </array>
   <key>WorkingDirectory</key><string>$RUNTIME</string>
   <key>EnvironmentVariables</key>
-  <dict><key>PYTHONPATH</key><string>$RUNTIME</string></dict>
+  <dict>
+    <key>PYTHONPATH</key><string>$RUNTIME</string>
+    <key>PATH</key><string>/Users/zps/.local/bin:/Users/zps/.local/share/pi-node/node-v22.23.2-darwin-arm64/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><false/>
   <key>ProcessType</key><string>Background</string>

@@ -71,7 +71,11 @@ class ClaudeExtractor:
     name = "claude"
 
     def __init__(self, timeout: float = 90.0):
-        self.binary = shutil.which("claude") or ""
+        candidates = [shutil.which("claude"),
+                      str(Path.home() / ".local" / "bin" / "claude"),
+                      "/usr/local/bin/claude", "/opt/homebrew/bin/claude"]
+        self.binary = next((path for path in candidates
+                            if path and Path(path).is_file() and os.access(path, os.X_OK)), "")
         self.timeout = timeout
 
     @property
