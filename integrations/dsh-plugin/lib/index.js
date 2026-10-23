@@ -74,8 +74,9 @@ const MEMORY_MARKER_RE = /记忆\s*[:：]/
 
 function memoryQuery(text, mode = "anywhere") {
   const value = String(text ?? "").trim()
-  const selected = ["anywhere", "prefix", "off"].includes(String(mode)) ? String(mode) : "anywhere"
+  const selected = ["always", "anywhere", "prefix", "off"].includes(String(mode)) ? String(mode) : "anywhere"
   if (selected === "off" || !value) return ""
+  if (selected === "always") return value
   const lines = value.split(/\r?\n/)
   let inFence = false
   const fence = String.fromCharCode(96).repeat(3)
@@ -120,7 +121,7 @@ function resolveConfig(config) {
     agentConfig,
     maxItems: clamp(config?.maxItems, DEFAULTS.maxItems, 1, 8),
     maxChars: clamp(config?.maxChars, DEFAULTS.maxChars, 200, 16000),
-    triggerMode: ["anywhere", "prefix", "off"].includes(String(config?.triggerMode)) ? String(config.triggerMode) : DEFAULTS.triggerMode,
+    triggerMode: ["always", "anywhere", "prefix", "off"].includes(String(config?.triggerMode)) ? String(config.triggerMode) : DEFAULTS.triggerMode,
     requestTimeoutMs: clamp(config?.requestTimeoutMs, DEFAULTS.requestTimeoutMs, 100, 5000),
     writeBackTimeoutMs: clamp(config?.writeBackTimeoutMs, DEFAULTS.writeBackTimeoutMs, 100, 10000),
     writeBack: config?.writeBack !== false,

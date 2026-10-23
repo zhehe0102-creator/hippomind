@@ -618,6 +618,54 @@ class ContextPackBuilder:
             current = list(deeper)
         return current
 
+    def _associative_candidates(self, candidates: Sequence[Mapping[str, Any]],
+                                options: ContextPackOptions) -> List[Mapping[str, Any]]:
+        """Add a small, bounded associative expansion through claim subjects.
+
+        A memory that shares an entity/subject with a strong hit is often the
+        context a human would recall next ("we discussed X, so Y matters").
+        This is deliberately capped at a handful of items and scored below
+        direct hits; it cannot flood a pack, but it gives the graph a role in
+        retrieval instead of being a separate display-only view.
+        """
+        ids = [str(item.get("memory_id", "")) for item in candidates[:8]
+               if str(item.get("memory_id", ""))]
+        if not ids:
+            return list(candidates)
+        placeholders = ",".join("?" for _ in ids)
+        try:
+            with self.ledger._reading() as conn:
+                rows = conn.execute(
+                    "SELECT DISTINCT subject FROM memory_claims WHERE memory_id IN (" +
+                    placeholders + ") AND state IN ('active','conflict') LIMIT 16",
+                    tuple(ids)).fetchall()
+                subjects = [str(row["subject"]) for row in rows if str(row["subject"] or "")]
+                if not subjects:
+                    return list(candidates)
+                subject_marks = ",".join("?" for _ in subjects)
+                related = conn.execute(
+                    "SELECT memory_id FROM memory_claims WHERE subject IN (" +
+                    subject_marks + ") AND state IN ('active','conflict') "
+                    "AND memory_id NOT IN (" + placeholders + ") "
+                    "GROUP BY memory_id ORDER BY MAX(confidence) DESC LIMIT 8",
+                    tuple(subjects) + tuple(ids)).fetchall()
+        except Exception:
+            return list(candidates)
+        seen = set(ids)
+        output = list(candidates)
+        for row in related:
+            memory_id = str(row["memory_id"])
+            if memory_id in seen:
+                continue
+            memory = self.ledger.get_memory(memory_id)
+            if not memory or memory.get("lifecycle") != "active" or memory.get("quality_state") != "accepted":
+                continue
+            memory["score"] = 0.35
+            memory["score_parts"] = {"association": 0.35}
+            output.append(memory)
+            seen.add(memory_id)
+        return output
+
     def _hybrid_reranker(self) -> HybridRanker:
         """混合重排器（单例，按当前 embedder 缓存，避免每轮重建权重）。"""
         cached = getattr(self, "_hybrid_cached", None)
@@ -994,6 +1042,8 @@ class ContextPackBuilder:
                 eff_from=eff_from, eff_to=eff_to, initial_limit=initial_limit,
                 use_embedder=bool(task_anchor),
             )
+        if candidates:
+            candidates = self._associative_candidates(candidates, options)
         candidate_debug = [{
             "memory_id": str(candidate.get("memory_id", "")),
             "kind": str(candidate.get("kind", "")),

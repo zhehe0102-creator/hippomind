@@ -61,7 +61,7 @@ def cmd_install_agents(args) -> int:
                             package_root=package_root, home=home,
                             scopes=args.scope or None, permissions=args.permission or None)
     payload: Dict[str, Any] = {"installed": result, "count": len(result),
-                               "message": "各 Agent 仅在普通用户文本包含记忆：或记忆:时检索和注入"}
+                               "message": "默认每轮自动预取；也可用记忆：强制指定查询"}
     if discovery_report is not None:
         payload["discovery"] = {
             "known_detected": sorted(name for name, item in discovery_report["known"].items()

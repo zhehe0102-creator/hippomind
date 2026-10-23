@@ -79,9 +79,9 @@ python3 -m hippomind login-remove
 python3 -m hippomind install-agents --agent all
 ```
 
-macOS 下直接双击 `start-hippomind.command` 也会先启动或复用 daemon，再幂等刷新同一套接入。需要历史时，在普通用户文本中加入 `记忆：` 或 `记忆:`，例如“继续验收。记忆：检查 daemon API 的并发限制”。标记可在自然语言任意位置，查询取标记之后的内容。
+macOS 下直接双击 `start-hippomind.command` 也会先启动或复用 daemon，再幂等刷新同一套接入。v2 默认每轮自动预取，无需标记；也可在普通用户文本中加入 `记忆：` 或 `记忆:` 强制指定查询，例如“继续验收。记忆：检查 daemon API 的并发限制”。
 
-安装器会为 Codex 注册并验证 UserPromptSubmit 原生 Hook，为 DeepSeek Harness（DSH）部署 Cordis 原生插件（见下节），并把 MCP server 注册到 Pi 的 `~/.pi/agent/mcp.json`、Claude、Cursor、Gemini 的实际用户配置；同时在 Pi、Claude、Cursor、Gemini、DeepSeek 与 local Agent 的规则位置插入并维护带标记的 HippoMind 区块，保留其他用户规则。`~/.agents/mcp.json` 还提供受管的通用 MCP 入口，遵循该标准的新 Agent 可在安装后直接发现 Hub。重复运行幂等。Codex Hook、DSH 插件和规则回退都会先检查本轮普通用户文本的标记；没有标记时，不读取账本、不启动 daemon、不注入历史。引用行、代码块、行内代码与空标记同样不触发。触发后才从标记之后的查询、任务线索和工作目录软线索构建最小 Context Pack。
+安装器会为 Codex 注册并验证 UserPromptSubmit 原生 Hook，为 DeepSeek Harness（DSH）部署 Cordis 原生插件（见下节），并把 MCP server 注册到 Pi 的 `~/.pi/agent/mcp.json`、Claude、Cursor、Gemini 的实际用户配置；同时在 Pi、Claude、Cursor、Gemini、DeepSeek 与 local Agent 的规则位置插入并维护带标记的 HippoMind 区块，保留其他用户规则。`~/.agents/mcp.json` 还提供受管的通用 MCP 入口，遵循该标准的新 Agent 可在安装后直接发现 Hub。重复运行幂等。v2 默认每轮自动预取（规则/Hook 传入 `--trigger-mode always`）；`记忆：` 作为强制查询入口保留。没有相关结果时不注入；引用行、代码块、行内代码与空标记不会触发强制查询。
 
 首次安装或规则升级后，需要重载相应 Agent 的规则或新建任务；后台服务不能追溯改写一个已经开启的模型上下文。对于完全未知、未配置的 Agent 客户端，本机服务只生成适配报告，绝不强行注入。自定义 Agent 可使用 [AGENTS.md.template](integrations/AGENTS.md.template)、[pi-memory-hook.md](integrations/pi-memory-hook.md) 或 [AGENT_MEMORY_PROTOCOL.md](integrations/AGENT_MEMORY_PROTOCOL.md)。
 
@@ -103,7 +103,7 @@ printf '%s\n' "继续验收。记忆：检查 SQLite WAL 的并发事务" | pyth
 
 ### 使用建议：三种最省心的入口
 
-- **请求内标记**：日常使用 `记忆：<要回忆的问题>`。它是默认建议，准确、可见、不会让普通请求出现意外历史。
+- **自动预取（v2 默认）**：每轮普通用户文本自动检索；**请求内标记** `记忆：<要回忆的问题>` 仍可用于强制指定查询。
 - **MCP Resource 选择器**：支持 Resources 的宿主可挂载 `hippomind://projects/{name}/active-context`，适合先浏览项目当前状态、再决定是否带入对话。
 - **诊断与开关**：`hippomind context <query> --debug` 显示命中、过滤与证据；`hippomind inject off --agent <agent>` 立即禁止下一轮注入。
 

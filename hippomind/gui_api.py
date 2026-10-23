@@ -895,6 +895,26 @@ class GuiApi:
                            _format_bytes(storage.get("archive_bytes", 0)),
                            storage.get("retention_days", DEFAULT_RAW_RETENTION_DAYS)),
                        "fix": None})
+        capture = getattr(hub, "health", {}).get("capture") if isinstance(getattr(hub, "health", {}), Mapping) else {}
+        capture = capture if isinstance(capture, Mapping) else {}
+        capture_error = str(capture.get("error", "") or "")
+        checks.append({"id": "capture", "label": "自动采集",
+                       "severity": "warn" if capture_error else "ok",
+                       "detail": capture_error or ("%s 个文件 · %s 条消息 · %s 条新增" % (
+                           capture.get("files", 0), capture.get("messages", 0),
+                           capture.get("inserted", 0))) if capture else "等待首次采集",
+                       "fix": ({"label": "手动补采", "command": "hippomind sync-transcripts"}
+                               if capture_error else None)})
+        distill = getattr(hub, "health", {}).get("distill") if isinstance(getattr(hub, "health", {}), Mapping) else {}
+        distill = distill if isinstance(distill, Mapping) else {}
+        distill_error = str(distill.get("error", "") or "")
+        checks.append({"id": "distill", "label": "自动提炼",
+                       "severity": "warn" if distill_error else "ok",
+                       "detail": distill_error or ("%s 个候选 · %s 条 claims · %s 条提炼" % (
+                           distill.get("candidates", 0), distill.get("claims", 0),
+                           distill.get("distilled", 0))) if distill else "等待首次提炼",
+                       "fix": ({"label": "手动提炼", "command": "hippomind distill --limit 16"}
+                               if distill_error else None)})
         quarantine = int(overview.get("quarantined", 0) or 0)
         checks.append({"id": "privacy", "label": "隐私面",
                        "severity": "warn" if tool_output else "ok",

@@ -435,6 +435,27 @@ class LifecycleMixin:
 
         return self._transaction(write)
 
+    def repair_claim_states(self) -> Dict[str, int]:
+        """Converge claim states with their memory's quality/lifecycle.
+
+        A claim is active only while its memory is accepted+active.  This is
+        the repair half of the same invariant that health checks; it is safe
+        to run repeatedly and never changes accepted winners.
+        """
+        def write(conn):
+            superseded = conn.execute(
+                "UPDATE memory_claims SET state='superseded' WHERE state='active' "
+                "AND memory_id IN (SELECT memory_id FROM memories "
+                "WHERE quality_state IN ('superseded','expired') OR lifecycle IN ('superseded','expired'))"
+            ).rowcount
+            conflicted = conn.execute(
+                "UPDATE memory_claims SET state='conflict' WHERE state='active' "
+                "AND memory_id IN (SELECT memory_id FROM memories WHERE quality_state='conflict')"
+            ).rowcount
+            return {"superseded": int(superseded or 0), "conflict": int(conflicted or 0)}
+
+        return self._transaction(write)
+
     def maintain(self, active_limit: int = 2_000, cold_after_days: int = 90,
                  decay_per_day: float = 0.008, raw_active_limit: int = DEFAULT_RAW_CAPACITY,
                  raw_after_days: int = DEFAULT_RAW_RETENTION_DAYS, *,

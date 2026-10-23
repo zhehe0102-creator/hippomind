@@ -34,7 +34,9 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from .access import AccessDenied, AccessPolicy
 from .context_pack import DEFAULT_MAX_CHARS, DEFAULT_MAX_TOKENS, ContextPackBuilder, ContextPackOptions
 from .injection import InjectionState
+from .distill import DistillEngine  # noqa: E402
 from .gui_api import GuiApi, GuiApiError  # noqa: E402  (module keeps its legacy import block)
+from .transcripts import TranscriptScanner  # noqa: E402
 from .ledger import LedgerError, SQLiteLedger, default_ledger_path, utc_now
 from .provider_manifest import DEFAULT_DISCOVERY_INTERVAL_SECONDS, AgentDiscovery
 from .watcher import ArchiveWatcher, default_dsh_sessions_root
@@ -203,6 +205,10 @@ class MemoryHubService:
         self.watcher = ArchiveWatcher(self.ledger, archive_root=archive_root,
                                       poll_interval=watch_interval,
                                       dsh_sessions_root=default_dsh_sessions_root())
+        # Native transcript capture + automatic distillation (v2).  Both share
+        # the daemon's ledger handle and are stopped by _stop_event.
+        self.transcripts = TranscriptScanner(self.ledger)
+        self.distiller = DistillEngine(self.ledger)
         self.watch_enabled = bool(watch)
         self.require_auth = bool(require_auth)
         self.read_only = bool(read_only)
@@ -222,7 +228,9 @@ class MemoryHubService:
                        # Convergence counters: a long-running hub must be able to
                        # show that it is shrinking, not just "healthy".
                        "raw_purged_total": 0, "bytes_reclaimed_total": 0,
-                       "last_storage": {}}
+                       "last_storage": {},
+                       # Automatic capture/distillation telemetry (v2).
+                       "capture": {}, "distill": {}}
         self._last_sleep_run: Optional[float] = None
         self.last_sleep_report: Optional[Dict[str, Any]] = None
         # Latest controlled auto-install outcome (per detected agent); only
@@ -355,6 +363,38 @@ class MemoryHubService:
             return entry
         except Exception:
             return None
+
+    def start_capture_loop(self, *, tick_seconds: float = 60.0) -> None:
+        """Continuously capture native Claude/Codex transcripts."""
+        if self.read_only or not self.watch_enabled or self._stop_event.is_set():
+            return
+
+        def loop() -> None:
+            while not self._stop_event.is_set():
+                try:
+                    summary = self.transcripts.sync(max_messages=100)
+                    self.health["capture"] = summary
+                except Exception as exc:  # capture must never take the hub down
+                    self.health["capture"] = {"error": "%s: %s" % (type(exc).__name__, str(exc)[:200])}
+                self._stop_event.wait(tick_seconds)
+
+        threading.Thread(target=loop, name="hippomind-transcripts", daemon=True).start()
+
+    def start_distill_loop(self, *, tick_seconds: float = 300.0) -> None:
+        """Continuously distill new evidence into claims, with bounded batches."""
+        if self.read_only or not self.watch_enabled or self._stop_event.is_set():
+            return
+
+        def loop() -> None:
+            while not self._stop_event.is_set():
+                try:
+                    summary = self.distiller.run(limit=16)
+                    self.health["distill"] = summary
+                except Exception as exc:
+                    self.health["distill"] = {"error": "%s: %s" % (type(exc).__name__, str(exc)[:200])}
+                self._stop_event.wait(tick_seconds)
+
+        threading.Thread(target=loop, name="hippomind-distill", daemon=True).start()
 
     def start_metrics_trend_thread(self, *, tick_seconds: float = 60.0) -> None:
         """后台线程：每分钟醒来检查是否到了写趋势行的时间（每小时一行）。"""
@@ -1063,6 +1103,8 @@ def run_daemon(*, ledger_path: Optional[os.PathLike] = None,
     _atomic_json(paths.state_path, service.state(host, int(port)))
     service.start_watcher()
     service.start_discovery_loop()
+    service.start_capture_loop()
+    service.start_distill_loop()
     service.start_metrics_trend_thread()
     service.start_sleep_loop()
 

@@ -489,6 +489,7 @@ from .cmd_read import (  # noqa: E402  (re-exports follow the helpers they feed)
     cmd_watch as cmd_watch,
 )
 from .cmd_data import cmd_export as cmd_export, cmd_import as cmd_import  # noqa: E402  (re-exports follow the helpers they feed)
+from .cmd_distill import cmd_distill as cmd_distill, cmd_sync_transcripts as cmd_sync_transcripts  # noqa: E402  (re-exports follow the helpers they feed)
 from .cmd_ui import cmd_ui as cmd_ui  # noqa: E402  (re-exports follow the helpers they feed)
 from .cmd_maintain import (  # noqa: E402  (re-exports follow the helpers they feed)
     _backup_registry_path as _backup_registry_path, _load_backup_registry as _load_backup_registry,

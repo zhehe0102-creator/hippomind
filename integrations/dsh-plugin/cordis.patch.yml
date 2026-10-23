@@ -7,3 +7,4 @@
       name: '@dsh-external/dsh-hippomind'
       config:
         agentConfig: __HIPPOMIND_AGENT_CONFIG__
+        triggerMode: always

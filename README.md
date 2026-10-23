@@ -95,9 +95,9 @@ python3 -m hippomind install-agents --agent all
 python3 -m hippomind install-agents --auto
 python3 -m hippomind discover-agents
 
-# 此后只在普通用户文本中写入记忆：或记忆: 时检索并注入，例如：
+# 默认每轮自动预取（无标记）；也可在普通文本中写 记忆： 强制指定查询，例如：
 # “检查服务状态。记忆：检查 daemon API 的并发限制”。标记可在自然语言任意位置。
-# 没有标记时不访问记忆库、不启动 daemon、不注入任何历史；引用、代码块、行内代码和空标记也不触发。
+# 没有相关记忆时不注入；引用、代码块、行内代码和空标记不会触发强制查询。
 # 首次安装或规则更新后，新建任务或重载对应 Agent；可用 agent-status 核验原生接入。
 # 需要检查结果时才手工运行：
 printf '%s\n' "检查服务状态。记忆：检查 daemon API 的并发限制" | \
@@ -215,7 +215,7 @@ shared_ids = mind.publish_commons(source_agent="my-agent", source_session="task-
 ## 一键启动（macOS）
 
 在 Finder 中双击项目根目录的 `start-hippomind.command`，即可启动或复用本机 daemon 和 watcher。
-启动器还会幂等刷新所有已支持 Agent 的显式记忆接入。首次安装后，在需要历史时只要在请求内加入记忆：即可；没有标记不会产生预取或注入。
+启动器还会幂等刷新所有已支持 Agent 的显式记忆接入。v2 默认每轮自动预取；没有相关结果不会注入，记忆：仍可强制指定查询。
 添加 `--gui` 才按需打开全屏中文层状记忆网络。后台账本和旧实验 JSON 相互独立，找不到归档时服务仍可用并会报告单一来源错误。
 
 ## 快速开始

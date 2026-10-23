@@ -16,6 +16,7 @@ from .cmd_lifecycle import (
     cmd_doctor, cmd_init, cmd_login_install, cmd_login_remove, cmd_monitor, cmd_start, cmd_status, cmd_stop,
     cmd_version,
 )
+from .cmd_distill import cmd_distill, cmd_sync_transcripts
 from .cmd_maintain import (
     cmd_backup, cmd_checkup, cmd_maintain, cmd_recovery_check, cmd_redact_raw, cmd_restore, cmd_scan_raw,
 )
@@ -222,6 +223,18 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--archive")
     sync.add_argument("--watch-interval", type=float, default=30.0)
     sync.set_defaults(func=cmd_sync)
+
+    transcripts = sub.add_parser("sync-transcripts", help="增量采集 Claude/Codex 原生会话到账本")
+    _connection_arguments(transcripts)
+    transcripts.add_argument("--limit", type=int, default=200)
+    transcripts.set_defaults(func=cmd_sync_transcripts)
+
+    distill = sub.add_parser("distill", help="把会话证据自动提炼为带证据的 claims")
+    _connection_arguments(distill)
+    distill.add_argument("--limit", type=int, default=32)
+    distill.add_argument("--dry-run", action="store_true")
+    distill.add_argument("--provider", choices=("auto", "claude", "heuristic"), default="auto")
+    distill.set_defaults(func=cmd_distill)
 
     watch = sub.add_parser("watch", help="以低频游标方式持续采集归档")
     _connection_arguments(watch)

@@ -227,7 +227,11 @@ class IdentityMixin:
                     continue
                 old_score = float(old["confidence"]) * float(old["source_trust"])
                 if incoming_score > old_score + 0.05:
-                    conn.execute("UPDATE memory_claims SET state='superseded' WHERE claim_id=?", (old["claim_id"],))
+                    # The whole losing memory leaves recall, so every active
+                    # claim on it must leave the active set as well; otherwise
+                    # health reports dangling active claims forever.
+                    conn.execute("UPDATE memory_claims SET state='superseded' "
+                                 "WHERE memory_id=? AND state='active'", (old["memory_id"],))
                     conn.execute("""UPDATE memories SET lifecycle='superseded',superseded_by=?,quality_state='superseded',updated_at=?
                                     WHERE memory_id=? AND lifecycle='active'""",
                                  (prepared["memory_id"], prepared["asserted_at"], old["memory_id"]))
@@ -239,7 +243,8 @@ class IdentityMixin:
                 else:
                     # 分数接近、无法裁决：双方同时下线等待更强证据。
                     state = "conflict"
-                    conn.execute("UPDATE memory_claims SET state='conflict' WHERE claim_id=?", (old["claim_id"],))
+                    conn.execute("UPDATE memory_claims SET state='conflict' "
+                                 "WHERE memory_id=? AND state='active'", (old["memory_id"],))
                     conn.execute("UPDATE memories SET quality_state='conflict',updated_at=? WHERE memory_id=?",
                                  (prepared["asserted_at"], old["memory_id"]))
             claim_id = "cl_" + _hash(prepared["memory_id"], claim["subject"], claim["predicate"], claim["slot_key"])[:32]

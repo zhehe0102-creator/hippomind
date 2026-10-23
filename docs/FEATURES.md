@@ -30,7 +30,7 @@
   （`memories` 表）可随时从事件重建——改错可回滚，历史不可篡改。
 - **单文件部署**：整个记忆就是一个 `.sqlite` 文件（+wal/shm），备份=复制文件。
 
-## 3. CLI 全部子命令（38 个）
+## 3. CLI 全部子命令（40 个）
 
 ### 3.1 生命周期
 | 命令 | 干什么 | 典型用法 |
@@ -82,6 +82,8 @@
 | `login-install` / `login-remove` | 本机登录态管理（安装/移除登录自启项） |
 | `install-auto` / `install-agents` / `agent-status` / `discover-agents` | 给 Claude Code/Cursor 等写 MCP profile、查看接入状态 |
 | `sync` / `watch` | 手动增量同步 / 前台观察采集 |
+| `sync-transcripts` | 增量采集 Claude/Codex 原生 JSONL 会话到账本（自动循环的 CLI 入口） |
+| `distill` | 自动提炼会话证据为 claims；`--provider auto|claude|heuristic`，`--dry-run` |
 
 ## 4. MCP 工具（11 个，给 AI Agent 用）
 

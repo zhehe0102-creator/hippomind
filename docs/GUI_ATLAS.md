@@ -651,3 +651,67 @@ error, info, menu。
 20/20 截图 PASS；生产库 10/10 截图 PASS；新增 API 测试 4 项、E2E 写入表单验证
 （AtlasE2E claim 写入后 `/api/v1/claims?subject=AtlasE2E` 返回 1 条 active）；
 生产 environment 端点 < 0.3s、events < 5ms、pins/duplicates < 5ms。
+
+
+## 11. v2 自动记忆核心（2026-10-23）
+
+目标不是再增加视图，而是让系统在用户不写标记、不手动 ingest 的情况下自动闭环：
+
+### 11.1 自动采集
+
+- 新增 `hippomind/transcripts.py`：增量读取 Claude Code（`~/.claude/projects/**/*.jsonl`）
+  与 Codex（`~/.codex/sessions/**/*.jsonl`）原生会话；只取 user/assistant 文本，
+  忽略 system/developer/tool/attachment；游标存于 `source_cursors`，断线可补采。
+- daemon 启动 `start_capture_loop`（60s 周期），每轮最多 100 条消息；
+  `/stats.health.capture` 暴露 files/messages/inserted/errors。
+- 现有 Agent-Chat-Archive watcher 与 DSH 原生插件继续保留；Claude/Codex 的空白由此补齐。
+
+### 11.2 自动提炼
+
+- 新增 `hippomind/distill.py`：每 5 分钟取最多 16 条未提炼记忆，调用本机
+  `claude -p` 做 JSON claims 抽取（subject/predicate/slot_key/value/confidence/
+  source），失败回退到确定性抽取；每条提炼记录必须带 `memory:<source_id>` 证据。
+- 提炼结果写入现有 `memories` + `memory_claims`（无 schema 迁移），
+  以 `distill:<memory_id>` 游标保证幂等。
+- 同一 subject 的连续提炼通过 `causal_parents(related_to)` 连接，图谱开始出现边；
+  `ContextPackBuilder` 增加有界联想扩展（共享 claim subject 的相关记忆，score 0.35，
+  最多 8 条），让图谱参与检索而不只是展示。
+- 自动冲突：`resolve_conflicts` 只在高置信且领先 ≥0.10 时自动裁决，
+  模糊冲突保留人工/后续模型处理。
+
+### 11.3 无标记注入
+
+- Codex 托管 Hook 命令增加 `--trigger-mode always`；DSH 插件 patch 写入
+  `triggerMode: always`；各 MCP Agent 规则改为默认每轮 `auto-context
+  --trigger-mode always`。`记忆：` 保留为强制查询入口。
+- 注入仍受 Context Pack 预算/证据/不可信包裹约束；空结果不注入。
+- `hippomind/health` 新增 `capture` / `distill` 检查项，GUI 体检页可见。
+
+### 11.4 系统环境
+
+- 新增 `scripts/install-autostart.sh`：把 1.8MB 的 Python 包同步到内置盘
+  `~/Library/Application Support/HippoMind/runtime`，写 LaunchAgent
+  （内置盘 + 内置账本，绕过外置卷 TCC），登录后后台运行 daemon。
+  重新升级代码后重跑该脚本即可刷新 runtime。
+- 现有 `HippoMind Atlas.app` / `打开 HippoMind Atlas.command` 继续作为手动入口。
+
+### 11.5 实测（2026-10-23）
+
+- 全量单测 **654 项 OK**；lint gate 90/90。
+- 生产 daemon 重启后自动采集：首轮 100 条消息（已有内容多为 duplicate，说明 watcher
+  已覆盖大部分；新增 2 条）；自动提炼首轮 **16 候选 → 15 条提炼 → 28 claims**，
+  第二轮后生产库 **57 claims / 57 active**，事实与图谱不再为空。
+- 一次 `claude -p` 抽取 1 批约 44–65s；daemon 每 5 分钟 16 条，适合后台渐进回填。
+- 生产环境 `/api/v1/environment` 0.14s、events 0.32s；doctor READY。
+
+### 11.6 仍未达到 95 的部分（如实）
+
+1. 真语义 embedding 尚未接入：当前仍是 FTS/LIKE + 字符 n-gram；要上 95 需要
+   bge/mxbai/nomic 等本地 embedding + reranker。
+2. 采集覆盖仍以 Claude/Codex/DSH 为主；Gemini/Cursor/Pi 依赖 MCP/规则，需补原生
+   transcript adapter。
+3. 提炼吞吐约 16 条/5 分钟；242k raw 历史全量回填需要更长的批处理/会话级摘要。
+4. 自动注入尚未做 relevance gate 的分数阈值；可能出现无关上下文，需要
+   injection trace + 阈值调优。
+5. 自动冲突只在明确领先时裁决；复杂冲突仍留人工。
+6. 95 分评估集/回归门禁尚未建立；当前 654 测试是工程门，不是质量分数。

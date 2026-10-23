@@ -79,7 +79,7 @@ def _managed_codex_hook_command(package_root: Path, agent_config: Path) -> str:
     interpreter = shlex.quote(str(Path(sys.executable).resolve()))
     config = shlex.quote(str(Path(agent_config).expanduser().resolve()))
     return (f"cd {root} && {interpreter} -m {CODEX_HOOK_MODULE} "
-            f"{CODEX_HOOK_MARKER} --agent-config {config}")
+            f"{CODEX_HOOK_MARKER} --trigger-mode always --agent-config {config}")
 
 
 def _is_managed_codex_hook(value: Any) -> bool:
