@@ -27,12 +27,16 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import platform
+import plistlib
 import secrets
+import shutil
 import sqlite3
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 from urllib.parse import unquote
 
 from . import __version__
@@ -80,6 +84,10 @@ ENDPOINTS: Tuple[Dict[str, Any], ...] = (
     {"method": "GET", "path": "/api/v1/graph", "summary": "实体图谱邻域", "auth": "admin"},
     {"method": "GET", "path": "/api/v1/agents", "summary": "来源 Agent、游标与接入状态", "auth": "admin"},
     {"method": "GET", "path": "/api/v1/health", "summary": "完整性/索引/容量体检", "auth": "admin"},
+    {"method": "GET", "path": "/api/v1/environment", "summary": "运行环境、磁盘、备份与登录项", "auth": "admin"},
+    {"method": "GET", "path": "/api/v1/events", "summary": "结构化事件流（排除 raw/tool/system）", "auth": "admin"},
+    {"method": "GET", "path": "/api/v1/pins", "summary": "置顶记忆列表", "auth": "admin"},
+    {"method": "GET", "path": "/api/v1/duplicates", "summary": "近似重复候选（只读）", "auth": "admin"},
     {"method": "POST", "path": "/api/v1/pin", "summary": "置顶/取消置顶一条记忆", "auth": "admin"},
     {"method": "POST", "path": "/api/v1/feedback", "summary": "对一条记忆给出正负反馈", "auth": "admin"},
     {"method": "POST", "path": "/api/v1/ui-token", "summary": "签发一次性 UI 引导令牌", "auth": "admin"},
@@ -258,6 +266,14 @@ class GuiApi:
             return self.agents(params)
         if route == "health":
             return self.health(params)
+        if route == "environment":
+            return self.environment(params)
+        if route == "events":
+            return self.events(params)
+        if route == "pins":
+            return self.pins(params)
+        if route == "duplicates":
+            return self.duplicates(params)
         raise GuiApiError(404, "unknown endpoint")
 
     def post(self, path: str, body: Mapping[str, Any],
@@ -481,6 +497,8 @@ class GuiApi:
         if query:
             base_where.append("(content LIKE ? ESCAPE '!' OR metadata_json LIKE ? ESCAPE '!')")
             base_args.extend([_like_term(query), _like_term(query)])
+        if _truthy_param(params, "pinned"):
+            base_where.append("pinned=1")
         self._append_time_bounds(params, base_where, base_args)
 
         where = list(base_where)
@@ -925,6 +943,240 @@ class GuiApi:
         return True, "令牌文件存在且仅本用户可读（0600）"
 
     # ------------------------------------------------------------------
+    # environment / activity / pins / duplicates
+    # ------------------------------------------------------------------
+    def environment(self, params: Mapping[str, List[str]]) -> Dict[str, Any]:
+        hub = self.hub
+        package_root = Path(__file__).resolve().parents[1]
+        storage = self._storage()
+        started = float(getattr(hub, "_started_at", time.time()))
+        server = getattr(hub, "_server", None)
+        host = "127.0.0.1"
+        port = 0
+        if server is not None:
+            try:
+                host = str(server.server_address[0])
+                port = int(server.server_address[1])
+            except (AttributeError, IndexError, TypeError, ValueError):
+                port = 0
+        ui_url = "http://%s:%d/ui/" % (host, port) if port else ""
+        api_url = "http://%s:%d/api/v1" % (host, port) if port else ""
+        try:
+            usage = shutil.disk_usage(str(package_root))
+            disk = {"total_bytes": int(usage.total), "used_bytes": int(usage.used),
+                    "free_bytes": int(usage.free)}
+        except OSError:
+            disk = {}
+        external = _is_external_volume(package_root)
+        with self.ledger._reading() as conn:
+            journal = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).upper()
+            events = int(conn.execute("SELECT COUNT(*) FROM ledger_events").fetchone()[0])
+            memories = int(conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0])
+            schema = int(conn.execute(
+                "SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0])
+        backups = _read_backup_registry(Path(getattr(hub.paths, "state_path", "")))
+        latest = backups[-1] if backups else None
+        latest_info = None
+        if latest:
+            backup_path = Path(str(latest.get("path", "")))
+            try:
+                exists = backup_path.is_file()
+                size = backup_path.stat().st_size if exists else int(latest.get("bytes", 0) or 0)
+            except OSError:
+                exists = False
+                size = int(latest.get("bytes", 0) or 0)
+            created = str(latest.get("created_at", ""))
+            age = None
+            try:
+                parsed = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                age = max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds())
+            except (TypeError, ValueError):
+                age = None
+            latest_info = {"path": str(backup_path), "bytes": size,
+                           "created_at": created, "sha256": str(latest.get("sha256", "")),
+                           "exists": exists, "age_s": round(age, 1) if age is not None else None}
+        dependencies: Dict[str, Any] = {"sqlite": sqlite3.sqlite_version}
+        try:
+            import matplotlib
+            dependencies["matplotlib"] = str(getattr(matplotlib, "__version__", "?"))
+        except Exception:
+            dependencies["matplotlib"] = None
+        launchd = _launchd_report(package_root) if sys.platform == "darwin" else []
+        checks = self._environment_checks(disk, external, backups, latest_info,
+                                          launchd, dependencies, journal)
+        return {
+            "generated_at": _utc_now(),
+            "platform": {"system": platform.system(), "release": platform.release(),
+                         "machine": platform.machine(),
+                         "python": platform.python_version(),
+                         "python_executable": sys.executable,
+                         "package_root": str(package_root), "cwd": os.getcwd()},
+            "workspace": {"path": str(package_root), "external_volume": external,
+                          "disk": disk},
+            "daemon": {"pid": os.getpid(), "host": host, "port": port,
+                       "uptime_s": round(max(0.0, time.time() - started), 1),
+                       "started_at": str(getattr(hub, "started_at", "")),
+                       "watch_enabled": bool(getattr(hub, "watch_enabled", False)),
+                       "ui_url": ui_url, "api_url": api_url},
+            "ledger": {"path": str(self.ledger.path),
+                       "db_bytes": int(storage.get("db_bytes", 0) or 0),
+                       "wal_bytes": int(storage.get("wal_bytes", 0) or 0),
+                       "freelist": int(storage.get("freelist", 0) or 0),
+                       "reclaimable_bytes": int(storage.get("reclaimable_bytes", 0) or 0),
+                       "schema_version": schema, "journal_mode": journal,
+                       "events": events, "memories": memories},
+            "backups": {"registry_path": str(Path(getattr(hub.paths, "state_path", "")).parent / "backups.json"),
+                        "count": len(backups), "latest": latest_info},
+            "launchd": launchd,
+            "dependencies": dependencies,
+            "home": {"HIPPOMIND_HOME": os.environ.get("HIPPOMIND_HOME", ""),
+                     "runtime_dir": str(Path(getattr(hub.paths, "state_path", "")).parent)},
+            "checks": checks,
+        }
+
+    def _environment_checks(self, disk: Mapping[str, Any], external: bool,
+                            backups: List[Any], latest: Optional[Mapping[str, Any]],
+                            launchd: List[Mapping[str, Any]],
+                            dependencies: Mapping[str, Any], journal: str) -> List[Dict[str, Any]]:
+        checks: List[Dict[str, Any]] = []
+        version = platform.python_version()
+        python_ok = sys.version_info >= (3, 9)
+        checks.append({"id": "python", "label": "Python", "severity": "ok" if python_ok else "error",
+                       "detail": "%s · %s" % (version, sys.executable),
+                       "fix": None if python_ok else {"label": "安装 Python 3.9+", "command": "python3 --version"}})
+        matplotlib_ok = dependencies.get("matplotlib") is not None
+        checks.append({"id": "matplotlib", "label": "绘图依赖", "severity": "ok" if matplotlib_ok else "warn",
+                       "detail": ("matplotlib %s" % dependencies.get("matplotlib")) if matplotlib_ok
+                                 else "未安装 matplotlib（仅旧版可视化需要）",
+                       "fix": None if matplotlib_ok else
+                              {"label": "安装依赖", "command": "python3 -m pip install -r requirements.txt"}})
+        if external:
+            checks.append({"id": "workspace", "label": "工作区卷", "severity": "warn",
+                           "detail": "工作区在外置卷；macOS 会拒绝 launchd 后台任务读取该卷，登录自启不可用",
+                           "fix": {"label": "启动命令", "command": "hippomind start"}})
+        else:
+            checks.append({"id": "workspace", "label": "工作区卷", "severity": "ok",
+                           "detail": "工作区在内置卷", "fix": None})
+        free = int((disk or {}).get("free_bytes", 0) or 0)
+        if free and free < 2 * 1024 * 1024 * 1024:
+            checks.append({"id": "disk", "label": "磁盘空间", "severity": "warn",
+                           "detail": "可用空间仅 %.1f GiB" % (free / (1024 ** 3)),
+                           "fix": {"label": "清理空间", "command": "hippomind maintain"}})
+        else:
+            checks.append({"id": "disk", "label": "磁盘空间", "severity": "ok",
+                           "detail": ("可用 %.1f GiB" % (free / (1024 ** 3))) if free else "不可用",
+                           "fix": None})
+        if not backups or latest is None:
+            checks.append({"id": "backup", "label": "备份", "severity": "warn",
+                           "detail": "没有登记备份；建议定期备份",
+                           "fix": {"label": "创建备份", "command": "hippomind backup ~/hippomind-backup.db"}})
+        else:
+            age = latest.get("age_s")
+            stale = age is None or age > 30 * 86400
+            exists = bool(latest.get("exists"))
+            severity = "warn" if stale or not exists else "ok"
+            detail = "最近备份 %s 前" % _format_age(age) if age is not None else "最近备份时间未知"
+            if not exists:
+                detail += "（文件不存在）"
+            checks.append({"id": "backup", "label": "备份", "severity": severity, "detail": detail,
+                           "fix": None if severity == "ok" else
+                                  {"label": "创建备份", "command": "hippomind backup ~/hippomind-backup.db"}})
+        if sys.platform == "darwin":
+            problems: List[str] = []
+            for item in launchd:
+                problems.extend(item.get("problems", []))
+            if problems:
+                checks.append({"id": "launchd", "label": "登录自启", "severity": "warn",
+                               "detail": "；".join(problems[:3]),
+                               "fix": {"label": "重装登录项", "command": "hippomind login-install"}})
+            elif external:
+                checks.append({"id": "launchd", "label": "登录自启", "severity": "warn",
+                               "detail": "登录项存在，但外置卷受 TCC 限制；请用 hippomind start 手动启动",
+                               "fix": {"label": "启动命令", "command": "hippomind start"}})
+            elif launchd:
+                checks.append({"id": "launchd", "label": "登录自启", "severity": "ok",
+                               "detail": "登录项路径有效", "fix": None})
+            else:
+                checks.append({"id": "launchd", "label": "登录自启", "severity": "ok",
+                               "detail": "未安装登录项（按需运行 login-install）", "fix": None})
+        journal_ok = str(journal).upper() == "WAL"
+        checks.append({"id": "journal", "label": "日志模式", "severity": "ok" if journal_ok else "warn",
+                       "detail": journal or "未知", "fix": None if journal_ok else
+                              {"label": "检查账本", "command": "hippomind checkup"}})
+        return checks
+
+    def events(self, params: Mapping[str, List[str]]) -> Dict[str, Any]:
+        limit = _clamp_int(params, "limit", 20, 1, 200)
+        event_type = _text_param(params, "type", "", 64)
+        agent = _text_param(params, "agent", "", 128)
+        since = _text_param(params, "since", "", 40)
+        excluded = ("raw_chat", "tool_output", "system_message", "developer_message",
+                    "environment", "command_output", "approval")
+        clauses = ["event_type NOT IN (" + ",".join("?" for _ in excluded) + ")"]
+        args: List[Any] = list(excluded)
+        if event_type:
+            clauses.append("event_type=?")
+            args.append(event_type)
+        if agent:
+            clauses.append("source_agent=?")
+            args.append(agent)
+        if since:
+            clauses.append("occurred_at>=?")
+            args.append(since)
+        clause = " AND ".join(clauses)
+        with self.ledger._reading() as conn:
+            rows = conn.execute(
+                "SELECT event_id,event_type,occurred_at,ingested_at,source_agent,"
+                "session_id,task_id,project,role,scope,content,metadata_json "
+                "FROM ledger_events WHERE " + clause +
+                " ORDER BY occurred_at DESC LIMIT ?", tuple(args) + (limit,)).fetchall()
+            count_rows = conn.execute(
+                "SELECT event_type, COUNT(*) AS count FROM ledger_events WHERE " +
+                clause + " GROUP BY event_type ORDER BY count DESC", tuple(args)).fetchall()
+        items = []
+        for row in rows:
+            items.append({"event_id": str(row["event_id"]),
+                          "event_type": str(row["event_type"]),
+                          "occurred_at": str(row["occurred_at"]),
+                          "ingested_at": str(row["ingested_at"]),
+                          "source_agent": str(row["source_agent"]),
+                          "session_id": str(row["session_id"]),
+                          "task_id": str(row["task_id"]),
+                          "project": str(row["project"]),
+                          "role": str(row["role"]),
+                          "scope": str(row["scope"]),
+                          "content_preview": _preview(row["content"], 240),
+                          "metadata": _json_value(row["metadata_json"], {})})
+        counts = {str(row["event_type"]): int(row["count"]) for row in count_rows}
+        return {"limit": limit, "items": items, "counts": counts,
+                "total": sum(counts.values())}
+
+    def pins(self, params: Mapping[str, List[str]]) -> Dict[str, Any]:
+        scope = _text_param(params, "scope", "shared", 128) or "shared"
+        limit = _clamp_int(params, "limit", 100, 1, 500)
+        with self.ledger._reading() as conn:
+            rows = conn.execute(
+                "SELECT " + _MEMORY_COLUMNS + " FROM memories WHERE pinned=1 AND scope=? "
+                "ORDER BY updated_at DESC LIMIT ?", (scope, limit)).fetchall()
+            total = int(conn.execute(
+                "SELECT COUNT(*) FROM memories WHERE pinned=1 AND scope=?", (scope,)).fetchone()[0])
+        claims = self._has_claims_for([row["memory_id"] for row in rows])
+        return {"scope": scope, "total": total,
+                "items": [_public_memory(row, has_claims=str(row["memory_id"]) in claims)
+                          for row in rows]}
+
+    def duplicates(self, params: Mapping[str, List[str]]) -> Dict[str, Any]:
+        limit = _clamp_int(params, "limit", 20, 1, 100)
+        sample = _clamp_int(params, "sample", 4000, 200, 20000)
+        raw_similarity = _text_param(params, "min_similarity", "0.85", 16)
+        try:
+            similarity = max(0.5, min(1.0, float(raw_similarity)))
+        except (TypeError, ValueError):
+            similarity = 0.85
+        return self.ledger.duplicate_candidates(
+            limit=limit, sample=sample, min_similarity=similarity)
+
+    # ------------------------------------------------------------------
     # writes (audited ledger operations only)
     # ------------------------------------------------------------------
     def pin(self, body: Mapping[str, Any]) -> Dict[str, Any]:
@@ -976,6 +1228,78 @@ class GuiApi:
             "ttl_seconds": UI_NONCE_TTL_SECONDS,
             "url": "/ui/#/pulse?boot=" + nonce,
         }
+
+
+def _is_external_volume(path: Path) -> bool:
+    try:
+        return os.stat(str(path)).st_dev != os.stat(os.sep).st_dev
+    except OSError:
+        return False
+
+
+def _read_backup_registry(state_path: Path) -> List[Dict[str, Any]]:
+    registry = Path(str(state_path)).parent / "backups.json"
+    try:
+        data = json.loads(registry.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return []
+    return [item for item in data if isinstance(item, Mapping)] if isinstance(data, list) else []
+
+
+def _launchd_report(package_root: Path) -> List[Dict[str, Any]]:
+    root = Path.home() / "Library" / "LaunchAgents"
+    labels = (("com.hippomind.daemon", "com.hippomind.daemon.plist"),
+              ("com.hippomind.gui", "com.hippomind.gui.plist"))
+    report: List[Dict[str, Any]] = []
+    for label, filename in labels:
+        path = root / filename
+        item: Dict[str, Any] = {"label": label, "path": str(path), "exists": path.is_file(),
+                                "problems": []}
+        if not item["exists"]:
+            report.append(item)
+            continue
+        try:
+            with path.open("rb") as handle:
+                config = plistlib.load(handle)
+        except (OSError, plistlib.InvalidFileException, ValueError) as exc:
+            item["problems"].append("plist 不可读: %s" % type(exc).__name__)
+            report.append(item)
+            continue
+        if not isinstance(config, Mapping):
+            item["problems"].append("plist 不是字典")
+            report.append(item)
+            continue
+        environment = config.get("EnvironmentVariables")
+        environment = environment if isinstance(environment, Mapping) else {}
+        pythonpath = str(environment.get("PYTHONPATH", "") or "")
+        if pythonpath and not Path(pythonpath).is_dir():
+            item["problems"].append("PYTHONPATH 指向不存在的目录: %s" % pythonpath)
+        working = str(config.get("WorkingDirectory", "") or "")
+        if working and not Path(working).is_dir():
+            item["problems"].append("WorkingDirectory 指向不存在的目录: %s" % working)
+        program = config.get("ProgramArguments")
+        if isinstance(program, (list, tuple)) and program:
+            executable = str(program[0])
+            if executable and not Path(executable).exists():
+                item["problems"].append("解释器不存在: %s" % executable)
+        if pythonpath and Path(pythonpath).resolve() != package_root.resolve():
+            item["problems"].append("PYTHONPATH 与当前包根不一致: %s" % pythonpath)
+        report.append(item)
+    return report
+
+
+def _format_age(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "未知"
+    total = int(max(0, seconds))
+    days, remainder = divmod(total, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes = remainder // 60
+    if days:
+        return "%s 天 %s 小时" % (days, hours)
+    if hours:
+        return "%s 小时 %s 分" % (hours, minutes)
+    return "%s 分钟" % minutes
 
 
 def _format_bytes(value: Any) -> str:

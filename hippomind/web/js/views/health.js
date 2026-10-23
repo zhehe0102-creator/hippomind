@@ -58,6 +58,16 @@ function fetchHealth(context, withIntegrity) {
   return api.get("/api/v1/health", params, { signal: context.signal });
 }
 
+async function fetchEnvironment(context) {
+  try {
+    return await api.get("/api/v1/environment", null, { signal: context.signal });
+  } catch (error) {
+    if (error && error.name === "AbortError") throw error;
+    console.warn("[atlas] environment unavailable", error);
+    return null;
+  }
+}
+
 /* ---------------------------------------------------------------- verdict -- */
 
 function verdictSection(data) {
@@ -279,9 +289,109 @@ function integrityBlock(context) {
   return host;
 }
 
+/* ------------------------------------------------------------- environment -- */
+
+function environmentCard(env, context) {
+  if (!env) {
+    return card({
+      eyebrow: "ENVIRONMENT",
+      title: "运行环境",
+      body: emptyState({ plain: true, title: "环境信息不可用",
+        hint: "daemon 未返回 /api/v1/environment；请确认已重启到当前版本。" }),
+    });
+  }
+  const platform = env.platform || {};
+  const workspace = env.workspace || {};
+  const daemon = env.daemon || {};
+  const backups = env.backups || {};
+  const dependencies = env.dependencies || {};
+  const latest = backups.latest || null;
+  const launchd = Array.isArray(env.launchd) ? env.launchd : [];
+  const checks = Array.isArray(env.checks) ? env.checks : [];
+  const warnings = checks.filter((check) => check.severity !== "ok");
+  const disk = workspace.disk || {};
+  const launchdProblems = launchd.reduce((count, item) =>
+    count + (Array.isArray(item.problems) ? item.problems.length : 0), 0);
+  const rows = statRow([
+    { label: "Python", value: platform.python + " · " + (platform.python_executable || "") },
+    { label: "平台", value: (platform.system || "?") + " " + (platform.release || "") + " · " + (platform.machine || "") },
+    { label: "工作区", value: workspace.path + (workspace.external_volume ? "（外置卷）" : "（内置卷）") },
+    { label: "磁盘可用", value: disk.free_bytes ? fmtBytes(disk.free_bytes) + " / " + fmtBytes(disk.total_bytes) : "不可用" },
+    { label: "依赖", value: "matplotlib " + (dependencies.matplotlib || "未安装") + " · SQLite " + (dependencies.sqlite || "?") },
+    { label: "最近备份", value: latest
+      ? (latest.exists ? fmtBytes(latest.bytes) + " · " + relTime(latest.created_at) : "登记文件不存在 · " + relTime(latest.created_at))
+      : "没有登记备份" },
+    { label: "登录自启", value: launchd.length
+      ? (launchdProblems ? launchdProblems + " 个路径问题" : "路径有效") + (workspace.external_volume ? " · 外置卷受 TCC 限制" : "")
+      : "未安装" },
+    { label: "daemon", value: (daemon.ui_url || "—") + " · 已运行 " + duration(daemon.uptime_s) },
+    { label: "运行目录", value: (env.home && env.home.runtime_dir) || "—" },
+  ]);
+  const actions = el("div", { class: "va-env-actions" },
+    copyButton("hippomind start", { label: "复制启动命令" }),
+    copyButton("hippomind ui", { label: "复制打开命令" }),
+    daemon.ui_url ? copyButton(daemon.ui_url, { label: "复制 UI 地址" }) : null);
+  const warningList = warnings.length
+    ? el("div", { class: "va-env-warnings" }, ...warnings.slice(0, 4).map((check) =>
+        el("div", { class: "va-env-warning" },
+          dot(severityTone(check.severity)),
+          el("span", { class: "va-env-warning-label" }, check.label || check.id),
+          el("span", { class: "va-env-warning-detail" }, check.detail || ""))))
+    : el("div", { class: "va-env-ok" }, "环境检查全部通过");
+  return card({
+    eyebrow: "ENVIRONMENT",
+    title: "运行环境",
+    actions: badge(workspace.external_volume ? "外置卷" : "内置卷",
+      { tone: workspace.external_volume ? "warn" : "ok" }),
+    body: el("div", { class: "va-env" }, rows, actions, warningList),
+  });
+}
+
+/* --------------------------------------------------------------- duplicates -- */
+
+function duplicatesCard(context) {
+  const result = el("div", { class: "va-dup-result" });
+  const button = el("button", { class: "atlas-btn atlas-btn--ghost atlas-btn--sm", type: "button" },
+    icon("search", { size: 13 }), el("span", {}, "扫描重复候选"));
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    result.replaceChildren(el("p", { class: "va-note" }, "扫描中…（只读，不修改账本）"));
+    try {
+      const data = await api.get("/api/v1/duplicates",
+        { limit: 10, sample: 2000, min_similarity: 0.85 }, { signal: context.signal });
+      const pairs = Array.isArray(data.pairs) ? data.pairs : [];
+      const head = el("p", { class: "va-note" },
+        "扫描 " + fmtInt(data.scanned) + " 条 accepted 记忆，发现 " +
+        fmtInt(data.suggestions) + " 对近似重复候选。");
+      const list = el("div", { class: "va-dup-list" });
+      for (const pair of pairs.slice(0, 6)) {
+        list.appendChild(el("div", { class: "va-dup-row" },
+          el("span", { class: "va-dup-sim" }, Number(pair.similarity || 0).toFixed(2)),
+          el("span", { class: "va-dup-preview" }, pair.preview || "（无预览）")));
+      }
+      result.replaceChildren(head, list);
+      if (!pairs.length) result.appendChild(el("p", { class: "va-note" }, "没有达到阈值的候选。"));
+    } catch (error) {
+      if (error && error.name === "AbortError") return;
+      result.replaceChildren(el("p", { class: "va-note tone-danger" },
+        "扫描失败：" + String((error && (error.detail || error.message)) || "未知错误")));
+    } finally {
+      button.disabled = false;
+    }
+  });
+  return card({
+    eyebrow: "DUPLICATES",
+    title: "重复候选",
+    body: el("div", { class: "va-dup" },
+      el("p", { class: "va-note" },
+        "按内容指纹分桶 + 字符 Jaccard 找出近似重复（只读，不合并、不删除）。"),
+      button, result),
+  });
+}
+
 /* ------------------------------------------------------------------- paint -- */
 
-function paint(root, data, context) {
+function paint(root, data, environment, context) {
   clear(root);
   const checks = Array.isArray(data.checks) ? data.checks : [];
   const tone = data.ready ? "ok" : "danger";
@@ -297,6 +407,8 @@ function paint(root, data, context) {
     el("div", { class: "va-health-side" },
       projectionsCard(data),
       integrityBlock(context))));
+  root.appendChild(environmentCard(environment, context));
+  root.appendChild(duplicatesCard(context));
   root.appendChild(commandsCard());
   current.painted = true;
 }
@@ -310,7 +422,9 @@ export async function render(context) {
   try {
     const data = await fetchHealth(context, false);
     if (context.signal.aborted) return root;
-    paint(root, data || {}, context);
+    const environment = await fetchEnvironment(context);
+    if (context.signal.aborted) return root;
+    paint(root, data || {}, environment, context);
   } catch (error) {
     if (error && error.name === "AbortError") return root;
     clear(root);
@@ -325,7 +439,9 @@ export async function refresh(context) {
   try {
     const data = await fetchHealth(context, false);
     if (context.signal.aborted) return;
-    paint(root, data || {}, context);
+    const environment = await fetchEnvironment(context);
+    if (context.signal.aborted) return;
+    paint(root, data || {}, environment, context);
   } catch (error) {
     if (error && error.name === "AbortError") return;
     if (current.painted) context.toast("体检刷新失败：" + String((error && (error.detail || error.message)) || "未知错误"), { tone: "warn" });

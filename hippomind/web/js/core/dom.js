@@ -121,6 +121,20 @@ export function isTypingTarget(target) {
   return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || target.isContentEditable;
 }
 
+/* Download a client-generated text file without a server round trip. */
+export function downloadText(filename, text, mime = "text/plain;charset=utf-8") {
+  const blob = new Blob([String(text ?? "")], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.style.display = "none";
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1200);
+}
+
 /* Copy with a clipboard fallback that works under file://-less local origins. */
 export async function copyText(text) {
   try {

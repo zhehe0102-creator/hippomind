@@ -263,7 +263,7 @@ PUBLIC_MEMORY_PREVIEW（列表统一形）：
 ### 4.3 GET /api/v1/memories
 
 参数：limit(1–100, 默认 50)、offset(0–100000)、kind、agent、lifecycle、project、
-scope(默认 shared)、q(≤200 字符，LIKE)、sort=updated|created|weight（默认 updated）、
+scope(默认 shared)、q(≤200 字符，LIKE)、pinned=1（只看置顶）、sort=updated|created|weight（默认 updated）、
 order=desc|asc、from/to(ISO 前缀)、raw=exclude|include|only（默认 exclude）、
 facets=1 时返回 facets。
 
@@ -343,6 +343,32 @@ item 含 claim 字段 + memory content ≤120（沿用现有 /conflicts 语义�
      "checks":[{"id":"ledger","label":"账本","severity":"ok|warn|error",
        "detail":"...","fix":{"label":"","command":""}}],
      "integrity":{"ran":false,"ok":null,"elapsed_ms":null}}
+
+### 4.17 GET /api/v1/environment
+
+运行环境只读快照：platform（python/executable/package_root）、workspace（卷类型/磁盘）、
+daemon（host/port/ui_url/uptime）、ledger（大小/schema/journal/计数）、backups
+（registry 路径/最近备份/存在性/年龄）、launchd（plist 路径与问题）、dependencies
+（matplotlib/sqlite）、home（HIPPOMIND_HOME/runtime_dir）、checks（python/磁盘/备份/
+登录项/日志模式等 severity + fix 命令）。用于体检页「运行环境」卡片。
+
+### 4.18 GET /api/v1/events
+
+结构化事件流：默认排除 raw_chat/tool_output/system_message/developer_message/
+environment/command_output/approval；参数 limit(1–200)、type、agent、since。
+返回 items（event_id/type/occurred_at/source_agent/session/task/project/role/scope/
+content_preview≤240/metadata）与 counts 按类型聚合。用于脉搏页「最近活动」。
+
+### 4.19 GET /api/v1/pins
+
+参数 scope(默认 shared)、limit(1–500)；返回 total + items（PUBLIC_MEMORY_PREVIEW）。
+记忆库的 pinned=1 过滤也复用同一置顶语义。
+
+### 4.20 GET /api/v1/duplicates
+
+参数 limit(1–100)、sample(200–20000)、min_similarity(0.5–1.0，默认 0.85)；
+返回 duplicate_candidates 的 pairs/scanned/suggestions（只读，不合并不删除）。
+体检页「重复候选」按钮按需调用。
 
 ### 4.14 POST /api/v1/pin
 
@@ -534,7 +560,7 @@ error, info, menu。
 ## 7. 质量门槛（验收）
 
 1. python3 -m unittest discover -s tests -p 'test_gui*.py' 全绿（新增测试）。
-2. python3 -m unittest discover -s tests 全绿（2026-10-23 实测 644 项）。
+2. python3 -m unittest discover -s tests 全绿（2026-10-23 实测 648 项）。
 3. scripts/lint.sh exit 0。
 4. 前端静态检查：index.html 引用的每个资源存在；每个 ES 模块可 node --check；
    无外链 http(s) 资源；无内联 <script>；无 innerHTML = <接口数据> 模式。
@@ -580,14 +606,14 @@ error, info, menu。
 
 | 门 | 结果 |
 |---|---|
-| 全量单测 | 644 项 OK（2026-10-23，含新增 GUI API 15 / serving 8 / CLI 4 / frontend 17） |
+| 全量单测 | 648 项 OK（2026-10-23，含 GUI API 19 / serving 8 / CLI 4 / frontend 17） |
 | lint | gate 90/90、legacy 254/254，exit 0（ruff 0.16.3） |
 | 截图 | seed 720 条 × 10 视图 × 2 主题 = 20/20 PASS，0 console error / 0 HTTP≥400 / 0 溢出 / 0 XSS |
 | 生产库截图 | 真实 248,523 事件 × 10 视图 = 10/10 PASS |
-| 生产端点时延 | overview 0.53s、health 0.66s、agents 0.15s、memories 8ms、quick_check 1.8s（按需） |
+| 生产端点时延 | overview 0.50s、environment 0.14s、events 0.32s、pins 0.22s、duplicates 9ms、memories 8ms |
 | 引导令牌 | 无 localStorage 打开 /ui#/pulse?boot=…：自动换 token、fragment 清理、无连接面板、数据正常 |
 | 安全 | /ui HTML 无 token/路径；越界路径 400/403；CSP/frame DENY/nosniff；XSS seed 6 条全部按文本渲染 |
-| 生产体检 | `hippomind doctor` READY（privacy/launchd 为已知 warning），daemon v1.0.0 pid 70237 |
+| 生产体检 | `hippomind doctor` READY（privacy/launchd 为已知 warning），daemon v1.0.0 pid 80795 |
 
 ### 9.3 已知边界
 
@@ -597,3 +623,31 @@ error, info, menu。
 3. 唯一写操作是置顶/反馈；遗忘/裁决等仍只给可复制的 CLI 命令。
 4. 旧 matplotlib 工作台保留（`--gui` / `--network`），但文档主界面已切换为 Web 控制台。
 5. 工作区在外置卷时 launchd 开机自启仍受 macOS TCC 限制（既有平台限制，doctor 会提示）。
+
+
+## 10. v1.1 增强（2026-10-23）
+
+在 v1.0 的十视图基础上，本轮补的是「可运维 + 可写入 + 可发现」：
+
+- **活动流**：新增 `GET /api/v1/events`（隐私过滤后的结构化事件），脉搏页新增
+  「最近活动」卡片，按事件类型/来源展示最近 8 条并聚合类型计数。
+- **运行环境**：新增 `GET /api/v1/environment`，体检页新增「运行环境」卡片
+  （Python/平台/工作区卷/磁盘/依赖/最近备份/登录项/daemon URL/运行目录）与
+  「重复候选」按需扫描（`/api/v1/duplicates`）。
+- **置顶与导出**：新增 `GET /api/v1/pins`，记忆库支持 pinned=1 过滤；记忆库与
+  事实页支持当前页 CSV 导出（客户端生成，不经服务端）。
+- **事实写入**：事实页新增「记录事实」表单（subject/predicate/slot_key/value/
+  evidence/confidence/content），通过既有 `POST /ingest` 写入一条带证据的 claim，
+  成功后立即出现在事实/图谱视图。这是控制台唯一可直接执行的写操作；source_agent
+  固定为 `atlas-gui`，scope 为 shared，evidence 必填。
+- **命令面板**：输入任意关键词时追加「在记忆中搜索…」「在记忆库中过滤…」两个动态
+  命令；新增 `?` 帮助抽屉（快捷键/设计说明）；命令面板新增「快捷键与帮助」。
+- **主题**：参考页新增「跟随系统」，app.js 监听 `prefers-color-scheme` 实时切换；
+  T 键仍在纸本/夜档间切换。
+- **系统环境**：新增 `scripts/bootstrap-env.sh`（默认只检查；`--create` 在
+  exFAT 上以 --copies 创建 .venv 并安装 requirements），start 脚本优先使用 .venv。
+
+验收证据（2026-10-23 第二轮）：全量单测 648 项 OK；lint gate 90/90；seed 数据
+20/20 截图 PASS；生产库 10/10 截图 PASS；新增 API 测试 4 项、E2E 写入表单验证
+（AtlasE2E claim 写入后 `/api/v1/claims?subject=AtlasE2E` 返回 1 条 active）；
+生产 environment 端点 < 0.3s、events < 5ms、pins/duplicates < 5ms。

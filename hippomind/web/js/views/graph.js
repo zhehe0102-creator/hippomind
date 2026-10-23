@@ -139,7 +139,7 @@ export async function render(context) {
   const shell = el("div", { class: "vb-view vb-graph" });
   const leftCard = card({ eyebrow: "SUBJECTS", title: "实体索引", body: skeleton(4) });
   const mainCard = card({ eyebrow: "ENTITY GRAPH", title: "关系网络", body: skeleton(3) });
-  const sideCard = card({ eyebrow: "ENTITY", title: "实体详情", body: entityPanel("", null, [], false, null) });
+  const sideCard = card({ eyebrow: "ENTITY", title: "实体", body: entityPanel("", null, [], false, null) });
   shell.append(leftCard, mainCard, sideCard);
   root.appendChild(shell);
 
@@ -209,6 +209,8 @@ export async function render(context) {
       canvasHost.appendChild(emptyState({
         title: "该主语暂无活跃 claim",
         hint: "图谱只展示 state=active/conflict 的 claim。确认主语拼写，或先在账本里写入带 claims 的记忆。",
+        action: { label: "记录一条事实", icon: "plus", primary: true,
+                  onClick: () => context.navigate("/facts?tab=claims") },
       }));
     }
   }
@@ -258,6 +260,8 @@ export async function render(context) {
         mainCard.querySelector(".atlas-card-body").replaceChildren(emptyState({
           title: "还没有实体索引",
           hint: "claims 由带 claims 的 ingest 记录产生。先写入一条带 subject/predicate/slot_key/value 的记忆，或运行 hippomind graph --subject <name> 检查账本。",
+          action: { label: "记录一条事实", icon: "plus", primary: true,
+                    onClick: () => context.navigate("/facts?tab=claims") },
         }));
         sideCard.querySelector(".atlas-card-body").replaceChildren(entityPanel("", null, [], false, null));
         return;

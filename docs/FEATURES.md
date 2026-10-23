@@ -102,7 +102,7 @@
 | GET | `/graph?subject=&scope=&hops=&limit=` | 实体图谱（缺 subject→400，无 token→401） |
 | GET | `/metrics` | Prometheus 文本（memories/events/claims_active/conflict/pinned/wal/cache） |
 | GET | `/ui` | HippoMind Atlas 静态控制台（同源、零构建；HTML 不含令牌或账本路径） |
-| GET | `/api/v1/*` | 控制台只读数据面：meta/overview/memories/timeline/claims/conflicts/facts/skills/subjects/graph/agents/health（管理员令牌） |
+| GET | `/api/v1/*` | 控制台数据面：meta/overview/memories/timeline/claims/conflicts/facts/skills/subjects/graph/agents/health/environment/events/pins/duplicates（管理员令牌） |
 | POST | `/api/v1/pin` · `/api/v1/feedback` · `/api/v1/ui-token` | 置顶/反馈/一次性 UI 登录令牌 |
 | POST | `/ingest` | 批量写入（≤预算，超长 413 且客户端必能读到错误响应） |
 | POST | `/recall` · `/context-pack` · `/feedback` · `/sync` | 对应 CLI 能力 |
@@ -142,6 +142,11 @@
   [GUI_ATLAS.md](GUI_ATLAS.md) 与 [ARCHITECTURE.md](ARCHITECTURE.md)。
 - **安全**：/ui 仅服务 `hippomind/web/` 内文件（路径包含校验），响应带 CSP/
   frame-ancestors/nosniff；页面源码不含 token 或账本路径。
+- **v1.1 增强**：脉搏页结构化活动流（`/api/v1/events`，默认排除 raw/tool/system）；
+  体检页运行环境卡片（Python/卷/磁盘/依赖/备份/登录项）与重复候选只读扫描；
+  记忆库置顶过滤 + CSV 导出；事实页「记录事实」表单（唯一可直接执行的写操作，
+  经 `POST /ingest` 写入带证据 claim）；命令面板输入关键词可直接检索记忆；
+  主题支持跟随系统；`scripts/bootstrap-env.sh` 检查/创建可复现 Python 环境。
 
 ### 6.1 旧版 matplotlib 工作台（保留，非主界面）
 

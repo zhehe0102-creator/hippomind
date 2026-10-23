@@ -300,10 +300,15 @@ claims、关系、反馈、置顶）、检索（FTS + LIKE、命中高亮）、�
 体检（完整性/FTS/claims/容量 + 可复制维护命令）、参考（接口目录与界面设置）。
 快捷键：`⌘K` 命令面板、1–0 视图、R 刷新、T 主题、Esc 关闭。
 
-控制台的读数据面是 `GET /api/v1/*`（管理员令牌、分页有界、内容截断）；唯一
-写操作是置顶与反馈（复用账本审计路径）。/ui 只服务 `hippomind/web/` 内的文件并
-带 CSP/frame-ancestors 头，页面不嵌入 token 或账本路径。设计与接口契约见
-[docs/GUI_ATLAS.md](docs/GUI_ATLAS.md)。
+控制台的数据面是 `GET /api/v1/*`（管理员令牌、分页有界、内容截断）；除置顶/反馈
+外，事实页提供「记录事实」表单，经既有 `POST /ingest` 写入一条带证据的 claim
+（source_agent=atlas-gui，evidence 必填）。/ui 只服务 `hippomind/web/` 内的文件并
+带 CSP/frame-ancestors 头，页面不嵌入 token 或账本路径。
+
+v1.1 还增加了：脉搏页结构化活动流；体检页运行环境（Python/卷/磁盘/依赖/备份/
+登录项）与重复候选只读扫描；记忆库置顶过滤与当前页 CSV 导出；命令面板输入关键词
+直接检索记忆；主题跟随系统；以及 `scripts/bootstrap-env.sh` 环境检查/创建脚本。
+设计与接口契约见 [docs/GUI_ATLAS.md](docs/GUI_ATLAS.md)。
 
 ## 旧版 matplotlib GUI 交互（保留）
 

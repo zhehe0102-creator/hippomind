@@ -238,9 +238,17 @@ daemon 在 `/ui` 同源提供新控制台（零构建、原生 ES Modules、无 
 记忆库、检索、上下文、图谱、事实、年轮、端点、体检、参考；浅色纸本为默认，night
 为深色主题；`⌘K` 命令面板、1–0 切视图、R 刷新、T 主题。
 
-数据面是 `GET /api/v1/*`：管理员令牌限定、分页有界、内容截断、GET 只读；唯一写操作
-是置顶/反馈。静态服务只读 `hippomind/web/` 且带 CSP、frame-ancestors、nosniff 头，
+数据面是 `GET /api/v1/*`：管理员令牌限定、分页有界、内容截断、GET 只读；写操作
+是置顶/反馈，以及事实页的「记录事实」（经 `POST /ingest` 写入带证据 claim）。
+v1.1 增加结构化活动流、运行环境卡片（Python/卷/磁盘/依赖/备份/登录项）、重复候选
+只读扫描、置顶过滤与 CSV 导出、命令面板直接检索、主题跟随系统。静态服务只读 `hippomind/web/` 且带 CSP、frame-ancestors、nosniff 头，
 页面不含 token 或账本路径。设计与接口契约见 [docs/GUI_ATLAS.md](docs/GUI_ATLAS.md)。
+
+### 环境自检与依赖
+
+`scripts/bootstrap-env.sh` 默认只检查 Python/sqlite 与是否已有 .venv；
+`scripts/bootstrap-env.sh --create` 会在 exFAT 上用 --copies 创建 .venv 并安装
+requirements.txt（需要网络）。`start-hippomind.command` 会优先使用 .venv/bin/python。
 
 ### 旧版 matplotlib 工作台
 

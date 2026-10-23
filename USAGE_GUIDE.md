@@ -16,6 +16,10 @@
 # 按需打开旧版 matplotlib GUI（保留）
 ./start-hippomind.command --gui
 
+# 检查/创建可复现 Python 环境（--create 会创建 .venv 并安装依赖）
+scripts/bootstrap-env.sh
+scripts/bootstrap-env.sh --create
+
 # 一次性安装各 Agent 的显式记忆接入；Codex 会启用原生提交 Hook
 python3 -m hippomind install-agents --agent all
 ```

@@ -235,6 +235,38 @@ function recentCard(data, context) {
   });
 }
 
+/* --------------------------------------------------------------- activity -- */
+
+function activityCard(activity, context) {
+  const items = Array.isArray(activity && activity.items) ? activity.items : [];
+  const list = el("div", { class: "va-activity" });
+  if (!items.length) {
+    list.appendChild(emptyState({
+      title: "还没有结构化事件",
+      hint: "watcher 采集到的结构化事件会出现在这里；raw/tool/system 事件不会展示。",
+      action: { label: "查看端点", icon: "agents", onClick: () => context.navigate("/agents") },
+    }));
+  } else {
+    for (const item of items.slice(0, 8)) {
+      list.appendChild(el("div", { class: "va-activity-row" },
+        el("span", { class: "va-activity-time", title: absTime(item.occurred_at) }, relTime(item.occurred_at)),
+        badge(item.event_type || "event", { tone: "neutral" }),
+        el("span", { class: "va-activity-agent" }, item.source_agent || "—"),
+        el("span", { class: "va-activity-content" }, truncate(item.content_preview || "", 140))));
+    }
+  }
+  const counts = activity && activity.counts ? activity.counts : {};
+  const summary = Object.keys(counts).slice(0, 4)
+    .map((key) => key + " " + fmtInt(counts[key])).join(" · ");
+  return card({
+    eyebrow: "ACTIVITY",
+    title: "最近活动",
+    actions: { label: "查看年轮", icon: "timeline", ghost: true, onClick: () => context.navigate("/timeline") },
+    body: el("div", {}, list,
+      summary ? el("div", { class: "va-activity-summary" }, summary) : null),
+  });
+}
+
 /* ------------------------------------------------------------ health flags -- */
 
 function healthCard(data, context) {
@@ -313,7 +345,7 @@ function emptyLedgerCard(context) {
 
 /* ------------------------------------------------------------------- paint -- */
 
-function paint(root, data, context) {
+function paint(root, data, activity, context) {
   clear(root);
   const ledger = data.ledger || {};
   root.appendChild(heroSection(data));
@@ -328,7 +360,9 @@ function paint(root, data, context) {
     sourcesCard(data)));
 
   root.appendChild(el("div", { class: "va-pulse-lower" },
-    recentCard(data, context),
+    el("div", { class: "va-pulse-main" },
+      recentCard(data, context),
+      activityCard(activity, context)),
     el("div", { class: "va-pulse-side" },
       healthCard(data, context),
       shortcutCard(context))));
@@ -345,7 +379,15 @@ export async function render(context) {
   try {
     const data = await api.get("/api/v1/overview", { days: OVERVIEW_DAYS }, { signal: context.signal });
     if (context.signal.aborted) return root;
-    paint(root, data || {}, context);
+    let activity = { items: [], counts: {} };
+    try {
+      activity = await api.get("/api/v1/events", { limit: 8 }, { signal: context.signal });
+    } catch (error) {
+      if (error && error.name === "AbortError") throw error;
+      console.warn("[atlas] pulse activity unavailable", error);
+    }
+    if (context.signal.aborted) return root;
+    paint(root, data || {}, activity || {}, context);
   } catch (error) {
     if (error && error.name === "AbortError") return root;
     clear(root);

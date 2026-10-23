@@ -6,7 +6,7 @@
    ========================================================================= */
 "use strict";
 
-import { el, clear } from "../core/dom.js";
+import { el, clear, downloadText } from "../core/dom.js";
 import { api } from "../core/api.js";
 import { absTime, fmtInt, relTime, truncate } from "../core/format.js";
 import {
@@ -14,6 +14,7 @@ import {
 } from "../components.js";
 import { icon } from "../icons.js";
 import { claimStateBadge } from "../components/inspector.js";
+import { openClaimForm } from "../components/claim-form.js";
 
 export const meta = {
   id: "facts",
@@ -174,6 +175,43 @@ function skillsList(items) {
   return el("div", { class: "vb-skills" }, items.slice(0, 100).map(skillCard));
 }
 
+function csvCell(value) {
+  return '"' + String(value === null || value === undefined ? "" : value).replace(/"/g, '""') + '"';
+}
+
+function exportFacts(payload, tab) {
+  if (!payload) return;
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  let rows = [];
+  let header = [];
+  if (tab === "skills") {
+    rows = (payload.skills && payload.skills.items) || [];
+    header = ["memory_id", "source_agent", "confidence", "created_at", "content"];
+    rows = rows.map((item) => ({ memory_id: item.memory_id, source_agent: item.source_agent,
+      confidence: item.confidence, created_at: item.created_at, content: item.content }));
+  } else if (tab === "facts") {
+    rows = (payload.facts && payload.facts.items) || [];
+    header = ["subject", "predicate", "slot_key", "value", "confidence", "source_agent", "asserted_at"];
+    rows = rows.map((item) => ({ subject: item.subject, predicate: item.predicate,
+      slot_key: item.slot_key, value: valueText(item.value), confidence: item.confidence,
+      source_agent: item.source_agent, asserted_at: item.asserted_at }));
+  } else {
+    rows = (payload.claims && payload.claims.items) || [];
+    if (tab === "conflicts") rows = rows.filter((item) => item.state !== "active");
+    header = ["subject", "predicate", "slot_key", "value", "state", "confidence",
+              "asserted_at", "memory_id", "memory_preview"];
+    rows = rows.map((item) => ({ subject: item.subject, predicate: item.predicate,
+      slot_key: item.slot_key, value: valueText(item.value), state: item.state,
+      confidence: item.confidence, asserted_at: item.asserted_at,
+      memory_id: item.memory_id, memory_preview: item.memory_preview }));
+  }
+  if (!rows.length) return;
+  const lines = [header.join(",")];
+  for (const row of rows) lines.push(header.map((key) => csvCell(row[key])).join(","));
+  downloadText("hippomind-" + tab + "-" + stamp + ".csv",
+    "\uFEFF" + lines.join("\n"), "text/csv;charset=utf-8");
+}
+
 function dataCard(title, eyebrow, body) {
   return card({ eyebrow, title, body });
 }
@@ -262,7 +300,16 @@ export async function render(context) {
       el("span", {}, "冲突 ", el("b", {}, fmtInt(claims.counts ? claims.counts.conflict : 0))),
       el("span", {}, "事实 ", el("b", {}, fmtInt((facts.items || []).length))),
       el("span", {}, "技能 ", el("b", {}, fmtInt((skills.items || []).length))),
-      el("span", { class: "vb-facts-note" }, "所有裁决/遗忘操作仅提供可复制的 CLI 命令，不在界面直接执行")));
+      el("span", { class: "vb-facts-note" }, "裁决/遗忘仍只提供可复制 CLI 命令；写入一条带证据的事实是唯一可直接执行的写操作")));
+    header.appendChild(el("div", { class: "vb-facts-actions" },
+      el("button", {
+        class: "atlas-btn atlas-btn--primary atlas-btn--sm", type: "button",
+        on: { click: () => openClaimForm({ onCreated: () => context.refresh() }) },
+      }, icon("plus", { size: 13 }), "记录事实"),
+      el("button", {
+        class: "atlas-btn atlas-btn--ghost atlas-btn--sm", type: "button",
+        on: { click: () => exportFacts(payload, activeTab) },
+      }, icon("copy", { size: 12 }), "导出 CSV")));
     paintTabs();
     paintBody();
   } catch (error) {

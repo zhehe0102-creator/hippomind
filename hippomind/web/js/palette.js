@@ -11,6 +11,7 @@ import { icon } from "./icons.js";
 import { toast } from "./components.js";
 
 let registered = [];
+let dynamicProvider = null;
 let state = null;
 
 function normalizeCommand(command, index) {
@@ -34,6 +35,7 @@ export function initPalette(options = {}) {
   registered = (Array.isArray(options.commands) ? options.commands : [])
     .filter((item) => item !== null && item !== undefined)
     .map(normalizeCommand);
+  dynamicProvider = typeof options.dynamic === "function" ? options.dynamic : null;
   if (state) render(state.input.value);
 }
 
@@ -94,9 +96,24 @@ function updateSelection(nextIndex, scroll) {
   }
 }
 
+function dynamicCommands(query) {
+  if (!dynamicProvider) return [];
+  const text = String(query || "").trim();
+  if (!text) return [];
+  try {
+    const items = dynamicProvider(text);
+    return (Array.isArray(items) ? items : [])
+      .filter((item) => item !== null && item !== undefined)
+      .map((item, index) => normalizeCommand(item, registered.length + index));
+  } catch (error) {
+    console.warn("[atlas] palette dynamic commands failed", error);
+    return [];
+  }
+}
+
 function render(query) {
   if (!state) return;
-  const filtered = filterCommands(query);
+  const filtered = filterCommands(query).concat(dynamicCommands(query));
   state.filtered = filtered;
   state.selected = 0;
   clear(state.list);

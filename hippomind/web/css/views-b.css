@@ -920,3 +920,20 @@
   .vb-graph-stage { height: 380px; }
   .vb-graph-hint { width: 100%; margin-left: 0; }
 }
+
+/* --------------------------------------- archive exports / facts actions ---- */
+.vb-toolbar-exports {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+.vb-facts-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.vb-claim-form { display: flex; flex-direction: column; gap: 14px; }
+.vb-claim-form .vb-form-grid { margin-bottom: 0; }
+.vb-claim-form .vb-form-actions { border-top: 1px solid var(--rule); padding-top: 12px; }
+@media (max-width: 760px) {
+  .vb-toolbar-exports { align-items: flex-start; }
+  .vb-facts-actions { width: 100%; }
+}

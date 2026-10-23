@@ -180,7 +180,7 @@ function buildForm(instance, onSubmit) {
     textField({
       label: "as_of（双时态切片）",
       value: state.asOf,
-      placeholder: "2026-10-21T00:00:00Z（可选）",
+      placeholder: "ISO 时间（可选）",
       monospace: true,
       hint: "留空 = 现在",
       onInput: (event, value) => { state.asOf = value; },

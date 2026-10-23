@@ -137,26 +137,36 @@ function apiTab(metaData) {
 
 function applyTheme(value) {
   store.setSetting("theme", value);
-  document.documentElement.dataset.theme = value;
+  const resolved = value === "auto"
+    ? (window.matchMedia("(prefers-color-scheme: dark)").matches ? "night" : "paper")
+    : value;
+  document.documentElement.dataset.theme = resolved;
   const button = document.getElementById("theme-btn");
   if (button) {
-    button.title = value === "night" ? "切换到纸本浅色 (T)" : "切换到夜档深色 (T)";
+    button.title = value === "auto"
+      ? "主题：跟随系统（点击切换）"
+      : resolved === "night" ? "切换到纸本浅色 (T)" : "切换到夜档深色 (T)";
   }
 }
 
 function settingsTab(context) {
   const settings = store.get("settings");
-  const theme = settings.theme === "night" ? "night" : "paper";
+  const theme = settings.theme === "night" ? "night" : settings.theme === "auto" ? "auto" : "paper";
   const refreshSeconds = Math.round((Number(settings.refreshMs) || 30000) / 1000);
   const pageSize = Number(settings.pageSize) || 50;
 
   const themeControl = segmented({
-    options: [{ value: "paper", label: "纸本 paper" }, { value: "night", label: "夜档 night" }],
+    options: [
+      { value: "paper", label: "纸本 paper" },
+      { value: "night", label: "夜档 night" },
+      { value: "auto", label: "跟随系统" },
+    ],
     value: theme,
     label: "主题",
     onChange: (value) => {
       applyTheme(value);
-      context.toast("主题已切换为" + (value === "night" ? "夜档" : "纸本"), { tone: "ok", ms: 1600 });
+      context.toast("主题已切换为" + (value === "night" ? "夜档" : value === "auto" ? "跟随系统" : "纸本"),
+        { tone: "ok", ms: 1600 });
     },
   });
 
@@ -213,7 +223,7 @@ function settingsTab(context) {
   const ledgerId = current.meta && current.meta.ledger_id ? String(current.meta.ledger_id) : "";
 
   const preferences = el("div", { class: "va-settings" },
-    settingRow("主题", "纸本为默认；夜档为低光环境准备", themeControl),
+    settingRow("主题", "纸本为默认；夜档为低光环境；跟随系统会随 macOS 外观切换", themeControl),
     settingRow("刷新间隔", "daemon 状态与当前视图的心跳周期", refreshControl),
     settingRow("每页条数", "记忆库 / 检索等分页视图的默认每页数量", pageSizeControl),
     settingRow("访问令牌", "令牌只保存在当前浏览器 localStorage",

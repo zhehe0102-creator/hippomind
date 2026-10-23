@@ -6,7 +6,7 @@
    ========================================================================= */
 "use strict";
 
-import { el, clear } from "../core/dom.js";
+import { el, clear, downloadText } from "../core/dom.js";
 import { api } from "../core/api.js";
 import { store } from "../core/store.js";
 import { absTime, fmtInt, relTime } from "../core/format.js";
@@ -60,6 +60,7 @@ function readState(params) {
     to: params.get("to") || "",
     raw: RAW_MODES.some((mode) => mode.value === raw) ? raw : "exclude",
     sort: SORTS.some((item) => item.value === sort) ? sort : "updated",
+    pinned: params.get("pinned") === "1",
     offset: Math.max(0, Number(params.get("offset")) || 0),
     limit: PAGE_SIZES.includes(pageSize) ? pageSize : 50,
     focus: params.get("focus") || "",
@@ -73,6 +74,7 @@ function buildQuery(state) {
   }
   if (state.raw !== "exclude") query.raw = state.raw;
   if (state.sort !== "updated") query.sort = state.sort;
+  if (state.pinned) query.pinned = "1";
   if (state.offset > 0) query.offset = String(state.offset);
   return query;
 }
@@ -98,6 +100,7 @@ function buildParams(state) {
   if (state.project) params.project = state.project;
   if (state.from) params.from = state.from;
   if (state.to) params.to = state.to;
+  if (state.pinned) params.pinned = "1";
   return params;
 }
 
@@ -201,8 +204,22 @@ function buildToolbar(instance) {
       (value) => apply(instance, { raw: value, offset: 0 })),
     segmentedField("排序", SORTS, state.sort,
       (value) => apply(instance, { sort: value, offset: 0 })),
+    segmentedField("置顶", [{ value: "", label: "全部" }, { value: "1", label: "仅置顶" }],
+      state.pinned ? "1" : "",
+      (value) => apply(instance, { pinned: value === "1", offset: 0 })),
   );
   toolbar.appendChild(filters);
+  const exportGroup = el("div", { class: "vb-toolbar-exports" },
+    el("span", { class: "atlas-field-label" }, "导出当前页"),
+    el("button", {
+      class: "atlas-btn atlas-btn--ghost atlas-btn--sm", type: "button",
+      on: { click: () => exportArchive(instance, "csv") },
+    }, icon("copy", { size: 12 }), "CSV"),
+    el("button", {
+      class: "atlas-btn atlas-btn--ghost atlas-btn--sm", type: "button",
+      on: { click: () => exportArchive(instance, "json") },
+    }, icon("copy", { size: 12 }), "JSON"));
+  toolbar.appendChild(exportGroup);
 
   toolbar.appendChild(el("div", { class: "vb-note" },
     icon("info", { size: 13 }),
@@ -210,6 +227,34 @@ function buildToolbar(instance) {
       "默认不含 raw 原始聊天（raw_chat=0）：原始证据只用于审计与取证，不进入日常浏览。",
       "这是有意的隐私选择，需要时可切换到「包含 / 仅原始」。")));
   return toolbar;
+}
+
+function csvCell(value) {
+  return '"' + String(value === null || value === undefined ? "" : value).replace(/"/g, '""') + '"';
+}
+
+function exportArchive(instance, format) {
+  const data = instance.lastData || {};
+  const items = Array.isArray(data.items) ? data.items : [];
+  if (!items.length) {
+    instance.context.toast("当前页没有可导出的记忆", { tone: "warn" });
+    return;
+  }
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  if (format === "json") {
+    downloadText("hippomind-archive-" + stamp + ".json",
+      JSON.stringify(items, null, 2), "application/json;charset=utf-8");
+  } else {
+    const header = ["memory_id", "kind", "lifecycle", "source_agent", "created_at",
+                    "updated_at", "weight", "pinned", "content"];
+    const lines = [header.join(",")];
+    for (const row of items) {
+      lines.push(header.map((key) => csvCell(key === "content" ? row.content : row[key])).join(","));
+    }
+    downloadText("hippomind-archive-" + stamp + ".csv",
+      "\uFEFF" + lines.join("\n"), "text/csv;charset=utf-8");
+  }
+  instance.context.toast("已导出当前页 " + items.length + " 条记忆", { tone: "ok" });
 }
 
 function contentCell(row) {
@@ -384,6 +429,7 @@ async function load(instance, options = {}) {
   try {
     const data = await api.get("/api/v1/memories", buildParams(state), { signal: context.signal });
     if (instance.destroyed) return;
+    instance.lastData = data || {};
     if (data && data.facets) instance.facets = data.facets;
     if (options.silent) renderBodyOnly(instance, data || {});
     else renderFull(instance, data || {});

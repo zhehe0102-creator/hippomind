@@ -224,15 +224,30 @@ function buildNav() {
   }
 }
 
+function resolveTheme() {
+  const setting = store.get("settings").theme;
+  if (setting === "night") return "night";
+  if (setting === "paper") return "paper";
+  try {
+    return window.matchMedia("(prefers-color-scheme: dark)").matches ? "night" : "paper";
+  } catch (error) {
+    return "paper";
+  }
+}
+
 function applyTheme() {
-  const theme = store.get("settings").theme === "night" ? "night" : "paper";
+  const theme = resolveTheme();
   document.documentElement.dataset.theme = theme;
   const button = $("#theme-btn");
-  if (button) button.title = theme === "night" ? "切换到纸本浅色 (T)" : "切换到夜档深色 (T)";
+  if (button) {
+    button.title = store.get("settings").theme === "auto"
+      ? "主题：跟随系统（点击切换）"
+      : theme === "night" ? "切换到纸本浅色 (T)" : "切换到夜档深色 (T)";
+  }
 }
 
 function toggleTheme() {
-  const next = store.get("settings").theme === "night" ? "paper" : "night";
+  const next = resolveTheme() === "night" ? "paper" : "night";
   store.setSetting("theme", next);
   applyTheme();
 }
@@ -274,9 +289,41 @@ function bindGlobalSurface() {
     if (key === "t") { event.preventDefault(); toggleTheme(); }
     if (key === "?") {
       event.preventDefault();
-      toast("⌘K 命令 · 1–0 切换视图 · R 刷新 · T 主题 · Esc 关闭", { tone: "info", ms: 4200 });
+      showHelp();
     }
   });
+}
+
+function helpRow(keys, description) {
+  return el("div", { class: "va-help-row" },
+    el("kbd", {}, keys), el("span", {}, description));
+}
+
+function showHelp() {
+  const content = el("div", { class: "va-help" },
+    el("p", { class: "va-note" }, "HippoMind Atlas · 本地记忆控制台"),
+    helpRow("⌘K", "命令面板；输入关键词可直接检索记忆"),
+    helpRow("1–0", "切换十个视图"),
+    helpRow("R", "刷新当前视图"),
+    helpRow("T", "切换纸本 / 夜档主题（设置页可选跟随系统）"),
+    helpRow("?", "打开本帮助"),
+    helpRow("Esc", "关闭抽屉 / 命令面板"),
+    el("p", { class: "va-note" }, "接口为同源 /api/v1（管理员令牌）；设计说明见 docs/GUI_ATLAS.md。"));
+  drawer.open({ title: "快捷键与帮助", eyebrow: "HELP", content,
+    actions: [{ label: "关闭", onClick: () => drawer.close() }] });
+}
+
+function paletteDynamicCommands(query) {
+  const text = String(query || "").trim();
+  if (!text) return [];
+  return [
+    { id: "search:recall", label: "在记忆中搜索「" + text + "」", hint: "RECALL",
+      keywords: "search recall memory 检索",
+      run: () => router.navigate("/recall?q=" + encodeURIComponent(text)) },
+    { id: "search:archive", label: "在记忆库中过滤「" + text + "」", hint: "ARCHIVE",
+      keywords: "archive filter 记忆库",
+      run: () => router.navigate("/archive?q=" + encodeURIComponent(text)) },
+  ];
 }
 
 function registerCommands() {
@@ -296,8 +343,9 @@ function registerCommands() {
         const ok = await copyText("~/Library/Application Support/HippoMind/hippomindd.token");
         toast(ok ? "令牌文件路径已复制" : "复制失败，请手动选择", { tone: ok ? "ok" : "warn" });
       } },
+    { id: "action:help", label: "快捷键与帮助", hint: "?", run: showHelp },
   );
-  initPalette({ commands });
+  initPalette({ commands, dynamic: paletteDynamicCommands });
 }
 
 /* ------------------------------- bootstrap ----------------------------- */
@@ -336,6 +384,14 @@ async function boot() {
   }
 
   initConnect({ onConnected: async () => { await ping(); await renderRoute(router.parse()); } });
+  try {
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    if (media && typeof media.addEventListener === "function") {
+      media.addEventListener("change", () => {
+        if (store.get("settings").theme === "auto") applyTheme();
+      });
+    }
+  } catch (error) { /* matchMedia unavailable */ }
   scheduleHeartbeat();
   router.start((route) => { renderRoute(route); });
   ping();

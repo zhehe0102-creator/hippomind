@@ -348,6 +348,56 @@ class GuiApiTests(unittest.TestCase):
         self.assertEqual(1.0, detail["feedback"][0]["signal"])
 
     # ------------------------------------------------------------------
+    # environment / activity / pins / duplicates
+    # ------------------------------------------------------------------
+    def test_environment_endpoint(self):
+        env = self.get("/api/v1/environment")
+        self.assertEqual("Darwin" if sys.platform == "darwin" else env["platform"]["system"],
+                         env["platform"]["system"])
+        self.assertTrue(env["platform"]["python"])
+        self.assertTrue(env["platform"]["python_executable"])
+        self.assertIn("disk", env["workspace"])
+        self.assertGreaterEqual(env["ledger"]["events"], 1)
+        self.assertGreaterEqual(env["ledger"]["memories"], 8)
+        self.assertEqual(8, env["ledger"]["schema_version"])
+        self.assertIn("matplotlib", env["dependencies"])
+        self.assertIn("sqlite", env["dependencies"])
+        ids = {item["id"] for item in env["checks"]}
+        self.assertTrue({"python", "disk", "backup", "journal"}.issubset(ids))
+        self.assertGreaterEqual(env["daemon"]["port"], 1)
+        self.assertIn("/ui/", env["daemon"]["ui_url"])
+
+    def test_events_are_structured_and_filterable(self):
+        events = self.get("/api/v1/events?limit=50")
+        self.assertTrue(events["items"])
+        self.assertTrue(events["counts"])
+        excluded = {"raw_chat", "tool_output", "system_message"}
+        self.assertFalse({item["event_type"] for item in events["items"]} & excluded)
+        progress = self.get("/api/v1/events?type=progress&limit=10")
+        self.assertTrue(progress["items"])
+        self.assertTrue(all(item["event_type"] == "progress" for item in progress["items"]))
+        self.assertTrue(all("content_preview" in item for item in progress["items"]))
+
+    def test_pins_and_pinned_filter(self):
+        pinned = self.post("/api/v1/pin", {"memory_id": self.ids["child"], "pinned": True})
+        self.assertTrue(pinned["pinned"])
+        pins = self.get("/api/v1/pins")
+        self.assertIn(self.ids["child"], [item["memory_id"] for item in pins["items"]])
+        self.assertGreaterEqual(pins["total"], 1)
+        filtered = self.get("/api/v1/memories?pinned=1&limit=50")
+        self.assertGreaterEqual(filtered["total"], 1)
+        self.assertTrue(all(item["pinned"] for item in filtered["items"]))
+        self.assertIn(self.ids["child"], [item["memory_id"] for item in filtered["items"]])
+        self.post("/api/v1/pin", {"memory_id": self.ids["child"], "pinned": False})
+
+    def test_duplicates_endpoint(self):
+        report = self.get("/api/v1/duplicates?limit=10&sample=200&min_similarity=0.85")
+        self.assertIn("pairs", report)
+        self.assertIn("scanned", report)
+        self.assertIn("suggestions", report)
+        self.assertIsInstance(report["pairs"], list)
+
+    # ------------------------------------------------------------------
     # UI bootstrap nonce
     # ------------------------------------------------------------------
     def test_ui_token_flow_is_single_use(self):
