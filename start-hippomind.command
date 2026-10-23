@@ -56,4 +56,4 @@ if [[ "$OPEN_GUI" -eq 1 || "$OPEN_NETWORK" -eq 1 ]]; then
   exec "$PYTHON_BIN" -m hippomind.main --one-click
 fi
 
-echo "HippoMind Memory Hub 已运行。使用 '$0 --web' 打开 Web 控制台，旧版可视化用 --gui/--network。"
+echo "HippoMind Memory Hub 已运行。双击 HippoMind Atlas.app 打开 Web 控制台；命令行用 '$0 --web'，旧版可视化用 --gui/--network。"

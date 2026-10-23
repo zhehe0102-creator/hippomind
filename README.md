@@ -287,6 +287,12 @@ daemon 在 **http://127.0.0.1:8765/ui** 同源提供新的 Web 控制台。它�
 依赖（原生 ES Modules），视觉是纸本档案馆风格：浅色纸底 + 墨色排版 + 朱砂信号色，
 可切换 night 深色；衬线标题、等宽数据、索引编号与细线表格取代了旧版的玻璃拟态。
 
+### 双击打开（推荐）
+
+在工作区根目录双击 **`HippoMind Atlas.app`**（或 **`打开 HippoMind Atlas.command`**）：
+它会自动启动/复用本地 daemon、申请一次性令牌并打开浏览器控制台；失败时会弹出
+日志路径。首次被 macOS 拦截时，右键应用 →「打开」。
+
 ```bash
 ./start-hippomind.command --web   # 启动并打开控制台
 python3 -m hippomind ui           # 或由 CLI 打开（一次性令牌，120s 单次有效）

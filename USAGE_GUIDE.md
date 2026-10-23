@@ -10,7 +10,8 @@
 # 默认只启动/复用后台服务和低频 watcher
 ./start-hippomind.command
 
-# 打开 Web 控制台（HippoMind Atlas，推荐）
+# 最简单：双击工作区根目录的 HippoMind Atlas.app（或 打开 HippoMind Atlas.command）
+# 也可用命令行：
 ./start-hippomind.command --web
 
 # 按需打开旧版 matplotlib GUI（保留）

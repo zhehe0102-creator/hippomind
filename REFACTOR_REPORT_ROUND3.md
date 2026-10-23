@@ -140,3 +140,25 @@ scripts/bootstrap-env.sh --create
 - `d57fc04` docs(gui): record the Atlas redesign and its measured acceptance
 
 回滚：`git revert 6c6fd60` 回到 v1.0；数据无迁移（schema 仍为 v8）。
+
+
+## 十、一键打开（本轮新增）
+
+用户反馈「打不开」，因此本轮把启动路径做成真正的一键：
+
+- 工作区根目录新增 **`HippoMind Atlas.app`**：双击后自动确保 daemon 运行、
+  申请一次性令牌并打开浏览器控制台；失败时弹出原生对话框并指向日志
+  `~/Library/Logs/HippoMind-Atlas.log`。应用有 AppIcon、Info.plist，并做了
+  ad-hoc codesign。
+- 新增 **`打开 HippoMind Atlas.command`**：Finder 双击即可（会打开 Terminal 执行同一
+  脚本），适合不想用 .app 或 macOS 拦截应用时使用。
+- 共享逻辑在 `scripts/launch-atlas.sh`：优先 .venv/bin/python，回退 /usr/bin/python3；
+  先检查/启动 daemon，再用 `hippomind ui --no-open` 拿一次性 URL，最后 `open`；
+  支持 `HIPPOMIND_LAUNCH_DRY_RUN=1` 做无副作用自检。
+- 为什么 .app 通过 Terminal 启动：本工作区在外置卷，macOS 会阻止直接放在可移动卷上的
+  应用执行卷内脚本（实测 LaunchServices 以 exit 126 退出）；把 .command 交给 Terminal
+  是用户已授权、且不依赖后台任务读取外置卷的可靠路径。
+
+实测：`open "HippoMind Atlas.app"` 后日志出现 app bundle → Terminal → launch 记录，
+一次性 URL 生成成功；`open "打开 HippoMind Atlas.command"` 同样成功；两者都只读打开
+控制台，不写账本。

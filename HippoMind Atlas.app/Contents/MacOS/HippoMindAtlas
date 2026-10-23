@@ -1,0 +1,21 @@
+#!/bin/bash
+# HippoMind Atlas.app launcher.
+# LaunchServices may sandbox an app living on a removable volume; executing a
+# script from that volume directly can fail with 126.  Hand the .command file to
+# Terminal through LaunchServices instead: Terminal already has the user's TCC
+# access to the workspace.
+set -u
+ROOT="/Volumes/移动硬盘/记忆系统重构"
+LOG="$HOME/Library/Logs/HippoMind-Atlas.log"
+mkdir -p "$HOME/Library/Logs" 2>/dev/null || true
+{
+  echo ""
+  echo "=== $(date '+%Y-%m-%d %H:%M:%S') app bundle -> Terminal ==="
+  echo "root=$ROOT"
+} >> "$LOG" 2>&1
+if [ ! -f "$ROOT/打开 HippoMind Atlas.command" ]; then
+  echo "missing command file" >> "$LOG" 2>&1
+  /usr/bin/osascript -e 'display dialog "找不到启动脚本，工作区可能已移动。请打开工作区里的 打开 HippoMind Atlas.command。" buttons {"好"} default button 1 with title "HippoMind Atlas"' >/dev/null 2>&1 || true
+  exit 1
+fi
+exec /usr/bin/open "$ROOT/打开 HippoMind Atlas.command"

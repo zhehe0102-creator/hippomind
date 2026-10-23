@@ -33,6 +33,10 @@ Agent-Chat-Archive watcher (低频增量游标，原始聊天只作证据)
 ./start-hippomind.command
 ```
 
+最简单的方式是双击工作区根目录的 **`HippoMind Atlas.app`**（或
+`打开 HippoMind Atlas.command`）：脚本会启动/复用 daemon、申请一次性令牌并打开
+Web 控制台。首次被 macOS 拦截时右键应用 →「打开」。
+
 它会启动或复用 daemon 和 watcher，但不会打开 GUI。按需打开中文层状网络：
 
 ```bash
