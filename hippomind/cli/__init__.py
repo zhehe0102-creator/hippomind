@@ -491,6 +491,7 @@ from .cmd_read import (  # noqa: E402  (re-exports follow the helpers they feed)
 from .cmd_data import cmd_export as cmd_export, cmd_import as cmd_import  # noqa: E402  (re-exports follow the helpers they feed)
 from .cmd_distill import (  # noqa: E402  (re-exports follow the helpers they feed)
     cmd_digest as cmd_digest, cmd_distill as cmd_distill,
+    cmd_semantic_build as cmd_semantic_build,
     cmd_sync_transcripts as cmd_sync_transcripts,
 )
 from .cmd_ui import cmd_ui as cmd_ui  # noqa: E402  (re-exports follow the helpers they feed)

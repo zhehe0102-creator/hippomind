@@ -67,6 +67,23 @@ def cmd_digest(args) -> int:
     return 0
 
 
+def cmd_semantic_build(args) -> int:
+    from . import _paths, _print
+    from ..ledger import SQLiteLedger
+    from ..semantic_space import build, save
+
+    paths = _paths(args)
+    ledger = SQLiteLedger(paths.ledger_path)
+    model = build(ledger, dim=int(getattr(args, "dim", 128) or 128))
+    if not model.get("vectors"):
+        _print({"built": False, "reason": model.get("reason", "empty corpus")})
+        return 1
+    target = save(model)
+    _print({"built": True, "path": str(target), "docs": model["docs"],
+            "terms": len(model["terms"]), "dim": model["dim"]})
+    return 0
+
+
 def cmd_sync_transcripts(args) -> int:
     from . import _paths, _print
     from ..ledger import SQLiteLedger

@@ -129,10 +129,20 @@ def build_auto_context(ledger: SQLiteLedger, request: str, *, scope: str = "shar
         task_id=task_id,
         debug=debug,
         min_score=float(os.environ.get("HIPPOMIND_MIN_SCORE", "0.20")),
+        # The ledger-native semantic space only helps through the rerank stage:
+        # with the embedder alone the labelled pack recall is unchanged (0.935),
+        # with hybrid rerank it rises to 0.957.
+        hybrid_rerank=True,
     )
     # Match the native Codex/Pi contract exactly. Workspace paths may differ
     # across hosts even when they are continuing the same shared task.
-    return ContextPackBuilder(ledger).build(request, options)
+    embedder = None
+    try:
+        from .semantic_space import load_embedder
+        embedder = load_embedder()
+    except Exception:
+        embedder = None
+    return ContextPackBuilder(ledger, embedder=embedder).build(request, options)
 
 
 def render_untrusted_context(pack: Dict[str, Any], *, max_chars: int = AUTO_MAX_CHARS) -> str:

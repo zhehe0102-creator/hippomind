@@ -30,7 +30,7 @@
   （`memories` 表）可随时从事件重建——改错可回滚，历史不可篡改。
 - **单文件部署**：整个记忆就是一个 `.sqlite` 文件（+wal/shm），备份=复制文件。
 
-## 3. CLI 全部子命令（41 个）
+## 3. CLI 全部子命令（42 个）
 
 ### 3.1 生命周期
 | 命令 | 干什么 | 典型用法 |
@@ -85,6 +85,7 @@
 | `sync-transcripts` | 增量采集 Claude/Codex 原生 JSONL 会话到账本（自动循环的 CLI 入口） |
 | `distill` | 自动提炼会话证据为 claims；`--provider auto|claude|heuristic`，`--dry-run` |
 | `digest` | 按会话生成摘要，一次性消化整段 raw 会话；`--limit`、`--min-messages`、`--dry-run` |
+| `semantic-build` | 用账本自身拟合 LSA 语义空间（numpy SVD），写入 `semantic_space.json` |
 
 ## 4. MCP 工具（11 个，给 AI Agent 用）
 

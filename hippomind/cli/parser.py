@@ -16,7 +16,7 @@ from .cmd_lifecycle import (
     cmd_doctor, cmd_init, cmd_login_install, cmd_login_remove, cmd_monitor, cmd_start, cmd_status, cmd_stop,
     cmd_version,
 )
-from .cmd_distill import cmd_digest, cmd_distill, cmd_sync_transcripts
+from .cmd_distill import cmd_digest, cmd_distill, cmd_semantic_build, cmd_sync_transcripts
 from .cmd_maintain import (
     cmd_backup, cmd_checkup, cmd_maintain, cmd_recovery_check, cmd_redact_raw, cmd_restore, cmd_scan_raw,
 )
@@ -246,6 +246,11 @@ def build_parser() -> argparse.ArgumentParser:
     digest.add_argument("--drain", action="store_true", help="循环处理直到积压清空")
     digest.add_argument("--max-batches", type=int, default=40)
     digest.set_defaults(func=cmd_digest)
+
+    semantic = sub.add_parser("semantic-build", help="用账本自身拟合 LSA 语义空间")
+    _connection_arguments(semantic)
+    semantic.add_argument("--dim", type=int, default=128)
+    semantic.set_defaults(func=cmd_semantic_build)
 
     watch = sub.add_parser("watch", help="以低频游标方式持续采集归档")
     _connection_arguments(watch)
