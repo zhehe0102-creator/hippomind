@@ -90,6 +90,14 @@ def build_hook_response(payload: Mapping[str, Any], *, agent_config: str,
         return None
     if not context:
         return None
+    if os.environ.get("HIPPOMIND_INJECTION_TRACE", "1") != "0" and (
+            trigger_mode == "always" or os.environ.get("HIPPOMIND_AUTO_INJECT") == "always"):
+        try:
+            from .injection_trace import record
+            record(agent="codex", query=request, context=context,
+                   item_count=len(pack.get("items", [])), source="codex-hook")
+        except Exception:
+            pass
     return {
         "hookSpecificOutput": {
             "hookEventName": HOOK_EVENT_NAME,

@@ -137,6 +137,9 @@ class ContextPackOptions:
     # 混合重排通道：需要 builder 持有一个 embedder 才真正生效（否则空转）。
     # 默认关——A/B 实测四类指标持平但无提升，见 HybridWeights 注释。
     hybrid_rerank: bool = False
+    # 自动注入的相关性门控：低于该分数的候选直接丢弃，避免把无关历史塞进
+    # 每一轮 prompt。0 表示关闭（显式 API 调用保持旧行为）。
+    min_score: float = 0.0
 
     def normalise(self) -> "ContextPackOptions":
         self.max_items = max(1, min(16, int(self.max_items)))
@@ -157,6 +160,10 @@ class ContextPackOptions:
             self.max_block_chars = max(200, min(2_000, int(self.max_block_chars)))
         except (TypeError, ValueError):
             self.max_block_chars = 520
+        try:
+            self.min_score = min(1.0, max(0.0, float(self.min_score)))
+        except (TypeError, ValueError):
+            self.min_score = 0.0
         return self
 
 
@@ -984,7 +991,7 @@ class ContextPackBuilder:
                      # 折叠/混合重排开关必须进缓存键：否则同一 query 在两种配置
                      # 之间切换时会命中上一次的缓存包，A/B 对比直接失真
                      # （实测会把 fold=False 的结果当成 fold=True 返回）。
-                     options.fold_duplicates, options.hybrid_rerank,
+                     options.fold_duplicates, options.hybrid_rerank, options.min_score,
                      id(self.embedder) if self.embedder is not None else None)
         cached = self._cached(cache_key)
         if cached is not None:
@@ -1044,6 +1051,9 @@ class ContextPackBuilder:
             )
         if candidates:
             candidates = self._associative_candidates(candidates, options)
+        if options.min_score > 0 and candidates:
+            candidates = [candidate for candidate in candidates
+                          if float(candidate.get("score", 0.0)) >= options.min_score]
         candidate_debug = [{
             "memory_id": str(candidate.get("memory_id", "")),
             "kind": str(candidate.get("kind", "")),

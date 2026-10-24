@@ -365,6 +365,7 @@ class HubClient {
           max_chars: payloadChars,
           raw_chat: false,
           require_evidence: true,
+          min_score: 0.20,
           scope: "shared",
         },
       },

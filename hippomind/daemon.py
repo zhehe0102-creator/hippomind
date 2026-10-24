@@ -764,6 +764,8 @@ class MemoryHubRequestHandler(BaseHTTPRequestHandler):
             to_time=raw.get("to_time", data.get("to_time", "")),
             as_of=raw.get("as_of", data.get("as_of", "")),
             debug=bool(raw.get("debug", data.get("debug", False))),
+            min_score=raw.get("min_score", data.get("min_score",
+                float(os.environ.get("HIPPOMIND_MIN_SCORE", "0")))),
         )
 
     @staticmethod

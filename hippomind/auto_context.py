@@ -128,6 +128,7 @@ def build_auto_context(ledger: SQLiteLedger, request: str, *, scope: str = "shar
         project=project,
         task_id=task_id,
         debug=debug,
+        min_score=float(os.environ.get("HIPPOMIND_MIN_SCORE", "0.20")),
     )
     # Match the native Codex/Pi contract exactly. Workspace paths may differ
     # across hosts even when they are continuing the same shared task.

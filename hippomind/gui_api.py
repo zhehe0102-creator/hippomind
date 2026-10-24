@@ -915,6 +915,17 @@ class GuiApi:
                            distill.get("distilled", 0))) if distill else "等待首次提炼",
                        "fix": ({"label": "手动提炼", "command": "hippomind distill --limit 16"}
                                if distill_error else None)})
+        try:
+            from .injection_trace import summary as injection_summary
+            injection = injection_summary()
+        except Exception:
+            injection = {"count": 0, "injected": 0, "last_at": ""}
+        checks.append({"id": "injection", "label": "自动注入",
+                       "severity": "ok",
+                       "detail": ("最近 %s 次注入 · %s 次实际注入 · 最近 %s" % (
+                           injection.get("count", 0), injection.get("injected", 0),
+                           injection.get("last_at", "") or "尚未记录")),
+                       "fix": None})
         quarantine = int(overview.get("quarantined", 0) or 0)
         checks.append({"id": "privacy", "label": "隐私面",
                        "severity": "warn" if tool_output else "ok",
