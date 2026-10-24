@@ -36,6 +36,10 @@ function installTone(state) {
   return "neutral";
 }
 
+function dot(tone) {
+  return el("span", { class: "va-dot tone-" + tone });
+}
+
 function trustTone(value) {
   const trust = Number(value);
   if (!Number.isFinite(trust)) return "neutral";
@@ -119,6 +123,86 @@ function metricBand(data) {
       small: true,
       hint: "未撤销的 Agent 凭据总数",
     }));
+}
+
+/* ------------------------------------------------------------- automation -- */
+
+/* /api/v1/agents is the endpoint page, and the automatic loop is what turns
+   these sources into memory. The strip summarises the two loops this payload
+   can actually evidence — the capture cursors per source and the injection
+   switch — plus the discovery scan that decides which sources exist at all.
+   Nothing here is invented: each cell states the endpoint field it reads. */
+function automationBand(data) {
+  const cursors = Array.isArray(data.cursors) ? data.cursors : [];
+  const failing = cursors.filter((row) => row && row.last_error);
+  const healthy = cursors.length - failing.length;
+  const newest = cursors.reduce((latest, row) => {
+    const stamp = Date.parse((row && (row.last_success_at || row.updated_at)) || "");
+    return Number.isFinite(stamp) && stamp > latest ? stamp : latest;
+  }, 0);
+  const injection = data.injection && typeof data.injection === "object" ? data.injection : {};
+  const discovery = data.discovery && typeof data.discovery === "object" ? data.discovery : {};
+  const detected = Array.isArray(discovery.known_detected) ? discovery.known_detected : [];
+  const absent = Array.isArray(discovery.known_absent) ? discovery.known_absent : [];
+  const agents = Array.isArray(data.agents) ? data.agents : [];
+  const seenRecently = agents.filter((row) => {
+    const stamp = Date.parse((row && row.last_seen) || "");
+    return Number.isFinite(stamp) && (Date.now() - stamp) / 86400000 <= 1;
+  }).length;
+
+  const cells = [
+    {
+      eyebrow: "CAPTURE",
+      label: "采集游标",
+      tone: failing.length ? "warn" : (cursors.length ? "ok" : "neutral"),
+      primary: cursors.length ? fmtInt(healthy) : "—",
+      unit: cursors.length ? "/ " + fmtInt(cursors.length) + " 个健康" : "",
+      detail: failing.length
+        ? fmtInt(failing.length) + " 个游标最近失败 · " + truncate(String(failing[0].last_error || ""), 40)
+        : (newest ? "最近成功 " + relTime(new Date(newest).toISOString()) : "还没有游标记录"),
+      title: failing.length
+        ? "失败的游标：" + failing.slice(0, 3).map((row) => String(row.source_id || "")).join("、")
+        : "所有采集游标最近一次增量同步都成功",
+    },
+    {
+      eyebrow: "SOURCES",
+      label: "接入来源",
+      tone: seenRecently ? "ok" : "neutral",
+      primary: fmtInt(agents.length),
+      unit: "个 Agent",
+      detail: fmtInt(seenRecently) + " 个今日活跃 · 发现 " + fmtInt(detected.length)
+        + (absent.length ? " · 缺失 " + fmtInt(absent.length) : ""),
+      title: "已检测：" + (detected.slice(0, 8).join("、") || "无")
+        + (absent.length ? "；未检测：" + absent.slice(0, 8).join("、") : ""),
+    },
+    {
+      eyebrow: "INJECTION",
+      label: "自动注入",
+      tone: injection.enabled ? "ok" : "warn",
+      primary: injection.enabled ? "开启" : "关闭",
+      unit: injection.agent ? "agent=" + injection.agent : "",
+      detail: injection.enabled
+        ? "相关性门槛通过后才注入上下文"
+        : "自动注入已关闭，Agent 会话不会收到上下文",
+      title: "注入开关来源：/api/v1/agents · injection"
+        + (injection.path ? "（" + injection.path + "）" : ""),
+    },
+  ];
+
+  return el("div", { class: "va-auto-band", role: "group", "aria-label": "自动记忆环路状态" },
+    el("div", { class: "va-auto-band-head" },
+      el("span", { class: "eyebrow" }, "AUTOMATION LOOP"),
+      el("span", { class: "va-auto-band-note" }, "采集游标 → 提炼 → 注入；每项均取自本页端点")),
+    el("div", { class: "va-auto-band-cells" },
+      ...cells.map((cell) => el("div", { class: "va-auto-band-cell", dataset: { tone: cell.tone } },
+        el("div", { class: "va-auto-band-cell-head" },
+          dot(cell.tone),
+          el("span", { class: "va-auto-band-eyebrow" }, cell.eyebrow),
+          el("span", { class: "va-auto-band-label" }, cell.label)),
+        el("div", { class: "va-auto-band-figure" },
+          el("b", {}, cell.primary),
+          cell.unit ? el("span", { class: "va-auto-band-unit" }, cell.unit) : null),
+        el("div", { class: "va-auto-band-detail", title: cell.title }, truncate(cell.detail, 90))))));
 }
 
 /* ------------------------------------------------------------------ tables -- */
@@ -303,6 +387,7 @@ function refreshButton(context) {
 function paint(root, data, context) {
   clear(root);
   root.appendChild(metricBand(data));
+  root.appendChild(automationBand(data));
   root.appendChild(sectionTitle("Agent 总览", {
     hint: "来源、游标、发现与自动安装状态均由 daemon 实时提供",
     actions: refreshButton(context),

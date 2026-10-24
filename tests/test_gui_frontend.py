@@ -132,6 +132,26 @@ NIGHT_TOKENS = {
 
 OLD_OBSERVATORY_FILES = ["app.css", "app.js"]
 
+#: The v2 automatic memory loop is surfaced in three places. The daemon reports
+#: one health check per stage (id capture/distill/injection); the GUI must render
+#: all three with their severity and detail, and a compact strip must exist on
+#: the pulse/agents views using only already-documented endpoints.
+AUTOMATION_CHECK_IDS = ["capture", "distill", "injection"]
+AUTOMATION_VIEWS = ["pulse", "agents", "health"]
+
+#: Every endpoint a view may call. Adding a new one is a backend change and
+#: belongs to whoever owns the API contract, never to a view.
+DOCUMENTED_ENDPOINTS = {
+    "/api/v1/meta", "/api/v1/overview", "/api/v1/memories",
+    "/api/v1/memories/", "/api/v1/timeline", "/api/v1/claims",
+    "/api/v1/conflicts", "/api/v1/facts", "/api/v1/skills",
+    "/api/v1/subjects", "/api/v1/graph", "/api/v1/agents",
+    "/api/v1/health", "/api/v1/environment", "/api/v1/events",
+    "/api/v1/pins", "/api/v1/duplicates", "/api/v1/pin",
+    "/api/v1/feedback", "/api/v1/ui-token", "/api/v1/ui-token/exchange",
+}
+API_PATH_RE = re.compile(r"""["'`](/api/v1/[A-Za-z0-9_\-/]*)""")
+
 EXTERNAL_URL_RE = re.compile(r"""(?:\b(?:href|src)\s*=\s*["']\s*(?:https?:)?//)|"""
                              r"""(?:url\(\s*["']?\s*(?:https?:)?//)|"""
                              r"""(?:\bfrom\s*["'](?:https?:)?//)|"""
@@ -473,6 +493,107 @@ class GuiFrontendStaticTests(unittest.TestCase):
             if not re.search(pattern, text):
                 missing.append(name)
         self.assertEqual(missing, [], "js/icons.js 缺少契约图标名: " + ", ".join(missing))
+
+    # ---------------------------------------------------------- automation --
+    #
+    # task-10: the GUI must show the v2 automatic memory loop. These checks are
+    # static on purpose: they pin the contract (the three health check ids are
+    # consumed, the strip exists, no new endpoint appears) without needing a
+    # daemon, so they run in the ordinary unit-test gate.
+
+    def test_health_view_consumes_automation_check_ids(self):
+        path = web_path("js/views/health.js")
+        self.assertTrue(path.exists(), "缺少 js/views/health.js（views-a 负责）")
+        text = read_text(path)
+        for check_id in AUTOMATION_CHECK_IDS:
+            with self.subTest(check_id=check_id):
+                self.assertRegex(
+                    text, r"""\bid:\s*["']%s["']""" % re.escape(check_id),
+                    "js/views/health.js 未消费 /api/v1/health 的检查项 id=%s；"
+                    "自动环路的三个阶段必须各自渲染" % check_id)
+
+    def test_health_view_renders_severity_and_detail_per_check(self):
+        text = read_text(web_path("js/views/health.js"))
+        self.assertIn("check.detail", text,
+                      "js/views/health.js 必须渲染 check.detail（daemon 的检查明细）")
+        self.assertIn("severity", text,
+                      "js/views/health.js 必须按 check.severity 渲染严重级别")
+        # The generic grid filtered the three loop checks out, so the automation
+        # section has to be the place they are actually rendered.
+        self.assertIn("automationSection", text,
+                      "js/views/health.js 必须把自动环路渲染为独立区块（automationSection）")
+
+    def test_health_view_tolerates_missing_automation_checks(self):
+        """An older daemon omits capture/distill/injection; the view must not crash."""
+        text = read_text(web_path("js/views/health.js"))
+        self.assertIn("未报告", text,
+                      "js/views/health.js 必须为缺失的自动环路检查项提供降级文案")
+        self.assertNotRegex(
+            text, r"""checks\.find\(\s*\(?\s*check\s*\)?\s*=>\s*check\.id\s*===\s*["']capture["']""",
+            "js/views/health.js 不应假定 capture 检查项必然存在（旧 daemon 不返回它）")
+
+    def test_automation_strip_uses_existing_endpoints_only(self):
+        for view in AUTOMATION_VIEWS:
+            path = web_path("js/views/" + view + ".js")
+            with self.subTest(view=view):
+                self.assertTrue(path.exists(), "缺少 js/views/%s.js" % view)
+                text = read_text(path)
+                called = set(API_PATH_RE.findall(text))
+                unknown = sorted(called - DOCUMENTED_ENDPOINTS)
+                self.assertEqual(
+                    unknown, [],
+                    "js/views/%s.js 调用了未登记的 /api/v1 端点: %s（task-10 禁止新增端点）"
+                    % (view, ", ".join(unknown)))
+
+    def test_automation_strip_present_on_pulse_or_agents(self):
+        """A compact capture/distill/injection strip must exist on a first screen."""
+        found = {}
+        for view in ("pulse", "agents"):
+            text = read_text(web_path("js/views/" + view + ".js"))
+            found[view] = ("AUTOMATION" in text) and ("va-auto" in text)
+        self.assertTrue(
+            found["pulse"] or found["agents"],
+            "pulse/agents 都没有渲染自动环路条带（需要 AUTOMATION 区块 + va-auto 样式钩子）")
+
+    def test_automation_strip_reads_capture_and_distill_counters(self):
+        text = read_text(web_path("js/views/pulse.js"))
+        for field in ("capture", "distill", "injected", "daemon_health"):
+            with self.subTest(field=field):
+                self.assertIn(field, text,
+                              "js/views/pulse.js 的自动环路条带未读取 %s 计数" % field)
+
+    def test_agents_view_exposes_automation_state(self):
+        text = read_text(web_path("js/views/agents.js"))
+        for field in ("cursors", "injection", "last_error"):
+            with self.subTest(field=field):
+                self.assertIn(field, text,
+                              "js/views/agents.js 的自动环路条带未使用 %s" % field)
+
+    def test_automation_css_hooks_exist_and_are_themed(self):
+        """Strip/pipeline classes must be styled from tokens, in both themes."""
+        css = read_text(web_path("css/views-a.css"))
+        for hook in (".va-auto-strip", ".va-auto-cell", ".va-auto-band", ".va-auto-stage"):
+            with self.subTest(hook=hook):
+                self.assertIn(hook, css,
+                              "css/views-a.css 缺少自动环路样式钩子 %s" % hook)
+        # No hard-coded colours: every colour must come from a design token.
+        for match in re.finditer(r"\.va-auto[a-z-]*[^{]*\{([^}]*)\}", css):
+            block = match.group(1)
+            with self.subTest(block=block[:60]):
+                self.assertNotRegex(
+                    block, r"#[0-9a-fA-F]{3,8}\b",
+                    "自动环路样式硬编码了颜色；必须使用 tokens.css 的变量")
+
+    def test_automation_css_has_narrow_viewport_rules(self):
+        css = read_text(web_path("css/views-a.css"))
+        for hook in (".va-auto-flow", ".va-auto-strip-cells", ".va-auto-band-cells"):
+            with self.subTest(hook=hook):
+                # Each grid must collapse to one column on a phone.
+                pattern = (re.escape(hook)
+                           + r"\s*\{\s*grid-template-columns:\s*minmax\(0,\s*1fr\)")
+                self.assertRegex(
+                    css, pattern,
+                    "css/views-a.css 的 %s 缺少窄屏单列规则（三个单元格在手机上会挤成一团）" % hook)
 
     def test_tokens_css_contract(self):
         path = web_path("css/tokens.css")

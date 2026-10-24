@@ -24,6 +24,20 @@ export const meta = {
 };
 
 const WAL_WARN_BYTES = 64 * 1024 * 1024;
+
+/* The v2 automatic memory loop: the daemon reports one check per stage, and
+   these three are promoted out of the generic grid because they describe a
+   running process (capture -> distill -> inject), not a static property. */
+const AUTOMATION_STAGES = [
+  { id: "capture", index: "01", stage: "自动采集", eyebrow: "CAPTURE", cadence: "每 60 秒",
+    hint: "Claude / Codex / Gemini / Pi 原生会话按游标增量入账。" },
+  { id: "distill", index: "02", stage: "自动提炼", eyebrow: "DISTILL", cadence: "每 5 分钟",
+    hint: "把新证据提炼成带来源的 claims，冲突按最新者胜出。" },
+  { id: "injection", index: "03", stage: "自动注入", eyebrow: "INJECTION", cadence: "按需",
+    hint: "相关性门槛通过后，才把上下文注入 Agent 会话。" },
+];
+const AUTOMATION_IDS = new Set(AUTOMATION_STAGES.map((stage) => stage.id));
+
 const COMMANDS = [
   { command: "hippomind checkup", label: "深度体检", readOnly: true,
     description: "完整性 / FTS 同步 / 游标 / claims 一致性。默认只读，--repair 才会修复。" },
@@ -130,7 +144,10 @@ function checkCard(check) {
 }
 
 function checksSection(data) {
-  const checks = Array.isArray(data.checks) ? data.checks : [];
+  /* The three automatic-loop checks are promoted into their own pipeline
+     section below, so the grid keeps the static ledger properties only. */
+  const checks = (Array.isArray(data.checks) ? data.checks : [])
+    .filter((check) => !AUTOMATION_IDS.has(check && check.id));
   const host = el("div", { class: "va-checks" });
   if (!checks.length) {
     host.appendChild(emptyState({
@@ -143,6 +160,69 @@ function checksSection(data) {
     for (const check of checks) host.appendChild(checkCard(check));
   }
   return host;
+}
+
+/* ------------------------------------------------------------- automation -- */
+
+function automationStageCard(stage, check) {
+  const tone = check ? severityTone(check.severity) : "neutral";
+  const detail = check
+    ? (check.detail || "daemon 未提供明细")
+    : "本次 daemon 未返回该检查项；可能尚未运行到这一阶段。";
+  const node = el("article", { class: "va-auto-stage", dataset: { tone, stage: stage.id } },
+    el("div", { class: "va-auto-stage-head" },
+      el("span", { class: "va-auto-index" }, stage.index),
+      el("div", { class: "va-auto-stage-title" },
+        el("div", { class: "eyebrow" }, stage.eyebrow),
+        el("h3", { class: "va-auto-stage-name" }, stage.stage)),
+      check ? badge(severityLabel(check.severity), { tone }) : badge("未报告", { tone: "neutral" })),
+    el("p", { class: "va-auto-stage-detail" }, detail),
+    el("div", { class: "va-auto-stage-foot" },
+      dot(tone),
+      el("span", { class: "va-auto-cadence" }, stage.cadence),
+      el("span", { class: "va-auto-hint" }, stage.hint)));
+  if (check && check.fix && check.fix.command) {
+    node.appendChild(el("div", { class: "va-fix" },
+      el("span", { class: "va-fix-label" }, check.fix.label || "建议"),
+      el("code", { class: "va-fix-command", title: check.fix.command }, check.fix.command),
+      copyButton(check.fix.command, { label: "复制" })));
+  }
+  return node;
+}
+
+/* The automatic loop is a process, not a property: capture feeds distill,
+   distill feeds injection. Rendering it as a three-stage pipeline makes a
+   stalled stage visible at a glance instead of hidden in a check grid. */
+function automationSection(data) {
+  const checks = Array.isArray(data.checks) ? data.checks : [];
+  const byId = new Map();
+  for (const check of checks) {
+    if (check && check.id) byId.set(String(check.id), check);
+  }
+  const reported = AUTOMATION_STAGES.filter((stage) => byId.has(stage.id));
+  const problems = reported.filter((stage) => byId.get(stage.id).severity !== "ok");
+  const tone = problems.length ? (problems.some((stage) => byId.get(stage.id).severity === "error")
+    ? "danger" : "warn") : (reported.length ? "ok" : "neutral");
+  const summary = reported.length
+    ? (problems.length
+      ? problems.map((stage) => stage.stage).join(" / ") + " 需要关注"
+      : "三个阶段均在运行")
+    : "daemon 未报告自动环路检查项";
+
+  const host = el("div", { class: "va-auto" });
+  const flow = el("div", { class: "va-auto-flow" },
+    ...AUTOMATION_STAGES.map((stage) => automationStageCard(stage, byId.get(stage.id) || null)));
+  host.appendChild(flow);
+  host.appendChild(el("p", { class: "va-note" },
+    "自动环路由 daemon 后台线程驱动：采集每 60 秒按游标增量入账，提炼每 5 分钟处理一批候选，",
+    "注入只在相关性门槛通过后发生。任一阶段报错会在这里显示为警告，并给出可复制的补救命令。"));
+
+  return card({
+    eyebrow: "AUTOMATION LOOP",
+    title: "自动记忆环路",
+    actions: badge(summary, { tone }),
+    body: host,
+  });
 }
 
 /* ---------------------------------------------------------------- storage -- */
@@ -394,11 +474,14 @@ function duplicatesCard(context) {
 function paint(root, data, environment, context) {
   clear(root);
   const checks = Array.isArray(data.checks) ? data.checks : [];
+  const automationCount = checks.filter((check) => AUTOMATION_IDS.has(check && check.id)).length;
+  const staticCount = checks.length - automationCount;
   const tone = data.ready ? "ok" : "danger";
   root.appendChild(verdictSection(data));
+  root.appendChild(automationSection(data));
   root.appendChild(el("div", { class: "va-section-row" },
     sectionTitle("检查项", {
-      hint: fmtInt(checks.length) + " 项 · 由 daemon 实时计算",
+      hint: fmtInt(staticCount) + " 项静态检查 · 自动环路 " + fmtInt(automationCount) + " 项见上方",
       actions: badge(data.ready ? "READY" : "NEEDS ATTENTION", { tone }),
     })));
   root.appendChild(checksSection(data));

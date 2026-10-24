@@ -153,6 +153,149 @@ function statusStrip(data, context) {
   return el("div", { class: "va-status-strip", role: "group", "aria-label": "daemon 与健康状态" }, ...items);
 }
 
+/* ------------------------------------------------------------ automation -- */
+
+function numberOrZero(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : 0;
+}
+
+/* /api/v1/health reports the injection trace as a rendered detail string
+   ("最近 N 次注入 · M 次实际注入 · 最近 <ts>") because it is the only endpoint
+   that summarises the trace, and this task may not add one. Parse it strictly;
+   when the wording changes the count degrades to "—" and the raw detail is
+   still shown verbatim, so a stale parser never invents a number. */
+function parseInjectionDetail(detail) {
+  const text = String(detail || "");
+  const count = text.match(/最近\s*(\d+)\s*次注入/);
+  const injected = text.match(/(\d+)\s*次实际注入/);
+  const lastAt = text.match(/(\d{4}-\d{2}-\d{2}T[0-9:.+-]+)/);
+  return {
+    count: count ? Number(count[1]) : null,
+    injected: injected ? Number(injected[1]) : null,
+    lastAt: lastAt ? lastAt[1] : "",
+  };
+}
+
+/* "The loop has not run yet" and "the loop ran and found nothing" are
+   different facts, and only one of them is a problem. The daemon publishes an
+   empty object until a stage completes its first round, so an empty stage is
+   rendered as unknown (—) rather than as a confident zero. */
+function stageState(raw) {
+  if (!raw || typeof raw !== "object" || !Object.keys(raw).length) return "pending";
+  if (String(raw.error || "")) return "error";
+  return "ran";
+}
+
+/* The v2 loop runs unattended, so the pulse page answers "is it actually
+   working?" from two payloads it already needs: /overview carries the daemon's
+   own capture/distill counters, /health carries the injection trace check.
+   They are fetched together so the strip is one snapshot, not two. */
+function automationStrip(data, health, context) {
+  const daemonHealth = data.daemon_health && typeof data.daemon_health === "object"
+    ? data.daemon_health : {};
+  const capture = daemonHealth.capture && typeof daemonHealth.capture === "object"
+    ? daemonHealth.capture : {};
+  const distill = daemonHealth.distill && typeof daemonHealth.distill === "object"
+    ? daemonHealth.distill : {};
+  const checks = health && Array.isArray(health.checks) ? health.checks : [];
+  const injectionCheck = checks.find((check) => check && check.id === "injection") || null;
+  const injection = injectionCheck ? parseInjectionDetail(injectionCheck.detail) : null;
+  const injectionCount = injection && injection.count !== null ? injection.count : null;
+  const injectionInjected = injection && injection.injected !== null ? injection.injected : null;
+  const injectionAt = injection ? injection.lastAt : "";
+
+  const captureState = stageState(capture);
+  const distillState = stageState(distill);
+  const captureError = String(capture.error || "");
+  const distillError = String(distill.error || "");
+  const captureFiles = numberOrZero(capture.files);
+  const captureMessages = numberOrZero(capture.messages);
+  const captureInserted = numberOrZero(capture.inserted);
+  const distillCandidates = numberOrZero(distill.candidates);
+  const distillClaims = numberOrZero(distill.claims);
+  const distillDistilled = numberOrZero(distill.distilled);
+
+  const stages = [
+    {
+      id: "capture",
+      eyebrow: "CAPTURE",
+      label: "采集",
+      tone: captureState === "error" ? "warn" : captureState === "ran" ? "ok" : "neutral",
+      primary: captureState === "ran" ? fmtInt(captureFiles) : "—",
+      unit: captureState === "ran" ? "个文件" : "",
+      detail: captureState === "error" ? captureError
+        : captureState === "ran"
+          ? (fmtInt(captureMessages) + " 条消息 · 新增 " + fmtInt(captureInserted) + " 条")
+          : "等待首轮采集（每 60 秒）",
+      title: captureState === "error"
+        ? "采集上一轮报错：" + captureError
+        : captureState === "ran"
+          ? "已扫描 " + fmtInt(captureFiles) + " 个会话文件，读取 " + fmtInt(captureMessages)
+            + " 条消息，新增 " + fmtInt(captureInserted) + " 条记忆"
+          : "daemon 尚未完成首轮采集；采集循环启动后每 60 秒运行一次",
+      stage: "capture",
+    },
+    {
+      id: "distill",
+      eyebrow: "DISTILL",
+      label: "提炼",
+      tone: distillState === "error" ? "warn" : distillState === "ran" ? "ok" : "neutral",
+      primary: distillState === "ran" ? fmtInt(distillCandidates) : "—",
+      unit: distillState === "ran" ? "个候选" : "",
+      detail: distillState === "error" ? distillError
+        : distillState === "ran"
+          ? (fmtInt(distillClaims) + " 条 claims · 提炼 " + fmtInt(distillDistilled) + " 条")
+          : "等待首轮提炼（每 5 分钟）",
+      title: distillState === "error"
+        ? "提炼上一轮报错：" + distillError
+        : distillState === "ran"
+          ? "本轮 " + fmtInt(distillCandidates) + " 个候选，产出 " + fmtInt(distillClaims)
+            + " 条 claims，落库 " + fmtInt(distillDistilled) + " 条"
+          : "daemon 尚未完成首轮提炼；提炼循环启动后每 5 分钟运行一次",
+      stage: "distill",
+    },
+    {
+      id: "injection",
+      eyebrow: "INJECTION",
+      label: "注入",
+      tone: injectionCheck && injectionCheck.severity !== "ok" ? "warn"
+        : (injectionCheck ? "ok" : "neutral"),
+      primary: injectionCount === null ? "—" : fmtInt(injectionCount),
+      unit: injectionCount === null ? "" : "次注入",
+      detail: injectionAt
+        ? ((injectionInjected === null ? "—" : fmtInt(injectionInjected)) + " 次实际注入 · " + relTime(injectionAt))
+        : (injectionCheck ? "尚无注入记录" : "daemon 未报告注入检查项"),
+      title: injectionCheck && injectionCheck.detail
+        ? injectionCheck.detail
+        : (injectionAt ? "最近注入于 " + absTime(injectionAt, { seconds: true }) : "尚未记录自动注入"),
+      stage: "injection",
+    },
+  ];
+
+  const cells = stages.map((stage) => el("button", {
+    class: "va-auto-cell",
+    type: "button",
+    dataset: { tone: stage.tone, stage: stage.id },
+    title: stage.title + " · 点击查看体检",
+    on: { click: () => context.navigate("/health") },
+  },
+    el("span", { class: "va-auto-cell-head" },
+      dot(stage.tone),
+      el("span", { class: "va-auto-cell-eyebrow" }, stage.eyebrow),
+      el("span", { class: "va-auto-cell-label" }, stage.label)),
+    el("span", { class: "va-auto-cell-figure" },
+      el("b", {}, stage.primary),
+      el("span", { class: "va-auto-cell-unit" }, stage.unit)),
+    el("span", { class: "va-auto-cell-detail" }, truncate(stage.detail, 74))));
+
+  return el("div", { class: "va-auto-strip", role: "group", "aria-label": "自动记忆环路" },
+    el("div", { class: "va-auto-strip-head" },
+      el("span", { class: "eyebrow" }, "AUTOMATION"),
+      el("span", { class: "va-auto-strip-note" }, "采集 → 提炼 → 注入，由 daemon 后台自动运行")),
+    el("div", { class: "va-auto-strip-cells" }, ...cells));
+}
+
 /* ------------------------------------------------------------ composition -- */
 
 function compositionCard(data) {
@@ -345,13 +488,15 @@ function emptyLedgerCard(context) {
 
 /* ------------------------------------------------------------------- paint -- */
 
-function paint(root, data, activity, context) {
+function paint(root, data, activity, health, context) {
   clear(root);
   const ledger = data.ledger || {};
   root.appendChild(heroSection(data));
 
   const strip = statusStrip(data, context);
   if (strip.children.length) root.appendChild(strip);
+
+  root.appendChild(automationStrip(data, health, context));
 
   if (!Number(ledger.memories)) root.appendChild(emptyLedgerCard(context));
 
@@ -372,13 +517,38 @@ function paint(root, data, activity, context) {
 
 /* ------------------------------------------------------------------- entry -- */
 
+/* The automation strip needs the health checks for the injection trace. It is
+   an enhancement, never a reason for the first screen to fail: a failed
+   /health leaves the strip in its "not reported" state. */
+async function fetchHealth(context) {
+  try {
+    return await api.get("/api/v1/health", null, { signal: context.signal });
+  } catch (error) {
+    if (error && error.name === "AbortError") throw error;
+    console.warn("[atlas] pulse automation health unavailable", error);
+    return null;
+  }
+}
+
+/* The automation strip reads overview.daemon_health and health.checks; taking
+   both in one parallel batch keeps the three stages describing the same
+   moment instead of two snapshots a minute apart. */
+async function loadSnapshot(context) {
+  const [overview, health] = await Promise.all([
+    api.get("/api/v1/overview", { days: OVERVIEW_DAYS }, { signal: context.signal }),
+    fetchHealth(context),
+  ]);
+  return { overview, health };
+}
+
 export async function render(context) {
   const root = el("div", { class: "va-view va-pulse" });
   current = { root, painted: false };
   root.appendChild(skeleton(4));
   try {
-    const data = await api.get("/api/v1/overview", { days: OVERVIEW_DAYS }, { signal: context.signal });
+    const snapshot = await loadSnapshot(context);
     if (context.signal.aborted) return root;
+    const data = snapshot.overview;
     let activity = { items: [], counts: {} };
     try {
       activity = await api.get("/api/v1/events", { limit: 8 }, { signal: context.signal });
@@ -387,7 +557,7 @@ export async function render(context) {
       console.warn("[atlas] pulse activity unavailable", error);
     }
     if (context.signal.aborted) return root;
-    paint(root, data || {}, activity || {}, context);
+    paint(root, data || {}, activity || {}, snapshot.health, context);
   } catch (error) {
     if (error && error.name === "AbortError") return root;
     clear(root);
@@ -404,9 +574,17 @@ export async function refresh(context) {
   const root = current.root;
   if (!root || !root.isConnected) return;
   try {
-    const data = await api.get("/api/v1/overview", { days: OVERVIEW_DAYS }, { signal: context.signal });
+    const snapshot = await loadSnapshot(context);
     if (context.signal.aborted) return;
-    paint(root, data || {}, context);
+    let activity = { items: [], counts: {} };
+    try {
+      activity = await api.get("/api/v1/events", { limit: 8 }, { signal: context.signal });
+    } catch (error) {
+      if (error && error.name === "AbortError") return;
+      console.warn("[atlas] pulse activity unavailable", error);
+    }
+    if (context.signal.aborted) return;
+    paint(root, snapshot.overview || {}, activity || { items: [], counts: {} }, snapshot.health, context);
   } catch (error) {
     if (error && error.name === "AbortError") return;
     if (current.painted) context.toast("脉搏刷新失败：" + String((error && (error.detail || error.message)) || "未知错误"), { tone: "warn" });

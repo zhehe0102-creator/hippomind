@@ -136,6 +136,101 @@
 }
 .va-status-detail { color: var(--ink-2); }
 
+/* ------------------------------------------------- pulse · automation ---- */
+
+/* A compact three-cell strip under the status line. It is a group of buttons,
+   not a chart: each cell is a shortcut into the health view where the full
+   check detail and the fix command live. */
+.va-auto-strip {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  min-width: 0;
+  padding: 11px 14px 12px;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-card);
+  background: var(--surface-2);
+}
+
+.va-auto-strip-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 3px 12px;
+}
+
+.va-auto-strip-note { font-size: 11px; color: var(--ink-3); }
+
+.va-auto-strip-cells {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0;
+  min-width: 0;
+}
+
+.va-auto-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  padding: 2px var(--space-4);
+  border: 0;
+  border-left: 1px solid var(--rule);
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+.va-auto-cell:first-child { padding-left: 0; border-left: 0; }
+.va-auto-cell:hover .va-auto-cell-eyebrow,
+.va-auto-cell:hover .va-auto-cell-figure b { color: var(--accent); }
+
+.va-auto-cell-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+
+.va-auto-cell-eyebrow {
+  font-family: var(--font-sans);
+  font-size: 9.5px;
+  letter-spacing: .13em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  white-space: nowrap;
+}
+
+.va-auto-cell-label { font-size: 11px; color: var(--ink-4); white-space: nowrap; }
+
+.va-auto-cell-figure {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  min-width: 0;
+}
+.va-auto-cell-figure b {
+  font-family: var(--font-mono);
+  font-size: 19px;
+  font-weight: 500;
+  line-height: 1.2;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+.va-auto-cell[data-tone="warn"] .va-auto-cell-figure b { color: var(--warn); }
+.va-auto-cell[data-tone="neutral"] .va-auto-cell-figure b { color: var(--ink-4); }
+
+.va-auto-cell-unit { font-size: 10.5px; color: var(--ink-3); white-space: nowrap; }
+
+.va-auto-cell-detail {
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--ink-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .va-composition,
 .va-sources { display: flex; flex-direction: column; gap: var(--space-3); }
 
@@ -343,6 +438,91 @@
 }
 .va-metric-band .atlas-metric-hint { font-size: 10.5px; }
 
+/* --------------------------------------------- 08 agents · automation ---- */
+
+.va-auto-band {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  padding: 12px 16px 13px;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-card);
+  background: var(--surface-2);
+}
+
+.va-auto-band-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 3px 12px;
+}
+
+.va-auto-band-note { font-size: 11px; color: var(--ink-3); }
+
+.va-auto-band-cells {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0;
+  min-width: 0;
+}
+
+.va-auto-band-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  padding: 0 var(--space-4);
+  border-left: 1px solid var(--rule);
+}
+.va-auto-band-cell:first-child { padding-left: 0; border-left: 0; }
+
+.va-auto-band-cell-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+
+.va-auto-band-eyebrow {
+  font-family: var(--font-sans);
+  font-size: 9.5px;
+  letter-spacing: .13em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  white-space: nowrap;
+}
+
+.va-auto-band-label { font-size: 11px; color: var(--ink-4); white-space: nowrap; }
+
+.va-auto-band-figure {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  min-width: 0;
+}
+.va-auto-band-figure b {
+  font-family: var(--font-mono);
+  font-size: 19px;
+  font-weight: 500;
+  line-height: 1.2;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+.va-auto-band-cell[data-tone="warn"] .va-auto-band-figure b { color: var(--warn); }
+.va-auto-band-cell[data-tone="neutral"] .va-auto-band-figure b { color: var(--ink-4); }
+
+.va-auto-band-unit { font-size: 10.5px; color: var(--ink-3); white-space: nowrap; }
+
+.va-auto-band-detail {
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--ink-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .va-cell-time {
   display: inline-flex;
   flex-direction: column;
@@ -420,6 +600,115 @@
 .va-install-row:first-child { border-top: 0; }
 .va-install-agent { flex: 0 0 auto; font-size: 11.5px; }
 .va-install-row .va-cursor-error { margin-left: auto; text-align: right; }
+
+/* ------------------------------------------- 09 health · automation loop -- */
+
+/* Capture -> distill -> inject is a process, so it reads as a left-to-right
+   pipeline of three stages rather than three more property checks. The
+   connector is drawn with a pseudo-element so no extra markup carries meaning. */
+.va-auto { display: flex; flex-direction: column; gap: var(--space-3); }
+
+.va-auto-flow {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  align-items: stretch;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+.va-auto-stage {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  padding: 13px 15px 12px;
+  border: 1px solid var(--rule);
+  border-left-width: 3px;
+  border-radius: var(--radius-card);
+  background: var(--surface);
+}
+
+.va-auto-stage[data-tone="ok"] { border-left-color: var(--ok); }
+.va-auto-stage[data-tone="warn"] { border-left-color: var(--warn); }
+.va-auto-stage[data-tone="danger"] { border-left-color: var(--danger); }
+.va-auto-stage[data-tone="neutral"] { border-left-color: var(--rule-strong); }
+
+/* The arrow between stages: furniture, hidden from assistive tech and from
+   narrow viewports where the grid already stacks. */
+.va-auto-stage:not(:last-child)::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  right: calc(-1 * var(--space-4) / 2 - 3px);
+  width: 6px;
+  height: 6px;
+  border-top: 1px solid var(--rule-strong);
+  border-right: 1px solid var(--rule-strong);
+  transform: translateY(-50%) rotate(45deg);
+  pointer-events: none;
+}
+
+.va-auto-stage-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  min-width: 0;
+}
+
+.va-auto-index {
+  flex: 0 0 auto;
+  padding-top: 1px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1.6;
+  color: var(--ink-4);
+  font-variant-numeric: tabular-nums;
+}
+
+.va-auto-stage-title { flex: 1 1 auto; min-width: 0; }
+
+.va-auto-stage-name {
+  margin: 1px 0 0;
+  font-family: var(--font-serif);
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.25;
+  color: var(--ink);
+}
+
+.va-auto-stage-detail {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--ink-2);
+  overflow-wrap: anywhere;
+}
+
+.va-auto-stage-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 3px 8px;
+  margin-top: auto;
+  padding-top: 8px;
+  border-top: 1px dashed var(--rule);
+}
+
+.va-auto-cadence {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--ink-3);
+  white-space: nowrap;
+}
+
+.va-auto-hint {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--ink-4);
+}
 
 /* ========================================================== 09 health ==== */
 
@@ -752,6 +1041,8 @@
   .va-pulse-lower { grid-template-columns: minmax(0, 1fr); }
   .va-metric-band { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .va-checks { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .va-auto-flow { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--space-3); }
+  .va-auto-hint { display: none; }
   .va-verdict { grid-template-columns: minmax(0, 1fr); gap: var(--space-4); }
   .va-verdict-side { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .va-about-grid { grid-template-columns: minmax(0, 1fr); }
@@ -763,7 +1054,12 @@
   .va-pulse-spark { max-width: none; }
   .va-metric-band { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-3); }
   .va-metric-band .atlas-metric-value { font-size: 21px; }
+  .va-auto-band-cells { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+  .va-auto-band-cell { padding: 0; border-left: 0; }
   .va-checks { grid-template-columns: minmax(0, 1fr); }
+  /* Stacked pipeline: the horizontal connector would point at nothing. */
+  .va-auto-flow { grid-template-columns: minmax(0, 1fr); }
+  .va-auto-stage:not(:last-child)::after { display: none; }
   .va-verdict-word { font-size: 38px; }
   .va-verdict-side { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .va-events { grid-template-columns: minmax(0, 1fr); gap: var(--space-3); }
@@ -774,6 +1070,10 @@
   .va-command-row { grid-template-columns: minmax(0, 1fr); gap: 8px; }
   .va-command-row .atlas-copy { justify-self: start; }
   .va-status-strip { gap: 4px var(--space-4); }
+  /* Three narrow cells stop being scannable on a phone: stack them. */
+  .va-auto-strip-cells { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+  .va-auto-cell { padding: 0; border-left: 0; }
+  .va-auto-cell:first-child { padding-top: 0; }
   .va-slip { grid-template-columns: 26px minmax(0, 1fr); }
   .va-integrity-head { flex-wrap: wrap; }
 }
