@@ -22,7 +22,8 @@ def cmd_distill(args) -> int:
             return 1
     engine = DistillEngine(ledger, extractor=extractor)
     result = engine.run(limit=int(getattr(args, "limit", 32) or 32),
-                        dry_run=bool(getattr(args, "dry_run", False)))
+                        dry_run=bool(getattr(args, "dry_run", False)),
+                        include_raw=not bool(getattr(args, "no_raw", False)))
     _print(result)
     return 0
 

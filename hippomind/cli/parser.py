@@ -234,6 +234,7 @@ def build_parser() -> argparse.ArgumentParser:
     distill.add_argument("--limit", type=int, default=32)
     distill.add_argument("--dry-run", action="store_true")
     distill.add_argument("--provider", choices=("auto", "claude", "heuristic"), default="auto")
+    distill.add_argument("--no-raw", action="store_true", help="只提炼结构化记忆，跳过 raw chat")
     distill.set_defaults(func=cmd_distill)
 
     watch = sub.add_parser("watch", help="以低频游标方式持续采集归档")

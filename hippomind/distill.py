@@ -183,14 +183,14 @@ class DistillEngine:
         provider = os.environ.get("HIPPOMIND_DISTILL_PROVIDER", "auto").strip().lower()
         self.extractor = None if provider in {"heuristic", "off"} else ClaudeExtractor()
 
-    def _candidates(self, limit: int) -> List[Candidate]:
+    def _candidates(self, limit: int, *, include_raw: bool = True) -> List[Candidate]:
         limit = max(1, min(200, int(limit)))
         # Keep both queues moving: half the batch from structured projections
         # (task/progress/decision), half from newest raw chat.  A pure
         # created_at sort would let 250k raw rows starve structured memory; a
         # pure structured-first sort would delay new sessions for days.
-        structured_limit = max(1, limit // 2)
-        raw_limit = max(1, limit - structured_limit)
+        structured_limit = limit if not include_raw else max(1, limit // 2)
+        raw_limit = 0 if not include_raw else max(1, limit - structured_limit)
         base = ("SELECT m.memory_id,m.kind,m.content,m.source_agent,m.project,m.task_id,"
                 "m.session_id,m.created_at,m.metadata_json FROM memories m "
                 "LEFT JOIN source_cursors c ON c.source_id='distill:' || m.memory_id "
@@ -201,8 +201,8 @@ class DistillEngine:
         with self.ledger._reading() as conn:
             structured = conn.execute(base + "AND m.raw_chat=0 ORDER BY m.created_at DESC LIMIT ?",
                                       (structured_limit,)).fetchall()
-            raw = conn.execute(base + "AND m.raw_chat=1 ORDER BY m.created_at DESC LIMIT ?",
-                               (raw_limit,)).fetchall()
+            raw = (conn.execute(base + "AND m.raw_chat=1 ORDER BY m.created_at DESC LIMIT ?",
+                                (raw_limit,)).fetchall() if raw_limit else [])
         rows = list(structured) + list(raw)
         seen = set()
         output: List[Candidate] = []
@@ -355,9 +355,10 @@ class DistillEngine:
                 continue
         return resolved
 
-    def run(self, *, limit: int = 32, dry_run: bool = False) -> Dict[str, Any]:
+    def run(self, *, limit: int = 32, dry_run: bool = False,
+            include_raw: bool = True) -> Dict[str, Any]:
         started = time.time()
-        candidates = self._candidates(limit)
+        candidates = self._candidates(limit, include_raw=include_raw)
         summary = {"candidates": len(candidates), "batches": 0, "claims": 0,
                    "distilled": 0, "skipped": 0, "errors": 0,
                    "extractor": "none", "conflicts_resolved": 0,
