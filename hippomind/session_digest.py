@@ -63,8 +63,15 @@ HARNESS_SENTENCE_RE = re.compile(
     re.IGNORECASE)
 
 #: Sessions whose text is pure harness traffic carry no durable memory.
-NOISE_PATTERNS = ("return only json", "output-format text", '{"ok":true}',
-                  "<MEMORY_DATA", "system-reminder")
+NOISE_PATTERNS = (
+    "return only json",
+    "output-format text",
+    chr(123) + chr(34) + "ok" + chr(34) + chr(58) + "true" + chr(125),
+    "<MEMORY_DATA",
+    "system-reminder",
+    "HippoMind 的记忆提炼器",
+    "output_format",
+)
 
 
 def _strip_boilerplate(text: str) -> str:
@@ -81,9 +88,26 @@ def _strip_boilerplate(text: str) -> str:
     return " ".join(kept)
 
 
+CONTEXT_ONLY_RE = re.compile(
+    r"(HippoMind 自动上下文|不可信参考数据|MEMORY_DATA_UNTRUSTED|"
+    r"<MEMORY_DATA|未找到有证据且相关的记忆)",
+    re.IGNORECASE)
+
+
+def _context_only(text: str) -> bool:
+    """True when the text is dominated by injected memory context."""
+    matches = CONTEXT_ONLY_RE.findall(str(text or ""))
+    if not matches:
+        return False
+    stripped = CONTEXT_ONLY_RE.sub(" ", str(text or ""))
+    return len(" ".join(stripped.split())) < 80
+
+
 def _informative(text: str) -> bool:
     lowered = text.lower()
     if any(pattern.lower() in lowered for pattern in NOISE_PATTERNS):
+        return False
+    if _context_only(text):
         return False
     # A digest of only tags/JSON has almost no letters or CJK left.
     letters = sum(1 for ch in text if ch.isalnum() or "\u4e00" <= ch <= "\u9fff")
@@ -114,7 +138,7 @@ class SessionDigester:
     # -- collection -------------------------------------------------------
     def pending_sessions(self, limit: int = 4, *, min_messages: int = 4) -> List[Dict[str, Any]]:
         """Return sessions with no digest cursor, newest first."""
-        limit = max(1, min(50, int(limit)))
+        limit = max(1, min(500, int(limit)))
         with self.ledger._reading() as conn:
             rows = conn.execute(
                 "SELECT m.session_id, m.source_agent, COUNT(*) n, MIN(m.created_at) first_at, "
@@ -203,6 +227,10 @@ class SessionDigester:
             "evidence": ["session:%s" % summary.session_id],
             "timestamp": summary.last_at or utc_now(),
             "confidence": 0.6,
+            # A session digest is a handoff summary: it must outrank the
+            # individual raw messages it came from, otherwise a 2-message
+            # harness session can win the slot with recency alone.
+            "importance": 7,
             "metadata": {"digested": True, "extractor": extractor_name,
                          "messages": summary.messages,
                          "first_at": summary.first_at, "last_at": summary.last_at},

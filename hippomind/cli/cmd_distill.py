@@ -42,10 +42,28 @@ def cmd_digest(args) -> int:
         from ..distill import ClaudeExtractor
         extractor = ClaudeExtractor()
     digester = SessionDigester(ledger, extractor=extractor, provider=provider)
-    result = digester.run(limit=int(getattr(args, "limit", 4) or 4),
-                          dry_run=bool(getattr(args, "dry_run", False)),
-                          min_messages=int(getattr(args, "min_messages", 4) or 4))
-    _print(result)
+    limit = int(getattr(args, "limit", 4) or 4)
+    min_messages = int(getattr(args, "min_messages", 4) or 4)
+    dry_run = bool(getattr(args, "dry_run", False))
+    if not getattr(args, "drain", False):
+        _print(digester.run(limit=limit, dry_run=dry_run, min_messages=min_messages))
+        return 0
+    # Drain mode: keep taking bounded batches until the backlog is empty or the
+    # caller-supplied batch budget is spent.  Heuristic extraction is fast enough
+    # to clear hundreds of sessions; the model path stays bounded per batch.
+    totals = {"sessions": 0, "digested": 0, "skipped": 0, "errors": 0,
+              "claims": 0, "messages": 0, "batches": 0, "elapsed_ms": 0.0}
+    max_batches = max(1, int(getattr(args, "max_batches", 40) or 40))
+    for _ in range(max_batches):
+        result = digester.run(limit=limit, dry_run=dry_run, min_messages=min_messages)
+        totals["batches"] += 1
+        for key in ("sessions", "digested", "skipped", "errors", "claims", "messages"):
+            totals[key] += int(result.get(key, 0) or 0)
+        totals["elapsed_ms"] = round(totals["elapsed_ms"] + float(result.get("elapsed_ms", 0) or 0), 1)
+        totals["extractor"] = result.get("extractor", "none")
+        if int(result.get("sessions", 0) or 0) == 0 or dry_run:
+            break
+    _print(totals)
     return 0
 
 

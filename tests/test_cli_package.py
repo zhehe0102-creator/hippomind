@@ -113,7 +113,7 @@ PARSER_SURFACE = {
     "checkup": ("f423e1adb4f6d6617acf985908bb9ffd532c4680269f621eaa066e566c5105c5", 7),
     "conflicts": ("aef6f57aa52644e95131795e33dbc4b0882d949530e3d9504e584982c149c28f", 8),
     "context": ("d3835f73f8eb2364e3b1e08e6281f45755352304564bd108ac8ec536f3b3b5ce", 22),
-    "digest": ("69ee4f4cde26aa299a5695416d9efcd4beb7a43ba0d03b949f7c36a1eebbbcd7", 9),
+    "digest": ("88bba3b9a9c08a9acb42c5de1dd72fdca23a0185134d87b6f15ff295aae5a98e", 11),
     "discover-agents": ("2e0dbd54e137ff04e8f0e4a6659d7b161494d53088ff22f152227e8ea019bbf7", 6),
     "distill": ("366a9e30187d71e3583bfc428372802792970f8ae395588b676037ab39ecec65", 9),
     "doctor": ("b953cb2db3bf28e7d6b06c9fcc2a47ee04bd7218846ceadd934aa47702d93d7f", 7),
