@@ -698,11 +698,20 @@ error, info, menu。
 ### 11.5 实测（2026-10-23）
 
 - 全量单测 **654 项 OK**；lint gate 90/90。
-- 生产 daemon 重启后自动采集：首轮 100 条消息（已有内容多为 duplicate，说明 watcher
-  已覆盖大部分；新增 2 条）；自动提炼首轮 **16 候选 → 15 条提炼 → 28 claims**，
-  第二轮后生产库 **57 claims / 57 active**，事实与图谱不再为空。
-- 一次 `claude -p` 抽取 1 批约 44–65s；daemon 每 5 分钟 16 条，适合后台渐进回填。
+- 生产 daemon 重启后自动采集：JSONL 首轮 100 条消息（已有内容多为 duplicate，
+  说明 watcher 已覆盖大部分）；自动提炼首轮 **16 候选 → 15 条提炼 → 28 claims**。
+- 截至 2026-10-23 晚：生产库 **260,401 条记忆**（其中 raw 254,479）、
+  **192 条自动提炼记忆**、**437 claims / 373 active / 39 conflict**、
+  **7 条关联关系**；health claims 悬空 0。
+- 一次 `claude -p` 抽取 1 批约 30–65s；daemon 每 5 分钟 16 条，适合后台渐进回填。
 - 生产环境 `/api/v1/environment` 0.14s、events 0.32s；doctor READY。
+- 新增 `hippomind/gemini_capture.py`：增量读取 Antigravity /
+  antigravity-cli 的 `conversation_summaries.db`，把 title/preview/project/agent
+  作为 `task` 记忆写入共享账本；daemon 采集循环已接入。
+- 新增 `scripts/eval_memory.py`：10 条真实查询的检索冒烟基准，输出
+  term_recall / MRR / duplicate_rate / p50 / p95；当前基线
+  **term_recall 0.700、MRR 0.900、duplicate 0.025、p50 15.5ms、p95 34.2ms**。
+  它是回归门，不是 95 分证明。
 
 ### 11.6 仍未达到 95 的部分（如实）
 

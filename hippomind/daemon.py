@@ -35,6 +35,7 @@ from .access import AccessDenied, AccessPolicy
 from .context_pack import DEFAULT_MAX_CHARS, DEFAULT_MAX_TOKENS, ContextPackBuilder, ContextPackOptions
 from .injection import InjectionState
 from .distill import DistillEngine  # noqa: E402
+from .gemini_capture import GeminiSummaryScanner  # noqa: E402
 from .gui_api import GuiApi, GuiApiError  # noqa: E402  (module keeps its legacy import block)
 from .transcripts import TranscriptScanner  # noqa: E402
 from .ledger import LedgerError, SQLiteLedger, default_ledger_path, utc_now
@@ -208,6 +209,7 @@ class MemoryHubService:
         # Native transcript capture + automatic distillation (v2).  Both share
         # the daemon's ledger handle and are stopped by _stop_event.
         self.transcripts = TranscriptScanner(self.ledger)
+        self.gemini_capture = GeminiSummaryScanner(self.ledger)
         self.distiller = DistillEngine(self.ledger)
         self.watch_enabled = bool(watch)
         self.require_auth = bool(require_auth)
@@ -373,6 +375,10 @@ class MemoryHubService:
             while not self._stop_event.is_set():
                 try:
                     summary = self.transcripts.sync(max_messages=100)
+                    try:
+                        summary["gemini"] = self.gemini_capture.sync(max_rows=50)
+                    except Exception as gemini_exc:
+                        summary["gemini"] = {"error": "%s: %s" % (type(gemini_exc).__name__, str(gemini_exc)[:200])}
                     self.health["capture"] = summary
                 except Exception as exc:  # capture must never take the hub down
                     self.health["capture"] = {"error": "%s: %s" % (type(exc).__name__, str(exc)[:200])}
