@@ -65,9 +65,15 @@ def main(argv=None) -> int:
         if item["write_scopes"]:
             print("      写范围: " + ", ".join(item["write_scopes"]))
     print("")
-    print("唤醒方式：对每个已中断的 owner 发送：")
-    print("  继续 <task-id>：先 team_task_get 看当前进度，检查已写入的文件，不要重做；")
-    print("  完成后 team_task_update action=complete，并给 Lead 发报告。")
+    print("唤醒消息（逐条 send_message 给对应 owner）：")
+    for item in resumable:
+        if not item["owner"]:
+            continue
+        print("  send_message target=%s" % item["owner"])
+        print("    API 中断已恢复。继续 %s（%s）：先 team_task_get 看当前进度，"
+              % (item["task_id"], item["subject"]))
+        print("    再检查你已写入的文件，不要重做已完成部分；完成后 team_task_update")
+        print("    action=complete expected_revision=<rev> 并给 Lead 发报告。现在继续。")
     return 0
 
 
