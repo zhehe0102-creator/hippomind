@@ -1058,12 +1058,18 @@ class ContextPackBuilder:
         # limit=240 → 8 条。也就是说固定深度 96 连"8 个不同结论"都凑不齐。
         # 折叠生效时按需加深取数，直到"折叠后不同候选数 ≥ max_items"或触顶。
         initial_limit = max(options.max_items * 12, 48)
+        # When hybrid rerank is on, the embedder is applied once to the final
+        # candidate set instead of to every row during scoring.  Scoring with
+        # the vector channel cost ~800ms extra per pack on the production
+        # ledger (past DSH's 700ms injection timeout) and did not change the
+        # labelled recall; the rerank stage is where it actually helps.
         candidates = self.ledger.search(
             query, scope=options.scope, task_id=task_id, project=project,
             source_agents=options.source_agents, roles=options.roles,
             from_time=eff_from, to_time=eff_to,
             include_raw_chat=options.raw_chat, require_evidence=options.require_evidence,
-            limit=initial_limit, embedder=self.embedder,
+            limit=initial_limit,
+            embedder=None if options.hybrid_rerank else self.embedder,
             as_of=options.as_of,
         )
         # Resolve shared task titles before grouping. This is intentionally a
