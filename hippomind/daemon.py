@@ -370,6 +370,27 @@ class MemoryHubService:
         except Exception:
             return None
 
+    def start_warmup(self) -> None:
+        """Warm SQLite page cache and the pack builder before the first hook.
+
+        A cold daemon pays ~650ms for the first context-pack (SQLite page cache
+        plus FTS load), which is right at DSH's 700ms injection timeout.  A
+        background warmup makes the first real injection fast instead of
+        making the user's first prompt pay for it.
+        """
+        if self.read_only or self._stop_event.is_set():
+            return
+
+        def warm() -> None:
+            try:
+                self.ledger.search("warmup", scope="shared", limit=8,
+                                   include_raw_chat=False, require_evidence=True)
+                self.contexts.build("warmup", ContextPackOptions(max_items=1, min_score=0.2))
+            except Exception:
+                pass
+
+        threading.Thread(target=warm, name="hippomind-warmup", daemon=True).start()
+
     def start_capture_loop(self, *, tick_seconds: float = 60.0) -> None:
         """Continuously capture native Claude/Codex transcripts."""
         if self.read_only or not self.watch_enabled or self._stop_event.is_set():
@@ -1130,6 +1151,7 @@ def run_daemon(*, ledger_path: Optional[os.PathLike] = None,
     service._server = server
     _atomic_json(paths.state_path, service.state(host, int(port)))
     service.start_watcher()
+    service.start_warmup()
     service.start_discovery_loop()
     service.start_capture_loop()
     service.start_distill_loop()
