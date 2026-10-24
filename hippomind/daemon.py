@@ -770,8 +770,11 @@ class MemoryHubRequestHandler(BaseHTTPRequestHandler):
             to_time=raw.get("to_time", data.get("to_time", "")),
             as_of=raw.get("as_of", data.get("as_of", "")),
             debug=bool(raw.get("debug", data.get("debug", False))),
+            # /context-pack is the automatic-injection endpoint, so it
+            # defaults to the same relevance gate as the CLI auto path.
+            # Explicit callers (MCP, scripts) can pass min_score=0.
             min_score=raw.get("min_score", data.get("min_score",
-                float(os.environ.get("HIPPOMIND_MIN_SCORE", "0")))),
+                float(os.environ.get("HIPPOMIND_MIN_SCORE", "0.20")))),
         )
 
     @staticmethod
