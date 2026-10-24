@@ -16,7 +16,7 @@ from .cmd_lifecycle import (
     cmd_doctor, cmd_init, cmd_login_install, cmd_login_remove, cmd_monitor, cmd_start, cmd_status, cmd_stop,
     cmd_version,
 )
-from .cmd_distill import cmd_distill, cmd_sync_transcripts
+from .cmd_distill import cmd_digest, cmd_distill, cmd_sync_transcripts
 from .cmd_maintain import (
     cmd_backup, cmd_checkup, cmd_maintain, cmd_recovery_check, cmd_redact_raw, cmd_restore, cmd_scan_raw,
 )
@@ -236,6 +236,14 @@ def build_parser() -> argparse.ArgumentParser:
     distill.add_argument("--provider", choices=("auto", "claude", "heuristic"), default="auto")
     distill.add_argument("--no-raw", action="store_true", help="只提炼结构化记忆，跳过 raw chat")
     distill.set_defaults(func=cmd_distill)
+
+    digest = sub.add_parser("digest", help="按会话生成摘要，一次性消化整段 raw 会话")
+    _connection_arguments(digest)
+    digest.add_argument("--limit", type=int, default=4)
+    digest.add_argument("--min-messages", type=int, default=4)
+    digest.add_argument("--dry-run", action="store_true")
+    digest.add_argument("--provider", choices=("auto", "claude", "heuristic"), default="auto")
+    digest.set_defaults(func=cmd_digest)
 
     watch = sub.add_parser("watch", help="以低频游标方式持续采集归档")
     _connection_arguments(watch)

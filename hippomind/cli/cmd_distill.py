@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from typing import Any
 
 
 def cmd_distill(args) -> int:
@@ -24,6 +25,26 @@ def cmd_distill(args) -> int:
     result = engine.run(limit=int(getattr(args, "limit", 32) or 32),
                         dry_run=bool(getattr(args, "dry_run", False)),
                         include_raw=not bool(getattr(args, "no_raw", False)))
+    _print(result)
+    return 0
+
+
+def cmd_digest(args) -> int:
+    from . import _paths, _print
+    from ..ledger import SQLiteLedger
+    from ..session_digest import SessionDigester
+
+    paths = _paths(args)
+    ledger = SQLiteLedger(paths.ledger_path)
+    provider = str(getattr(args, "provider", "auto") or "auto")
+    extractor: Any = None
+    if provider != "heuristic":
+        from ..distill import ClaudeExtractor
+        extractor = ClaudeExtractor()
+    digester = SessionDigester(ledger, extractor=extractor, provider=provider)
+    result = digester.run(limit=int(getattr(args, "limit", 4) or 4),
+                          dry_run=bool(getattr(args, "dry_run", False)),
+                          min_messages=int(getattr(args, "min_messages", 4) or 4))
     _print(result)
     return 0
 

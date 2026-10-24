@@ -37,6 +37,7 @@ from .injection import InjectionState
 from .distill import DistillEngine  # noqa: E402
 from .gemini_capture import GeminiSummaryScanner  # noqa: E402
 from .pi_capture import PiSessionScanner  # noqa: E402
+from .session_digest import SessionDigester  # noqa: E402
 from .gui_api import GuiApi, GuiApiError  # noqa: E402  (module keeps its legacy import block)
 from .transcripts import TranscriptScanner  # noqa: E402
 from .ledger import LedgerError, SQLiteLedger, default_ledger_path, utc_now
@@ -212,6 +213,7 @@ class MemoryHubService:
         self.transcripts = TranscriptScanner(self.ledger)
         self.gemini_capture = GeminiSummaryScanner(self.ledger)
         self.pi_capture = PiSessionScanner(self.ledger)
+        self.digester = SessionDigester(self.ledger)
         self.distiller = DistillEngine(self.ledger)
         self.watch_enabled = bool(watch)
         self.require_auth = bool(require_auth)
@@ -401,6 +403,15 @@ class MemoryHubService:
             while not self._stop_event.is_set():
                 try:
                     summary = self.distiller.run(limit=16)
+                    # Whole-session digests are the throughput path for the
+                    # 250k-message backlog: one model call per session instead
+                    # of one per message.  Bounded so it never starves the
+                    # per-memory queue.
+                    try:
+                        summary["digest"] = self.digester.run(limit=2)
+                    except Exception as digest_exc:
+                        summary["digest"] = {"error": "%s: %s" % (
+                            type(digest_exc).__name__, str(digest_exc)[:200])}
                     self.health["distill"] = summary
                 except Exception as exc:
                     self.health["distill"] = {"error": "%s: %s" % (type(exc).__name__, str(exc)[:200])}

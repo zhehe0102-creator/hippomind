@@ -106,13 +106,14 @@ def _digest(rows):
 #: the always-crashing ``hippomind pin`` was repaired.  Its *rendered* text did
 #: not move, and test_pin_help_text_is_unchanged pins that separately.
 PARSER_SURFACE = {
-    "(root)": ("1e0a9ae171a342afa74f11dbc8887fd73550c05481ce93120af5f21af0e87948", 42),
+    "(root)": ("9e7f364c6a2266bc78f5c746f2e1a76666aeb9639d558dee79230016cb6bf89e", 43),
     "agent-status": ("c6ce3680226dad9d5019b2ce233e1580998dfc861921c6e3ca1f02ff8e4ed5bf", 7),
     "auto-context": ("bcd24f3b2a2dd0f637d61a2f1dc9744cf08d71cef0717f5dfc97203004d1af8c", 22),
     "backup": ("3ba2b08b93a835ababbf4b62a644915a0df48e7e998837500580929290eadfd5", 6),
     "checkup": ("f423e1adb4f6d6617acf985908bb9ffd532c4680269f621eaa066e566c5105c5", 7),
     "conflicts": ("aef6f57aa52644e95131795e33dbc4b0882d949530e3d9504e584982c149c28f", 8),
     "context": ("d3835f73f8eb2364e3b1e08e6281f45755352304564bd108ac8ec536f3b3b5ce", 22),
+    "digest": ("69ee4f4cde26aa299a5695416d9efcd4beb7a43ba0d03b949f7c36a1eebbbcd7", 9),
     "discover-agents": ("2e0dbd54e137ff04e8f0e4a6659d7b161494d53088ff22f152227e8ea019bbf7", 6),
     "distill": ("366a9e30187d71e3583bfc428372802792970f8ae395588b676037ab39ecec65", 9),
     "doctor": ("b953cb2db3bf28e7d6b06c9fcc2a47ee04bd7218846ceadd934aa47702d93d7f", 7),
@@ -177,7 +178,8 @@ CLI_FACE = frozenset([
     "cmd_login_install", "cmd_login_remove", "cmd_maintain", "cmd_monitor",
     "cmd_pin", "cmd_pins", "cmd_recovery_check", "cmd_redact_raw",
     "cmd_resolve", "cmd_restore", "cmd_scan_raw", "cmd_skills",
-    "cmd_start", "cmd_status", "cmd_stop", "cmd_sync", "cmd_sync_transcripts", "cmd_distill", "cmd_ui",
+    "cmd_start", "cmd_status", "cmd_stop", "cmd_sync", "cmd_sync_transcripts", "cmd_distill",
+    "cmd_digest", "cmd_ui",
     "cmd_version", "cmd_watch", "contextlib", "default_dsh_sessions_root",
     "extract_memory_request", "fetch_auto_context", "getpass", "hashlib",
     "install_agent_rules", "install_agents", "integration_tier", "json",
@@ -222,7 +224,7 @@ class CliPackageSurfaceTests(unittest.TestCase):
             if "|SUBCOMMAND " in row:
                 name = row.split("|SUBCOMMAND ")[1].split("|")[0]
                 handlers[name] = row.rsplit("func=", 1)[1]
-        self.assertEqual(40, len(handlers))
+        self.assertEqual(41, len(handlers))
         for name, handler in sorted(handlers.items()):
             self.assertTrue(callable(getattr(self.cli, handler)),
                             "%s -> %s is not reachable on hippomind.cli"
