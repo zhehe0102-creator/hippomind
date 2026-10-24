@@ -103,10 +103,18 @@ value（值）、confidence（0-1）、source（对应片段编号）。
 %s
 """ % "\n\n".join(snippets)
         try:
+            env = os.environ.copy()
+            extra_paths = [
+                str(Path.home() / ".local" / "bin"),
+                str(Path.home() / ".local" / "share" / "pi-node"
+                    / "node-v22.23.2-darwin-arm64" / "bin"),
+                "/usr/local/bin", "/opt/homebrew/bin",
+            ]
+            env["PATH"] = os.pathsep.join(extra_paths + [env.get("PATH", "/usr/bin:/bin")])
             completed = subprocess.run(
                 [self.binary, "-p", "--output-format", "text"],
                 input=prompt, text=True, capture_output=True,
-                timeout=self.timeout, cwd=str(Path.home()),
+                timeout=self.timeout, cwd=str(Path.home()), env=env,
             )
         except (OSError, subprocess.SubprocessError):
             return None
@@ -226,6 +234,17 @@ class DistillEngine:
 
     def _record(self, candidate: Candidate, claims: Sequence[Mapping[str, Any]],
                 extractor_name: str, parent_memory_id: str = "") -> Dict[str, Any]:
+        # The ledger has a unique (memory_id, subject, predicate, slot_key)
+        # constraint.  LLM output may repeat a slot; keep the strongest one
+        # instead of failing the whole batch.
+        deduped: Dict[Tuple[str, str, str], Mapping[str, Any]] = {}
+        for item in claims:
+            key = (str(item.get("subject", "")), str(item.get("predicate", "")),
+                   str(item.get("slot_key", "")))
+            previous = deduped.get(key)
+            if previous is None or float(item.get("confidence", 0)) > float(previous.get("confidence", 0)):
+                deduped[key] = item
+        claims = list(deduped.values())
         values = [str(item.get("value", "")) for item in claims]
         summary = "；".join(value for value in values if value)[:1_200]
         record = {
@@ -273,8 +292,22 @@ class DistillEngine:
             second = ranked[1]
             top_score = float(top.get("confidence", 0) or 0) * float(top.get("source_trust", 0.5) or 0.5)
             second_score = float(second.get("confidence", 0) or 0) * float(second.get("source_trust", 0.5) or 0.5)
+            predicate = str(top.get("predicate", "")).lower()
+            slot = str(top.get("slot_key", "")).lower()
+            status_like = any(token in predicate + " " + slot for token in
+                              ("status", "progress", "stage", "当前", "进度", "阶段"))
             if top_score < second_score + 0.10 and float(top.get("confidence", 0) or 0) < 0.90:
-                continue
+                # Status-like facts are explicitly temporal: the newest
+                # observation wins when confidence is close.  Other claims
+                # stay in the conflict queue for human review.
+                if not status_like:
+                    continue
+                newest = max(group, key=lambda item: str(item.get("asserted_at", "")))
+                if newest is top:
+                    pass
+                else:
+                    top = newest
+                    top_score = float(top.get("confidence", 0) or 0) * float(top.get("source_trust", 0.5) or 0.5)
             try:
                 self.ledger.resolve_claim(str(top.get("claim_id", "")),
                                           str(top.get("memory_id", "")),

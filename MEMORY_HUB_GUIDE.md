@@ -248,6 +248,11 @@ v1.1 增加结构化活动流、运行环境卡片（Python/卷/磁盘/依赖/�
 只读扫描、置顶过滤与 CSV 导出、命令面板直接检索、主题跟随系统。静态服务只读 `hippomind/web/` 且带 CSP、frame-ancestors、nosniff 头，
 页面不含 token 或账本路径。设计与接口契约见 [docs/GUI_ATLAS.md](docs/GUI_ATLAS.md)。
 
+### 登录自启（可选）
+
+`scripts/install-autostart.sh` 会把 Python 包复制到内置盘 runtime 并安装
+LaunchAgent，避开外置卷 TCC 限制；升级后重跑一次刷新副本。
+
 ### 环境自检与依赖
 
 `scripts/bootstrap-env.sh` 默认只检查 Python/sqlite 与是否已有 .venv；

@@ -287,6 +287,17 @@ daemon 在 **http://127.0.0.1:8765/ui** 同源提供新的 Web 控制台。它�
 依赖（原生 ES Modules），视觉是纸本档案馆风格：浅色纸底 + 墨色排版 + 朱砂信号色，
 可切换 night 深色；衬线标题、等宽数据、索引编号与细线表格取代了旧版的玻璃拟态。
 
+### 登录自启（可选）
+
+工作区在外置卷时，macOS 会阻止 launchd 后台任务直接读取它。运行一次：
+
+```bash
+scripts/install-autostart.sh
+```
+
+它会把 Python 包同步到内置盘 `~/Library/Application Support/HippoMind/runtime`
+并写入 LaunchAgent，登录后自动启动 daemon（账本本来就在内置盘）。升级代码后重跑一次即可。
+
 ### 双击打开（推荐）
 
 在工作区根目录双击 **`HippoMind Atlas.app`**（或 **`打开 HippoMind Atlas.command`**）：
