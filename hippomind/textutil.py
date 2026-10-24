@@ -13,6 +13,7 @@ SQLite; it is safe to import from anywhere in the package.
 from __future__ import annotations
 
 import hashlib
+from functools import lru_cache
 import re
 from typing import Iterable, List, Set
 
@@ -70,7 +71,16 @@ def short_text(value: object, limit: int = MAX_TEXT_CHARS) -> str:
 _short_text = short_text
 
 
+
+@lru_cache(maxsize=512)
+def _tokenize_cached(text: str, limit: int) -> frozenset:
+    return frozenset(_tokenize_uncached(text, limit))
+
+
 def tokenize_multilingual(text: str, limit: int = MAX_TEXT_CHARS) -> Set[str]:
+    """Cached wrapper: the pack near-duplicate scan calls this O(n^2) times."""
+    return set(_tokenize_cached(str(text or ""), int(limit)))
+def _tokenize_uncached(text: str, limit: int = MAX_TEXT_CHARS) -> Set[str]:
     """Return word tokens for Latin text plus unigrams/bigrams for CJK.
 
     No external tokenizer is used: Latin/digit runs are kept whole, every CJK

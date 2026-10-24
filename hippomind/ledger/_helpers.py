@@ -17,6 +17,7 @@ import math  # noqa: F401 (mixin re-export surface)
 import time as _time_mod  # noqa: F401 (mixin re-export surface)
 import os  # noqa: F401 (mixin re-export surface)
 import re  # noqa: F401 (mixin re-export surface)
+from functools import lru_cache
 import secrets  # noqa: F401 (mixin re-export surface)
 import sqlite3  # noqa: F401 (mixin re-export surface)
 import tempfile  # noqa: F401 (mixin re-export surface)
@@ -240,7 +241,20 @@ def _sanitize_untrusted_metadata(value: Any) -> Any:
     return value
 
 
+@lru_cache(maxsize=1024)
+def _sim_tokens_cached(text: str) -> frozenset:
+    return frozenset(_sim_tokens_uncached(text))
+
+
 def _sim_tokens(text: str) -> set:
+    """多语言分词（词元 + CJK 单字 + 相邻 bigram），带缓存。
+
+    搜索对每个候选调用一次，同一段正文会在多次查询间反复出现；不缓存时
+    一次 limit=48 的搜索要重分词近千次。
+    """
+    return set(_sim_tokens_cached(str(text or "")))
+
+def _sim_tokens_uncached(text: str) -> set:
     """与 hippocampus.token_sim 内嵌 tokens 同语义的多语言分词
     （词元 + CJK 单字 + 相邻 bigram），供评分循环复用查询侧结果。"""
     parts = re.findall(r"[a-z0-9_]+|[\u3400-\u9fff]", str(text or "").lower())

@@ -34,6 +34,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from hippomind.ledger import SQLiteLedger  # noqa: E402
+from hippomind.context_pack import ContextPackBuilder, ContextPackOptions  # noqa: E402
 
 DEFAULT_LEDGER = os.path.expanduser(
     "~/Library/Application Support/HippoMind/hippomind.sqlite")
@@ -333,6 +334,30 @@ def load_queries(path: os.PathLike) -> List[Dict[str, Any]]:
     return validate_queries(raw)
 
 
+def _pack_search(builder: ContextPackBuilder, min_score: float):
+    """Adapter that scores the Context Pack the agent actually receives.
+
+    ``ledger.search`` measures the candidate ranking; the pack applies
+    grouping, budget, deduplication and the relevance gate.  Scoring the pack
+    is the honest measure of injection quality, because it is what the model
+    sees.
+    """
+
+    def search(query: str, project: str, scope: str, limit: int):
+        pack = builder.build(query, ContextPackOptions(
+            max_items=min(8, max(1, int(limit))),
+            scope=scope or "shared", project=project or "",
+            min_score=min_score,
+        ))
+        items = pack.get("items") or []
+        if not items:
+            return []
+        return [{"content": pack.get("text") or "", "kind": "pack",
+                 "memory_id": "pack", "score": 1.0}]
+
+    return search
+
+
 def evaluate(ledger: SQLiteLedger, queries: Sequence[Dict[str, Any]], *,
              limit: int = 8, search=None) -> Dict[str, Any]:
     """Run the labelled set and aggregate retrieval metrics.
@@ -505,14 +530,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         default=DEFAULT_THRESHOLDS["min_mrr"])
     parser.add_argument("--max-duplicate-rate", type=float,
                         default=DEFAULT_THRESHOLDS["max_duplicate_rate"])
-    parser.add_argument("--max-p95-ms", type=float,
-                        default=DEFAULT_THRESHOLDS["max_p95_ms"])
+    parser.add_argument("--max-p95-ms", type=float, default=None,
+                        help="default: 250ms for --mode search, 600ms for --mode pack")
     parser.add_argument("--min-queries", type=int,
                         default=DEFAULT_THRESHOLDS["min_queries"])
     parser.add_argument("--no-gate", action="store_true",
                         help="report metrics but always exit 0")
     parser.add_argument("--ledger-stats", action="store_true",
                         help="include ledger size/claim counts in the report")
+    parser.add_argument("--mode", choices=("search", "pack"), default="search",
+                        help="search = candidate ranking; pack = the context actually injected")
+    parser.add_argument("--min-score", type=float, default=0.20,
+                        help="relevance gate used by --mode pack")
     args = parser.parse_args(argv)
     if args.limit < 1:
         parser.error("--limit must be >= 1")
@@ -535,7 +564,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
     ledger = SQLiteLedger(ledger_path)
     try:
-        result = evaluate(ledger, queries, limit=args.limit)
+        search = None
+        if args.mode == "pack":
+            search = _pack_search(ContextPackBuilder(ledger), args.min_score)
+        result = evaluate(ledger, queries, limit=args.limit, search=search)
+        result["mode"] = args.mode
         ledger_stats = ledger.stats() if args.ledger_stats else None
     finally:
         ledger.close()
@@ -546,12 +579,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             for key in ("memories", "raw_chat", "active", "claims",
                         "active_claims", "conflict_claims", "schema_version")
         }
+    # Pack mode does grouping, MMR, budget rendering and the relevance gate on
+    # top of search, so it is legitimately slower; the real constraint is the
+    # host's injection timeout (DSH 700ms, Codex hook 12s).  Search mode keeps
+    # the tighter 250ms budget.
+    default_p95 = 600.0 if args.mode == "pack" else DEFAULT_THRESHOLDS["max_p95_ms"]
     result["gate"] = check_gate(
         result,
         min_recall_at_k=args.min_recall,
         min_mrr=args.min_mrr,
         max_duplicate_rate=args.max_duplicate_rate,
-        max_p95_ms=args.max_p95_ms,
+        max_p95_ms=(args.max_p95_ms if args.max_p95_ms is not None else default_p95),
         min_queries=args.min_queries,
     )
     if args.json:

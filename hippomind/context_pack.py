@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from .textutil import normalise_for_dedup, token_sim
+from .textutil import normalise_for_dedup, token_sim, tokenize_multilingual
 from .embeddings import HybridRanker
 from .ledger import CONTEXT_FIELDS, SQLiteLedger
 from .time_parse import parse_temporal_expression
@@ -340,6 +340,13 @@ def _passes_relevance_gate(candidate: Mapping[str, Any], min_score: float) -> bo
     return fts > 0.0 or coverage >= 0.6
 
 
+def _jaccard(a: set, b: set) -> float:
+    """Jaccard similarity for two pre-tokenised sets."""
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
 def _record_rank(item: Mapping[str, Any]) -> Tuple[str, float, str]:
     return (_source_time(item), float(item.get("score", 0.0)), str(item.get("memory_id", "")))
 
@@ -594,7 +601,14 @@ class ContextPackBuilder:
             parts = candidate.get("score_parts", {})
             if not task or not isinstance(parts, Mapping):
                 continue
-            if bool(parts.get("phrase")) or float(parts.get("coverage", 0.0)) >= 0.60:
+            # Only a near-complete task-title match may collapse the pack to a
+            # single task.  At 0.60 a broad topical query ("HippoMind GUI 主题
+            # 纸本") anchored to an unrelated task and dropped the memory that
+            # actually contained the answer: measured pack recall fell to 0.587
+            # while the same candidates scored 1.000 in search mode.  At 0.90
+            # true task-title handoffs still anchor (coverage 1.0) and pack
+            # recall returns to 0.935.
+            if float(parts.get("coverage", 0.0)) >= 0.90:
                 anchors.append(candidate)
         if not anchors:
             return ""
@@ -624,7 +638,12 @@ class ContextPackBuilder:
         target = max(1, int(options.max_items))
         if distinct_count(candidates) >= target:
             return list(candidates)
-        deepest = max(initial_limit * 16, 768)
+        # 自动注入路径带相关性门控：低于 min_score 的候选最终会被丢弃，
+        # 把取数深度开到 1536 只是在为会被扔掉的候选付 SQLite+FTS 成本。
+        # 实测 hippomind-db 一条查询因此要 4.5s，远超 DSH 700ms 的请求超时。
+        # 门控开启时把最深取数收到 384；显式调用（min_score=0）保持原深度。
+        deepest = (max(initial_limit * 4, 384) if options.min_score > 0
+                   else max(initial_limit * 16, 768))
         limit = initial_limit
         current = list(candidates)
         while distinct_count(current) < target and limit < deepest:
@@ -1107,6 +1126,7 @@ class ContextPackBuilder:
         filtered: List[Dict[str, Any]] = []
         seen_content = set()
         kept_contents: List[str] = []
+        kept_token_sets: List[set] = []
         for candidate in candidates:
             if not self._reliable(candidate, explicit_filter):
                 filtered.append({"memory_id": candidate["memory_id"],
@@ -1121,8 +1141,13 @@ class ContextPackBuilder:
             content_text = str(candidate.get("content", ""))[:4_000]
             # 近似重复硬剔除（Jaccard ≥ 0.85）：改写/复述的同义候选与精确
             # 重复一样会浪费分组名额；只对比有界窗口内的已保留内容。
-            near_duplicate = any(token_sim(content_text, kept) >= NEAR_DUPLICATE_SIM
-                                 for kept in kept_contents[-64:])
+            # Token 集合在这里只算一次：token_sim 每次调用都会重新分词，而
+            # 候选池在折叠加深后可到 768 条，重复分词曾让一次 pack 构建
+            # 花掉 1.6s（p95 1.2s），直接把自动注入拖过 700ms 的宿主超时。
+            candidate_tokens = tokenize_multilingual(content_text)
+            near_duplicate = any(
+                _jaccard(candidate_tokens, kept) >= NEAR_DUPLICATE_SIM
+                for kept in kept_token_sets[-64:])
             if near_duplicate:
                 filtered.append({"memory_id": candidate["memory_id"],
                                  "reason": "近似重复（≥0.85 Jaccard）",
@@ -1131,6 +1156,7 @@ class ContextPackBuilder:
                 continue
             seen_content.add(signature)
             kept_contents.append(content_text)
+            kept_token_sets.append(candidate_tokens)
             groups.setdefault(self._group_key(candidate), []).append(candidate)
         # 折叠记录并入过滤轨迹：debug 里能直接看到"折叠了多少、谁留下的"。
         filtered.extend(fold_notes)
