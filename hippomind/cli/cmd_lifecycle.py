@@ -331,6 +331,7 @@ def _launchd_check() -> tuple[bool, str, str]:
     labels = (("com.hippomind.daemon.plist", True), ("com.hippomind.gui.plist", False))
     problems: list = []
     found = 0
+    deployed_pythonpaths: list = []
     for name, owned_by_installer in labels:
         plist_path = _launch_agent_path().parent / name
         try:
@@ -348,10 +349,13 @@ def _launchd_check() -> tuple[bool, str, str]:
         environment = config.get("EnvironmentVariables")
         environment = environment if isinstance(environment, Mapping) else {}
         declared_pythonpath = str(environment.get("PYTHONPATH", "") or "")
+        if declared_pythonpath and _is_deployed_runtime(declared_pythonpath):
+            deployed_pythonpaths.append(declared_pythonpath)
         if declared_pythonpath and not Path(declared_pythonpath).is_dir():
             problems.append(f"{name} PYTHONPATH 指向不存在的目录 {declared_pythonpath}")
         elif (declared_pythonpath and owned_by_installer
-              and Path(declared_pythonpath).resolve() != package_root.resolve()):
+              and Path(declared_pythonpath).resolve() != package_root.resolve()
+              and not _is_deployed_runtime(declared_pythonpath)):
             problems.append(f"{name} PYTHONPATH 指向 {declared_pythonpath}，"
                             f"当前包根是 {package_root}")
         working = str(config.get("WorkingDirectory", "") or "")
@@ -368,11 +372,40 @@ def _launchd_check() -> tuple[bool, str, str]:
     if not found:
         return True, "ok", "未安装登录自启项（按需运行 login-install）"
     if external_volume:
+        # The repo lives on an external volume, but the job may legitimately
+        # point at the internal-disk runtime copy that install-autostart.sh
+        # deploys.  Only warn when it still points at the external path.
+        deployed = [path for path in deployed_pythonpaths if _is_deployed_runtime(path)]
+        if deployed:
+            return True, "ok", (f"登录项使用内置盘运行副本（{deployed[0]}），"
+                                "外置卷工作区不受 TCC 影响")
         return False, "warning", (
             f"登录项路径有效，但工作区在外置卷（{package_root}）：macOS 隐私保护会拒绝 "
             "launchd 后台任务读取该卷，登录自启会在每次登录时以 PermissionError 失败。"
-            "开机自启不可用，请改用 `hippomind start`（或把工作区移到内置盘）")
+            "开机自启不可用，请改用 `hippomind start`，或运行 "
+            "scripts/install-autostart.sh 部署内置盘运行副本")
     return True, "ok", f"登录项存在且路径有效（{package_root}）"
+
+
+def _is_deployed_runtime(path: str) -> bool:
+    """True when ``path`` is an intentional internal-disk runtime copy.
+
+    macOS TCC refuses to let a launchd background job read the external volume
+    the repo lives on, so ``scripts/install-autostart.sh`` copies the package to
+    ``~/Library/Application Support/HippoMind/runtime`` and points the job there.
+    That is a deliberate deployment, not stale drift, so doctor must not report
+    it as a broken login item.  The copy is only trusted when it actually
+    contains this package.
+    """
+    try:
+        candidate = Path(path).expanduser().resolve()
+    except OSError:
+        return False
+    if not (candidate / "hippomind" / "daemon.py").is_file():
+        return False
+    # The whole point of the copy is to sit on the boot volume: a package that
+    # still lives on the external volume is the un-deployed case, not a fix.
+    return not _is_external_volume(candidate)
 
 
 def _is_external_volume(path: Path) -> bool:
