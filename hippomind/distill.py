@@ -70,17 +70,27 @@ class ClaudeExtractor:
 
     name = "claude"
 
-    def __init__(self, timeout: float = 90.0):
+    def __init__(self, timeout: float = 45.0):
         candidates = [shutil.which("claude"),
                       str(Path.home() / ".local" / "bin" / "claude"),
                       "/usr/local/bin/claude", "/opt/homebrew/bin/claude"]
         self.binary = next((path for path in candidates
                             if path and Path(path).is_file() and os.access(path, os.X_OK)), "")
         self.timeout = timeout
+        self._failures = 0
+        self._cooldown_until = 0.0
+        self.last_error = ""
 
     @property
     def available(self) -> bool:
-        return bool(self.binary)
+        return bool(self.binary) and time.time() >= self._cooldown_until
+
+    def _record_failure(self, exc: Exception) -> None:
+        self._failures += 1
+        self.last_error = "%s: %s" % (type(exc).__name__, str(exc)[:200])
+        if self._failures >= 2:
+            self._cooldown_until = time.time() + 600.0
+            self._failures = 0
 
     def extract(self, candidates: Sequence[Candidate]) -> Optional[List[Dict[str, Any]]]:
         if not self.available or not candidates:
@@ -116,9 +126,11 @@ value（值）、confidence（0-1）、source（对应片段编号）。
                 input=prompt, text=True, capture_output=True,
                 timeout=self.timeout, cwd=str(Path.home()), env=env,
             )
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError) as exc:
+            self._record_failure(exc)
             return None
         if completed.returncode != 0:
+            self._record_failure(RuntimeError(completed.stderr[-300:]))
             return None
         text = completed.stdout.strip()
         start = text.find("{")
@@ -153,6 +165,8 @@ value（值）、confidence（0-1）、source（对应片段编号）。
             result.append({"subject": subject, "predicate": predicate,
                            "slot_key": slot, "value": value,
                            "confidence": round(confidence, 3), "source": source})
+        self._failures = 0
+        self._cooldown_until = 0.0
         return result
 
 
