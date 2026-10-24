@@ -174,3 +174,60 @@ ledger 新增 add_relations() 复用同样的环检测与 INSERT OR IGNORE。
     python3 scripts/eval_memory.py --mode pack     # 注入内容门禁
     python3 -m hippomind.cli digest --drain --provider heuristic
     python3 -m unittest discover -s tests -p 'test_*.py'
+
+---
+
+# Round 7 — 自愈、冲突收敛与注入效果闭环
+
+日期：2026-10-24
+
+## 1. 崩溃自愈（实测）
+
+LaunchAgent 之前是 KeepAlive=false：daemon 被杀后不会自己起来。改为
+KeepAlive{SuccessfulExit:false} 后实测：
+
+    kill -9 <pid>  ->  launchd 在 9.5 秒内拉起新 pid，/health 恢复 ok
+
+## 2. 冲突收敛
+
+repair_claim_states() 增加"孤儿冲突"修复：一个 conflict claim 如果同 slot
+下已经没有其它 active/conflict claim，且它的 memory 是 accepted+active，
+就重新激活。生产实测：37 条重新激活，冲突从 73 降到 36（真实分歧），
+悬空 0。
+
+## 3. 注入效果闭环（第一版）
+
+之前只记录"注入了多少条"，没有"注入有没有用"。现在：
+
+- trace 记录被注入的 memory_ids（最多 8 个，不存正文）；
+- injection_quality.py 用注入后同一 Agent 的 assistant 消息做词面重合度，
+  输出 reuse_rate / mean_overlap / sampled；
+- scripts/injection_report.py 打印报告。
+
+明确标注：这是代理指标，不是因果证明（Agent 可能本来就知道那个词），
+所以报告永远同时打印样本量。
+
+## 4. 当前生产库
+
+    记忆 266,525 · raw 259,266 · claims 2,119（active 1,985 / conflict 36）
+    关系 199 · 会话摘要 983 · 自动提炼 389
+
+## 5. 分数（更新）
+
+| 维度 | 权重 | 上轮 | 本轮 |
+| --- | --- | --- | --- |
+| 采集覆盖 | 15% | 85 | 85 |
+| 自动提炼 | 25% | 80 | 82 |
+| 检索质量 | 20% | 82 | 82 |
+| 注入质量 | 15% | 90 | 92 |
+| 可靠性 | 10% | 88 | 93 |
+| 使用成本 | 15% | 85 | 85 |
+
+加权约 86 分。
+
+## 6. 仍差
+
+1. 真实语义 embedding（无本地模型运行时；当前是词法 + 字符 n-gram）。
+2. Cursor 未安装、无持久会话库。
+3. 注入 reuse 样本要等真实使用积累；目前只有 1 条带 id 的 trace。
+4. 冲突仍有 36 条真实分歧需要人工/更强模型裁决。
