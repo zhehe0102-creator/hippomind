@@ -10,13 +10,29 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from .ledger import LedgerError, SQLiteLedger, utc_now
 
 CURSOR_PREFIX = "transcript:gemini:"
+
+
+def _iso_timestamp(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return utc_now()
+    text = text.replace("Z", "+00:00").replace(" ", "T", 1)
+    # Gemini stores variable-length fractional seconds (e.g. .09725); the
+    # ledger requires ISO-8601, so normalise the fraction to microseconds.
+    text = re.sub(r"\.(\d+)", lambda match: "." + (match.group(1) + "000000")[:6], text, count=1)
+    try:
+        return datetime.fromisoformat(text).isoformat()
+    except ValueError:
+        return text[:64]
 
 
 def default_gemini_summary_databases() -> List[Path]:
@@ -85,7 +101,8 @@ class GeminiSummaryScanner:
             content = "\n".join(part for part in (title, preview) if part)[:4_000]
             if not conversation_id or not content:
                 continue
-            timestamp = str(item.get("last_modified_time") or "")[:64] or utc_now()
+            source_modified = str(item.get("last_modified_time") or "")[:64]
+            timestamp = _iso_timestamp(source_modified)
             metadata = {
                 "source": "gemini-antigravity-summary",
                 "conversation_id": conversation_id,
@@ -94,6 +111,7 @@ class GeminiSummaryScanner:
                 "status": str(item.get("status") or ""),
                 "step_count": item.get("step_count"),
                 "workspace_uris": str(item.get("workspace_uris") or ""),
+                "source_modified_time": source_modified,
             }
             records.append({
                 "content": content,
@@ -135,7 +153,7 @@ class GeminiSummaryScanner:
                     summary["errors"] += 1
                     self._write_cursor(path, after, error=str(exc)[:500])
                     continue
-                last = str(records[-1].get("timestamp") or after)
+                last = str((records[-1].get("metadata") or {}).get("source_modified_time") or after)
                 summary["last_modified_time"] = last
                 self._write_cursor(path, last)
                 remaining -= len(records)

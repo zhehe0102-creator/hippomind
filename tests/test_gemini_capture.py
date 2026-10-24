@@ -30,7 +30,7 @@ class GeminiCaptureTests(unittest.TestCase):
             status TEXT, project_id TEXT, agent_name TEXT)""")
         conn.execute("INSERT INTO conversation_summaries VALUES(?,?,?,?,?,?,?,?,?)",
                      ("c-1", "AegisEye 传感器", "请编写传感器层", 8,
-                      "2026-10-23T10:00:00Z", "", "IDLE", "aegis-eye", "gemini"))
+                      "2026-10-23 10:00:00.09725+00:00", "", "IDLE", "aegis-eye", "gemini"))
         conn.execute("INSERT INTO conversation_summaries VALUES(?,?,?,?,?,?,?,?,?)",
                      ("c-2", "RelayDesk", "修复模型路由", 3,
                       "2026-10-23T11:00:00Z", "", "IDLE", "relaydesk", "gemini"))
