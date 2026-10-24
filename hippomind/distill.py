@@ -30,7 +30,8 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from . import llm_client
 from .ledger import LedgerError, SQLiteLedger, utc_now
-from .textutil import content_fingerprint
+from .schema import fts_indexed_predicate
+from .textutil import content_fingerprint, is_noise_text
 
 CURSOR_PREFIX = "distill:"
 #: Number of candidates sent to one model call.
@@ -116,6 +117,89 @@ DEFAULT_CONFIDENCE = 0.55
 DEFAULT_RUN_LIMIT = 64
 #: Cap on identical-content rows retired per pass (see _candidates).
 DEFAULT_DEDUPE_MARKS = 4_000
+#: Markers that identify the distiller's own prompt echoed back as content.
+#:
+#: These are deliberately *literal phrases from this module's prompt*, not
+#: generic words like "记忆" or "JSON": a real memory is allowed to talk about
+#: memory systems and about JSON, so a broad match would silently delete
+#: legitimate knowledge.  Each marker must be long enough that it cannot appear
+#: by accident in normal prose.
+PROMPT_SELF_MARKERS = (
+    "你是 HippoMind 的记忆提炼器",
+    "你是 hippomind 的记忆提炼器",
+    "只输出 JSON，不要解释",
+    "只输出 json，不要解释",
+    "从下面的会话片段中提取稳定、可复核的事实",
+    "从下面的会话片段中提取",
+    "subject（实体/项目/主题）",
+    "slot_key（槽位，稳定小写）",
+    "confidence（0-1）",
+    "source（对应片段编号）",
+    "如果片段没有可提炼内容，claims 返回空数组",
+)
+
+#: An empty extraction result stored as if it were a fact.
+EMPTY_PAYLOAD_RE = re.compile(
+    r'^\s*(?:\{\s*"claims"\s*:\s*\[\s*\]\s*\}|\[\s*\]|'
+    r'只输出\s*JSON\s*[：:]\s*\{\s*"claims"\s*:\s*\[\s*\]\s*\})\s*$',
+    re.IGNORECASE)
+
+#: A distilled record whose summary is empty: 提炼（raw_chat）： and nothing else.
+EMPTY_DISTILL_RE = re.compile(
+    r"^\s*提炼(?:（[^）]*）|\([^)]*\))?\s*[：:]\s*$")
+
+
+def classify_unusable(content: str) -> str:
+    """Return a reason code when content must not become a memory.
+
+    Returns "" when the content is acceptable.  The codes are stable so
+    callers can count and report them instead of dropping content silently:
+
+    empty
+        Nothing but whitespace.
+    empty_payload
+        A structurally empty extraction result ({"claims":[]}).
+    empty_distill
+        A distilled record with an empty summary (提炼（x）：).
+    self_prompt
+        The distiller's own prompt captured as if it were conversation.
+    noise
+        Structurally provable noise (banners, bare command echoes) per
+        :func:`hippomind.textutil.is_noise_text`.
+
+    Why a function and not a boolean: the production ledger accumulated 476
+    such rows precisely because nothing recorded *why* content was dropped, so
+    nobody could tell "we filtered it" from "we never captured it".  Returning
+    the reason makes the gate observable.
+    """
+    text = content or ""
+    if not text.strip():
+        return "empty"
+    stripped = text.strip()
+    if EMPTY_PAYLOAD_RE.match(stripped):
+        return "empty_payload"
+    if EMPTY_DISTILL_RE.match(stripped):
+        return "empty_distill"
+    # A distilled record whose body is only the empty payload, e.g.
+    # 提炼（raw_chat）：{"claims":[]} -- the wrapper hides the emptiness from
+    # the two checks above, so unwrap once and re-test the tail.
+    if stripped.startswith("提炼") and len(stripped) < 200:
+        parts = re.split(r"[：:]", stripped, 1)
+        if len(parts) == 2 and EMPTY_PAYLOAD_RE.match(parts[1].strip()):
+            return "empty_payload"
+    lowered = stripped.lower()
+    for marker in PROMPT_SELF_MARKERS:
+        if marker.lower() in lowered:
+            return "self_prompt"
+    if is_noise_text(text):
+        return "noise"
+    return ""
+
+
+def is_usable_memory(content: str) -> bool:
+    """Convenience predicate for callers that only need a yes/no answer."""
+    return not classify_unusable(content)
+
 DECISION_MARKERS = ("决定", "采用", "结论", "必须", "不能", "不要", "偏好",
                     "选择", "修复", "原因", "部署", "配置", "使用")
 
@@ -637,6 +721,88 @@ class DistillEngine:
             groups[key].append(candidate)
         return [(groups[key][0], groups[key][1:]) for key in order]
 
+    def _duplicate_index(self) -> Dict[str, str]:
+        """Fingerprint -> memory_id for every live distilled memory.
+
+        Built **once per run() pass**, not per write.  A per-write query was the
+        obvious implementation and the wrong one: it re-read and re-fingerprinted
+        the newest 400 rows for every single write, which on a 4,000-row backlog
+        is quadratic *and* still missed anything older than that window -- the
+        measured symptom was 142 duplicate groups surviving the gate.
+
+        The cache is deliberately NOT keyed on the ledger write generation.
+        Generation advances on every ingest, so a generation-keyed cache is
+        invalidated by the very writes it is meant to dedupe: each new row would
+        force a full rebuild, which is the cost this cache exists to avoid.
+        Instead ``run()`` takes one snapshot at the start of the pass and
+        ``_remember_written`` adds each new row to it, so the pass sees its own
+        writes without any rebuild.  Cross-pass correctness does not depend on
+        the cache being fresh: ``_existing_duplicate`` is only an optimisation
+        that lets us skip a write, and a stale miss just means the ledger unique
+        constraint (or the next pass) catches it.
+        """
+        cached = getattr(self, "_dup_index_cache", None)
+        if cached is not None:
+            return cached
+        index: Dict[str, str] = {}
+        # Reuse the schema-owned retrieval predicate instead of restating it:
+        # tests/test_fts_invariant.py enforces that schema.py is the only module
+        # allowed to spell this literal out, precisely so the ingest gate, the
+        # FTS index and the audit surfaces cannot drift apart.
+        predicate = fts_indexed_predicate("m")
+        with self.ledger._reading() as conn:
+            rows = conn.execute(
+                "SELECT m.memory_id, m.content FROM memories m "
+                "WHERE " + predicate + " AND m.source_agent='hippomind-distill'").fetchall()
+        for row in rows:
+            key = content_fingerprint(str(row["content"] or ""))
+            if key and key not in index:
+                index[key] = str(row["memory_id"])
+        self._dup_index_cache = index
+        return index
+
+    def _remember_written(self, content: str, memory_id: str) -> None:
+        """Teach the in-pass duplicate index about a row just written.
+
+        Without this, two rows written inside the same pass would not see each
+        other: the snapshot predates both.  Kept deliberately cheap -- it is the
+        only mutation of the index during a pass.
+        """
+        key = content_fingerprint(content)
+        if not key:
+            return
+        cached = getattr(self, "_dup_index_cache", None)
+        if cached is not None:
+            cached.setdefault(key, memory_id)
+
+    def _reset_duplicate_index(self) -> None:
+        """Drop the per-pass snapshot so the next pass re-reads the ledger.
+
+        Called at the start of every ``run()``.  A long-lived daemon reuses one
+        engine across passes, so without this the snapshot from the first pass
+        would live forever and miss everything other writers added.
+        """
+        self._dup_index_cache = None
+    def _existing_duplicate(self, content: str) -> str:
+        """Return the id of an already-accepted memory with the same content.
+
+        This is the ingest-side half of the duplicate problem.  On the live
+        ledger the *same* distilled sentence was written 141 times with one
+        identical evidence id but 141 different metadata blobs: the ledger
+        identity key includes mutable metadata, so every re-observation became
+        a new row.  Fixing the identity key is a schema-level change (out of
+        scope, tracked in docs/DATA_HYGIENE.md); the durable mitigation is to
+        refuse to write a row whose normalised content is already live.
+
+        Deliberately compares *normalised* content, not raw bytes: rows that
+        differ only by whitespace are the same fact.  Returns "" when the
+        content is new.
+        """
+        fingerprint = content_fingerprint(content)
+        if not fingerprint:
+            return ""
+        index = self._duplicate_index()
+        return index.get(fingerprint, "")
     def _mark_duplicate(self, candidate: Candidate, representative_id: str) -> None:
         """Retire a repeat row without a model call, keeping the audit trail.
 
@@ -660,11 +826,27 @@ class DistillEngine:
         distilling every row.
         """
         started = time.time()
+        # One duplicate snapshot per pass; see _duplicate_index for why this is
+        # not keyed on the ledger generation.
+        self._reset_duplicate_index()
         limit = default_run_limit() if limit is None else max(1, min(200, int(limit)))
         size = default_batch_size() if batch_size is None else max(1, min(MAX_BATCH, int(batch_size)))
         # Over-fetch so dedupe still yields limit distinct representatives.
         window = limit if not dedupe else min(1_000, limit * 4)
         candidates = self._candidates(limit, include_raw=include_raw, window=window)
+        # Content gate: refuse to distil anything that cannot become a useful
+        # memory.  This runs *before* dedupe so a polluted row never claims a
+        # representative slot, and it counts rejections by reason instead of
+        # dropping them silently (see classify_unusable).
+        rejected: Dict[str, int] = {}
+        kept: List[Candidate] = []
+        for candidate in candidates:
+            reason = classify_unusable(candidate.content)
+            if reason:
+                rejected[reason] = rejected.get(reason, 0) + 1
+                continue
+            kept.append(candidate)
+        candidates = kept
         groups = (self._dedupe_groups(candidates) if dedupe
                   else [(candidate, []) for candidate in candidates])
         groups = groups[:limit]
@@ -681,6 +863,10 @@ class DistillEngine:
                    "fetched": len(candidates),
                    "batch_size": size, "batches": 0, "claims": 0,
                    "distilled": 0, "skipped": 0, "errors": 0,
+                   # Rows refused by the content gate, by reason.  Visible so an
+                   # operator can tell "we filtered noise" from "we lost data".
+                   "rejected": dict(rejected),
+                   "rejected_total": sum(rejected.values()),
                    "extractor": "none", "extractors": {},
                    "conflicts_resolved": 0, "elapsed_ms": 0.0}
         last_by_subject: Dict[str, str] = {}
@@ -723,8 +909,19 @@ class DistillEngine:
                 try:
                     subject = str(source_claims[0].get("subject", "")).strip().lower()
                     parent = last_by_subject.get(subject, "")
-                    result = self.ledger.ingest(self._record(candidate, source_claims,
-                                                             extractor_name, parent))
+                    record = self._record(candidate, source_claims, extractor_name, parent)
+                    # Ingest-side dedupe: an identical live memory means this
+                    # observation adds nothing but a duplicate row.  Skip the
+                    # write, but still mark the cursor -- otherwise the same
+                    # source row is retried forever.
+                    existing = self._existing_duplicate(str(record.get("content", "")))
+                    if existing:
+                        summary["skipped_duplicate"] = summary.get("skipped_duplicate", 0) + 1
+                        self._mark_duplicate(candidate, existing)
+                        continue
+                    result = self.ledger.ingest(record)
+                    self._remember_written(str(record.get("content", "")),
+                                           result.memory_id)
                     if subject:
                         last_by_subject[subject] = result.memory_id
                     self._mark(candidate, len(source_claims))
@@ -735,8 +932,21 @@ class DistillEngine:
                 for repeat in repeats:
                     try:
                         repeat_parent = last_by_subject.get(subject, "") or result.memory_id
-                        self.ledger.ingest(self._record(repeat, source_claims,
-                                                        extractor_name, repeat_parent))
+                        repeat_record = self._record(repeat, source_claims,
+                                                     extractor_name, repeat_parent)
+                        # A repeat shares its representative's claims, so its
+                        # content is identical to a row just written: writing it
+                        # again would recreate the duplication this gate exists to
+                        # stop.  Record the skip and retire the cursor.
+                        repeat_dup = self._existing_duplicate(
+                            str(repeat_record.get("content", "")))
+                        if repeat_dup:
+                            summary["skipped_duplicate"] = summary.get("skipped_duplicate", 0) + 1
+                            self._mark_duplicate(repeat, repeat_dup)
+                            continue
+                        written = self.ledger.ingest(repeat_record)
+                        self._remember_written(str(repeat_record.get("content", "")),
+                                               written.memory_id)
                         self._mark_duplicate(repeat, candidate.memory_id)
                         summary["distilled"] += 1
                     except (LedgerError, ValueError):

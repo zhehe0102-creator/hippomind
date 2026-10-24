@@ -138,28 +138,45 @@ class ThroughputKnobTests(unittest.TestCase):
         self.assertEqual(1, len(extractor.batches))
         self.assertEqual(1, len(extractor.batches[0]))
 
-    def test_every_duplicate_row_still_gets_a_cursor_and_a_record(self):
+    def test_every_duplicate_row_gets_a_cursor_but_only_one_row_is_written(self):
+        """All repeats are retired; only one distilled memory is written.
+
+        This replaces the pre-hygiene contract, which wrote a separate distilled
+        memory for every repeat.  That is exactly how the live ledger reached
+        141 identical rows for one sentence: each re-observation appended a new
+        row because the identity key includes mutable metadata.  The invariant
+        that still holds is the one that matters for liveness -- *every* source
+        row is cursor-marked, so nothing is retried forever.
+        """
         extractor = RecordingExtractor()
         engine = DistillEngine(self.ledger, extractor=extractor)
         body = "这是一段重复出现的待提炼内容，用于验证每一行都被标记"
         memory_ids = [self._ingest(body, session_id="s-%d" % index).memory_id
                       for index in range(3)]
-        engine.run(limit=10, batch_size=8)
+        result = engine.run(limit=10, batch_size=8)
         cursors = self._cursors()
         for memory_id in memory_ids:
             self.assertIn(CURSOR_PREFIX + memory_id, cursors,
                           "每一行都必须被标记，否则会永远留在队列里")
-        # Each row also produced its own distilled memory with its own evidence.
         with self.ledger._reading() as conn:
             rows = conn.execute(
                 "SELECT evidence_json FROM memories WHERE source_agent='hippomind-distill'"
             ).fetchall()
+        self.assertEqual(1, len(rows), "重复内容只应写入一条提炼记忆")
         linked = {item for row in rows for item in
                   __import__("json").loads(row["evidence_json"] or "[]")}
-        for memory_id in memory_ids:
-            self.assertIn("memory:" + memory_id, linked)
+        self.assertEqual(1, len(linked), "只有代表行进入 evidence 链")
+        self.assertGreaterEqual(result.get("skipped_duplicate", 0), 1,
+                                "跳过必须在 summary 里可见，不能静默丢弃")
 
     def test_duplicate_cursor_records_which_row_answered(self):
+        """A retired repeat must record what it was collapsed into.
+
+        The pointer may name either the source representative or the distilled
+        memory that now carries the fact -- both are auditable and reversible,
+        which is the property under test.  Pinning the exact id would make the
+        test fail whenever the ingest gate legitimately skips the write.
+        """
         extractor = RecordingExtractor()
         engine = DistillEngine(self.ledger, extractor=extractor)
         body = "这是一段相同内容，用于验证 dedupe_of 指向哪一行"
@@ -171,7 +188,12 @@ class ThroughputKnobTests(unittest.TestCase):
         marked = [json.loads(cursors[CURSOR_PREFIX + mid]) for mid in ids]
         dedupe_of = [item.get("dedupe_of") for item in marked if item.get("dedupe_of")]
         self.assertEqual(1, len(dedupe_of), "重复行必须记录它复用了哪一行")
-        self.assertIn(dedupe_of[0], ids)
+        self.assertTrue(dedupe_of[0], "dedupe_of 必须是一个真实 id")
+        with self.ledger._reading() as conn:
+            distilled = {str(row["memory_id"]) for row in conn.execute(
+                "SELECT memory_id FROM memories WHERE source_agent='hippomind-distill'")}
+        self.assertIn(dedupe_of[0], set(ids) | distilled,
+                      "dedupe_of 必须指向代表行或它产出的提炼记忆")
 
     def test_dedupe_can_be_disabled(self):
         extractor = RecordingExtractor()

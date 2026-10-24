@@ -505,7 +505,11 @@ class MemoryHubService:
                     # 显示批 16 会静默丢掉约 11% 的条目（标成"无可提炼内容"），
                     # 那是拿质量换速度，不做。tick 也不要降到 120s：210s 的活塞进
                     # 120s 会背靠背连跑，退化成不停跑。
-                    summary = self.distiller.run(limit=64)
+                    # limit 可用 HIPPOMIND_DISTILL_LIMIT 覆盖：2026-10-24 实测
+                    # daemon 每 100 秒新增 21 条 distill 产物（~756 条/小时），
+                    # 其中 51% 是重复内容——入库去重落地前先用它把速率压下来。
+                    summary = self.distiller.run(
+                        limit=int(os.environ.get("HIPPOMIND_DISTILL_LIMIT", "64")))
                     # Whole-session digests are the throughput path for the
                     # 250k-message backlog: one model call per session instead
                     # of one per message.  Bounded so it never starves the
