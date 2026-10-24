@@ -106,10 +106,14 @@ def _digest(rows):
 #: the always-crashing ``hippomind pin`` was repaired.  Its *rendered* text did
 #: not move, and test_pin_help_text_is_unchanged pins that separately.
 PARSER_SURFACE = {
-    "(root)": ("ac8f5163bccc8e6dad9160c42ae383f4c1b8ffb315eefa46108877f86307d259", 44),
+    # +1 sub-command (capture-status) and therefore +1 SUBCOMMAND row.
+    "(root)": ("e3c7f69eb8fd1b8dd3db106a945d4f957a0667c61586b441f1ec54c2132aca2f", 45),
     "agent-status": ("c6ce3680226dad9d5019b2ce233e1580998dfc861921c6e3ca1f02ff8e4ed5bf", 7),
     "auto-context": ("bcd24f3b2a2dd0f637d61a2f1dc9744cf08d71cef0717f5dfc97203004d1af8c", 22),
     "backup": ("3ba2b08b93a835ababbf4b62a644915a0df48e7e998837500580929290eadfd5", 6),
+    # Added deliberately with the capture self-check (task-16): probe-only, so
+    # it takes the connection flags and one output-format switch.
+    "capture-status": ("3221fff0d7df8f217a0b1487d8a96fdc5cd86f556b4c7d5122f9ef08c9288875", 6),
     "checkup": ("f423e1adb4f6d6617acf985908bb9ffd532c4680269f621eaa066e566c5105c5", 7),
     "conflicts": ("aef6f57aa52644e95131795e33dbc4b0882d949530e3d9504e584982c149c28f", 8),
     "context": ("d3835f73f8eb2364e3b1e08e6281f45755352304564bd108ac8ec536f3b3b5ce", 22),
@@ -172,7 +176,7 @@ CLI_FACE = frozenset([
     "_start_or_reuse_daemon", "_start_or_reuse_daemon_locked", "_verified_scoped_credential", "agent_auto_rules",
     "agent_install_status", "annotations", "argparse", "build_auto_context",
     "build_parser", "cmd_agent_status", "cmd_auto_context", "cmd_backup",
-    "cmd_checkup", "cmd_conflicts", "cmd_context", "cmd_discover_agents",
+    "cmd_capture_status", "cmd_checkup", "cmd_conflicts", "cmd_context",
     "cmd_doctor", "cmd_export", "cmd_facts", "cmd_feedback",
     "cmd_forget", "cmd_graph", "cmd_import", "cmd_ingest",
     "cmd_init", "cmd_inject", "cmd_install_agents", "cmd_install_auto",
@@ -225,7 +229,7 @@ class CliPackageSurfaceTests(unittest.TestCase):
             if "|SUBCOMMAND " in row:
                 name = row.split("|SUBCOMMAND ")[1].split("|")[0]
                 handlers[name] = row.rsplit("func=", 1)[1]
-        self.assertEqual(42, len(handlers))
+        self.assertEqual(43, len(handlers))
         for name, handler in sorted(handlers.items()):
             self.assertTrue(callable(getattr(self.cli, handler)),
                             "%s -> %s is not reachable on hippomind.cli"

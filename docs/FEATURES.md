@@ -30,7 +30,7 @@
   （`memories` 表）可随时从事件重建——改错可回滚，历史不可篡改。
 - **单文件部署**：整个记忆就是一个 `.sqlite` 文件（+wal/shm），备份=复制文件。
 
-## 3. CLI 全部子命令（42 个）
+## 3. CLI 全部子命令（43 个）
 
 ### 3.1 生命周期
 | 命令 | 干什么 | 典型用法 |
@@ -81,6 +81,7 @@
 | `scan-raw` | 扫描 raw 证据占用 |
 | `login-install` / `login-remove` | 本机登录态管理（安装/移除登录自启项） |
 | `install-auto` / `install-agents` / `agent-status` / `discover-agents` | 给 Claude Code/Cursor 等写 MCP profile、查看接入状态 |
+| `capture-status` | **采集自检**：逐个 Agent 打印探测结果，不改账本。Cursor 明确三态 `detected` / `not_installed` / `unrecognized`（未识别≠0 条），装好 Cursor 后一眼看出是否被识别 |
 | `sync` / `watch` | 手动增量同步 / 前台观察采集 |
 | `sync-transcripts` | 增量采集 Claude/Codex 原生 JSONL 会话到账本（自动循环的 CLI 入口） |
 | `distill` | 自动提炼会话证据为 claims；`--provider auto|claude|heuristic`，`--dry-run` |
@@ -223,7 +224,9 @@ open -a Terminal python3 -m hippomind.main   # 打开可视化工作台
   检索主通道仍是词法，同义改写仍可能漏召回
 - 自动提炼已上线（本机 `claude -p` + 确定性回退），但吞吐 16 条/5 分钟，
   25 万 raw 历史尚未回填完
-- Cursor 本机未安装、无持久会话库，暂无采集适配器（见 AGENT_CAPTURE_COVERAGE.md）
+- Cursor 采集为**条件就绪**：适配器已实现并用合成 fixture 验证（`hippomind/cursor_capture.py`），
+  但**本机未安装 Cursor，未做端到端实测**；装好后 `hippomind capture-status` 显示 `detected` 即自动生效
+  （见 [AGENT_CAPTURE_COVERAGE.md](AGENT_CAPTURE_COVERAGE.md)）
 - 注入效果闭环缺失：只有 `injection.jsonl` 的注入留痕，没有“注入后是否被用上”的评估
 - 投影 API 返回形态不完全统一（list vs dict，消费方已适配）
 

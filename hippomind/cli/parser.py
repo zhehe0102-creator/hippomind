@@ -11,6 +11,7 @@ from ..auto_context import AUTO_MAX_CHARS, AUTO_MAX_ITEMS, AUTO_TRIGGER_MODES
 from ..context_pack import DEFAULT_MAX_CHARS, DEFAULT_MAX_TOKENS
 from . import cmd_auto_context
 from .cmd_data import cmd_export, cmd_import
+from .cmd_capture import cmd_capture_status
 from .cmd_integrate import cmd_agent_status, cmd_discover_agents, cmd_install_agents, cmd_install_auto
 from .cmd_lifecycle import (
     cmd_doctor, cmd_init, cmd_login_install, cmd_login_remove, cmd_monitor, cmd_start, cmd_status, cmd_stop,
@@ -217,6 +218,13 @@ def build_parser() -> argparse.ArgumentParser:
     _connection_arguments(discover)
     discover.add_argument("--home")
     discover.set_defaults(func=cmd_discover_agents)
+
+    capture_status = sub.add_parser(
+        "capture-status",
+        help="采集自检：逐个 Agent 打印探测结果（Cursor 为 detected/not_installed/unrecognized 三态）")
+    _connection_arguments(capture_status)
+    capture_status.add_argument("--format", choices=("text", "json"), default="text")
+    capture_status.set_defaults(func=cmd_capture_status)
 
     sync = sub.add_parser("sync", help="立即增量同步归档；daemon 不在时本地执行")
     _connection_arguments(sync)

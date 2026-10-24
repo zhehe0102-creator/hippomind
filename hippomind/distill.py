@@ -29,14 +29,98 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .ledger import LedgerError, SQLiteLedger, utc_now
+from .textutil import content_fingerprint
 
 CURSOR_PREFIX = "distill:"
-MAX_BATCH = 8
+#: Number of candidates sent to one model call.
+#:
+#: Measured on production data with the real backend (2026-10-24), see
+#: docs/DISTILL.md for the full tables.  Two measurements matter here.
+#:
+#: 1. Aggregate sweep, 3 blocks per size, distinct item sets per size:
+#:
+#:        size  s/call  s/item  item-coverage  claims/item
+#:           8    13.6    1.70         45.8%        0.83
+#:          16    18.4    1.15         47.9%        0.71
+#:          24    22.8    0.95         41.7%        0.62
+#:          32    31.7    0.99         34.4%        0.47
+#:          48    35.1    0.73         27.8%        0.42
+#:
+#:    This sweep alone would favour 16.  It is confounded: each size saw a
+#:    different item set, and items differ in how much extractable material they
+#:    contain, so "coverage" partly measures the items, not the batch.
+#:
+#: 2. Matched experiment, the one that decides: for each 16-item block, compare
+#:    one size-16 call against two size-8 calls *on the same items*, and count
+#:    items that received at least one valid claim (9 blocks, 144 items):
+#:
+#:        size-16 wall 173.0s   size-8 wall 289.9s   speedup 1.68x
+#:        items covered: size-16 64 / size-8 72
+#:        recall of size-16 vs size-8: 88.9%
+#:        items size-8 found that size-16 DROPPED: 18 (gained only 10)
+#:
+#:    So a batch of 16 silently loses ~11% of the items the smaller batch would
+#:    have distilled -- it does not fail, it just marks them "nothing to extract"
+#:    and moves on.  That is the exact failure this knob must not introduce:
+#:    speed bought by quietly doing less work.
+#:
+#: Therefore the default stays at 8.  The throughput win this module ships comes
+#: from content dedupe (4,019 rows -> 1,337 model calls) and from raising the
+#: per-pass limit, neither of which trades coverage for speed.  16 remains
+#: available via HIPPOMIND_DISTILL_BATCH for operators who measure their own
+#: corpus and accept the trade.
+DEFAULT_BATCH_SIZE = 8
+#: Hard ceiling for a caller-supplied batch size.  Above this the prompt alone
+#: exceeds the useful context window and coverage collapses.
+MAX_BATCH = 48
 MAX_CLAIMS_PER_SOURCE = 8
 MAX_SOURCE_CHARS = 1_200
 DEFAULT_CONFIDENCE = 0.55
+#: How many candidates one run() pass may claim.  The daemon calls run() on a
+#: timer, so this only bounds one tick's work, not the whole backlog.
+#:
+#: This is where the safe speedup lives.  It changes *how many* items a pass
+#: handles, never *how many share one model call*, so per-item quality is
+#: identical to before; it just stops the pass from idling between ticks.
+#: 64 rows at batch 8 is 8 model calls per pass (~110s at the measured 13.6s
+#: per call), comfortably inside the daemon tick.
+DEFAULT_RUN_LIMIT = 64
+#: Cap on identical-content rows retired per pass (see _candidates).
+DEFAULT_DEDUPE_MARKS = 4_000
 DECISION_MARKERS = ("决定", "采用", "结论", "必须", "不能", "不要", "偏好",
                     "选择", "修复", "原因", "部署", "配置", "使用")
+
+
+def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    """Read a bounded integer tuning knob from the environment.
+
+    Every throughput knob is overridable so an operator can retune a live
+    daemon without editing code, but never to a value the measurement above
+    showed to be harmful: out-of-range input falls back to the default instead
+    of silently producing a batch the model cannot handle.
+    """
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    if value < minimum or value > maximum:
+        return default
+    return value
+
+
+def default_batch_size() -> int:
+    """Batch size for one extraction call (HIPPOMIND_DISTILL_BATCH)."""
+    return _env_int("HIPPOMIND_DISTILL_BATCH", DEFAULT_BATCH_SIZE,
+                    minimum=1, maximum=MAX_BATCH)
+
+
+def default_run_limit() -> int:
+    """Candidates claimed per run() pass (HIPPOMIND_DISTILL_LIMIT)."""
+    return _env_int("HIPPOMIND_DISTILL_LIMIT", DEFAULT_RUN_LIMIT,
+                    minimum=1, maximum=200)
 
 
 def _clean(value: Any, limit: int = 500) -> str:
@@ -183,8 +267,18 @@ class DistillEngine:
         provider = os.environ.get("HIPPOMIND_DISTILL_PROVIDER", "auto").strip().lower()
         self.extractor = None if provider in {"heuristic", "off"} else ClaudeExtractor()
 
-    def _candidates(self, limit: int, *, include_raw: bool = True) -> List[Candidate]:
+    def _candidates(self, limit: int, *, include_raw: bool = True,
+                    window: Optional[int] = None) -> List[Candidate]:
+        """Fetch pending candidates, newest first, split between the two queues.
+
+        window deliberately over-fetches relative to limit: identical content is
+        common (raw chat re-captured across sessions), so the caller needs a
+        wider row window than the number of distinct items it wants to hand to
+        the model.  Fetching is cheap; a model call is not.
+        """
         limit = max(1, min(200, int(limit)))
+        if window is not None:
+            limit = max(limit, min(1_000, int(window)))
         # Keep both queues moving: half the batch from structured projections
         # (task/progress/decision), half from newest raw chat.  A pure
         # created_at sort would let 250k raw rows starve structured memory; a
@@ -405,17 +499,88 @@ class DistillEngine:
                 continue
         return resolved
 
-    def run(self, *, limit: int = 32, dry_run: bool = False,
-            include_raw: bool = True) -> Dict[str, Any]:
+    @staticmethod
+    def _dedupe_groups(candidates: Sequence[Candidate]) -> List[Tuple[Candidate, List[Candidate]]]:
+        """Group candidates that carry the same normalised content.
+
+        Raw chat is re-captured across sessions, so the pending queue is mostly
+        repeats: on the 2026-10-24 production backlog 4,067 pending rows held
+        only 1,367 distinct contents.  Paying a model call per row means paying
+        about 3x for the same answer.
+
+        The first (newest) member of each group is the representative that goes
+        to the model.  The rest are kept, not discarded: each one still gets its
+        own distilled record with its own evidence link, so ledger provenance is
+        unchanged.  Only the model call is shared.
+        """
+        groups: Dict[str, List[Candidate]] = {}
+        order: List[str] = []
+        for candidate in candidates:
+            # Fingerprint the *normalised* body, not the raw one: two rows that
+            # differ only by captured whitespace or a runner wrapper are one
+            # message.  An empty body fingerprints to the digest of "" -- a
+            # constant -- so it has to be excluded explicitly or every blank row
+            # in the queue would collapse into a single group.
+            key = content_fingerprint(candidate.content) if candidate.content.strip() else ""
+            if not key:
+                # An empty/unfingerprintable body must never collapse with
+                # another one; give it a unique key so it stands alone.
+                key = chr(0) + candidate.memory_id
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append(candidate)
+        return [(groups[key][0], groups[key][1:]) for key in order]
+
+    def _mark_duplicate(self, candidate: Candidate, representative_id: str) -> None:
+        """Retire a repeat row without a model call, keeping the audit trail.
+
+        The cursor records which representative answered for this row, so the
+        decision is reversible: deleting the cursor puts the row back in the
+        queue if the shared extraction is ever judged wrong for it.
+        """
+        self.ledger.set_cursor(CURSOR_PREFIX + candidate.memory_id, "1",
+                               metadata={"claims": 0, "at": utc_now(),
+                                         "dedupe_of": representative_id})
+
+    def run(self, *, limit: Optional[int] = None, dry_run: bool = False,
+            include_raw: bool = True, batch_size: Optional[int] = None,
+            dedupe: bool = True) -> Dict[str, Any]:
+        """Distil one bounded pass of pending evidence into claims.
+
+        batch_size (default 8, env HIPPOMIND_DISTILL_BATCH) is the number of
+        *distinct* items per model call.  limit (default 64, env
+        HIPPOMIND_DISTILL_LIMIT) bounds how many pending rows one pass claims.
+        dedupe collapses identical content to one model call while still
+        distilling every row.
+        """
         started = time.time()
-        candidates = self._candidates(limit, include_raw=include_raw)
-        summary = {"candidates": len(candidates), "batches": 0, "claims": 0,
+        limit = default_run_limit() if limit is None else max(1, min(200, int(limit)))
+        size = default_batch_size() if batch_size is None else max(1, min(MAX_BATCH, int(batch_size)))
+        # Over-fetch so dedupe still yields limit distinct representatives.
+        window = limit if not dedupe else min(1_000, limit * 4)
+        candidates = self._candidates(limit, include_raw=include_raw, window=window)
+        groups = (self._dedupe_groups(candidates) if dedupe
+                  else [(candidate, []) for candidate in candidates])
+        groups = groups[:limit]
+        representatives = [group[0] for group in groups]
+        duplicates = sum(len(group[1]) for group in groups)
+        # Report what this pass will actually handle, not how wide the fetch
+        # window was: dedupe reads limit*4 rows to find limit distinct ones, so
+        # the raw fetch count would overstate the pass by ~4x and make any
+        # throughput computed from it wrong.  "fetched" keeps the raw number
+        # visible for diagnosing dedupe efficiency.
+        summary = {"candidates": len(representatives) + duplicates,
+                   "distinct": len(representatives),
+                   "duplicates": duplicates,
+                   "fetched": len(candidates),
+                   "batch_size": size, "batches": 0, "claims": 0,
                    "distilled": 0, "skipped": 0, "errors": 0,
                    "extractor": "none", "conflicts_resolved": 0,
                    "elapsed_ms": 0.0}
         last_by_subject: Dict[str, str] = {}
-        for start in range(0, len(candidates), MAX_BATCH):
-            batch = candidates[start:start + MAX_BATCH]
+        for start in range(0, len(representatives), size):
+            batch = representatives[start:start + size]
             if not batch:
                 continue
             summary["batches"] += 1
@@ -429,10 +594,15 @@ class DistillEngine:
                 by_source.setdefault(source, []).append(claim)
             for index, candidate in enumerate(batch, 1):
                 source_claims = by_source.get(index, [])
+                # Repeats share this group's claims; they are retired together
+                # with it so a batch never half-finishes.
+                repeats = groups[start + index - 1][1]
                 if not source_claims:
-                    summary["skipped"] += 1
+                    summary["skipped"] += 1 + len(repeats)
                     if not dry_run:
                         self._mark(candidate, 0)
+                        for repeat in repeats:
+                            self._mark_duplicate(repeat, candidate.memory_id)
                     continue
                 summary["claims"] += len(source_claims)
                 if dry_run:
@@ -448,6 +618,16 @@ class DistillEngine:
                     summary["distilled"] += 1
                 except (LedgerError, ValueError):
                     summary["errors"] += 1
+                    continue
+                for repeat in repeats:
+                    try:
+                        repeat_parent = last_by_subject.get(subject, "") or result.memory_id
+                        self.ledger.ingest(self._record(repeat, source_claims,
+                                                        extractor_name, repeat_parent))
+                        self._mark_duplicate(repeat, candidate.memory_id)
+                        summary["distilled"] += 1
+                    except (LedgerError, ValueError):
+                        summary["errors"] += 1
         if not dry_run:
             summary["conflicts_resolved"] = self.resolve_conflicts()
             try:

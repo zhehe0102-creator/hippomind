@@ -30,6 +30,29 @@ RULES_BEGIN = "<!-- HIPPO-MIND-AUTO-CONTEXT:BEGIN -->"
 RULES_END = "<!-- HIPPO-MIND-AUTO-CONTEXT:END -->"
 
 
+def _load_vector_index(ledger: SQLiteLedger, embedder):
+    """可选神经向量索引：任何失败都返回 None，注入路径绝不因此报错。
+
+    向量参与的是**候选生成**（ledger.search 的第三路召回），不是重排。
+    实测（docs/SEMANTIC.md）：改写式查询 recall 0.200 -> 0.533，关键词集持平。
+    索引未构建 / onnxruntime 缺失 / numpy 缺失时静默退回纯词法路径。
+    """
+    if os.environ.get("HIPPOMIND_VECTOR_INDEX", "1").strip().lower() in {"0", "off", "false"}:
+        return None
+    try:
+        from .semantic_onnx import load_onnx_embedder
+        from .vector_index import load_vector_index
+    except Exception:
+        return None
+    try:
+        onnx_embedder = load_onnx_embedder()
+        if onnx_embedder is None:
+            return None
+        return load_vector_index(ledger, onnx_embedder)
+    except Exception:
+        return None
+
+
 def extract_memory_request(request: str, *, mode: str = "anywhere") -> Dict[str, Any]:
     """Apply the explicit memory marker gate without touching the ledger."""
     value = str(request or "").strip()
@@ -142,7 +165,10 @@ def build_auto_context(ledger: SQLiteLedger, request: str, *, scope: str = "shar
         embedder = load_embedder()
     except Exception:
         embedder = None
-    return ContextPackBuilder(ledger, embedder=embedder).build(request, options)
+    return ContextPackBuilder(
+        ledger, embedder=embedder,
+        vector_index=_load_vector_index(ledger, embedder),
+    ).build(request, options)
 
 
 def render_untrusted_context(pack: Dict[str, Any], *, max_chars: int = AUTO_MAX_CHARS) -> str:

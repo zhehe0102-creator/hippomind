@@ -502,6 +502,9 @@ from .cmd_maintain import (  # noqa: E402  (re-exports follow the helpers they f
     cmd_checkup as cmd_checkup, cmd_maintain as cmd_maintain, cmd_recovery_check as cmd_recovery_check,
     cmd_redact_raw as cmd_redact_raw, cmd_restore as cmd_restore, cmd_scan_raw as cmd_scan_raw,
 )
+from .cmd_capture import (  # noqa: E402  (re-exports follow the helpers they feed)
+    cmd_capture_status as cmd_capture_status,
+)
 from .cmd_integrate import (  # noqa: E402  (re-exports follow the helpers they feed)
     cmd_agent_status as cmd_agent_status, cmd_discover_agents as cmd_discover_agents,
     cmd_install_agents as cmd_install_agents, cmd_install_auto as cmd_install_auto,

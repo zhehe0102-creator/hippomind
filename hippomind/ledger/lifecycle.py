@@ -13,7 +13,7 @@ import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from ..schema import fts_indexed_predicate
 from ._helpers import (
     CONTEXT_FIELDS,
@@ -474,6 +474,337 @@ class LifecycleMixin:
             """).rowcount
             return {"superseded": int(superseded or 0), "conflict": int(conflicted or 0),
                     "reactivated": int(orphaned or 0)}
+
+        return self._transaction(write)
+
+    def _converge_claim_memory(self, conn: sqlite3.Connection, memory_ids: Sequence[str],
+                               now: str) -> Dict[str, Any]:
+        """Re-establish the claims invariant for the given memories.
+
+        The invariant (checked by ``claims_consistency_report``) is:
+
+            an ``active`` claim implies its memory is ``accepted``;
+            a ``conflict`` claim implies its memory is flagged ``conflict``.
+
+        ``quality_state='conflict'`` is a *memory-level* flag, so one disputed
+        slot takes a memory's unrelated claims down with it.  Those collateral
+        claims have no competitor of their own - they are orphans - and nothing
+        ever released them, because ``repair_claim_states`` only reactivates an
+        orphan when its memory is already accepted+active, while the memory
+        could not become accepted while it still carried conflict claims.
+        That circular wait is what parked 36 claims in the production queue.
+
+        Convergence here is a fixed point, in two steps per memory:
+
+        1. release every conflict claim that has no live competitor in its own
+           slot (it is collateral, not a disagreement);
+        2. recompute the flag from what is left - still disputed means the
+           flag stays and no claim of that memory may be active; otherwise the
+           flag clears to ``accepted``.
+
+        Memories that are not on the active lifecycle are skipped entirely:
+        their flags belong to the supersede/expire machinery, not to this one.
+        """
+        released: List[str] = []
+        cleared: List[str] = []
+        reflagged: List[str] = []
+        retired: List[str] = []
+        for memory_id in dict.fromkeys(memory_ids):
+            row = conn.execute(
+                "SELECT quality_state,lifecycle FROM memories WHERE memory_id=?",
+                (memory_id,)).fetchone()
+            if row is None:
+                continue
+            if str(row["lifecycle"]) != "active":
+                # The memory is already out of recall (superseded/expired), so
+                # its conflict claims are stale bookkeeping: neither side can be
+                # crowned and neither can be released into an active slot.
+                # Retire them so the review queue reflects only live disputes.
+                # This changes no recall decision - a claim on a superseded
+                # memory was never recallable either way - and the lineage
+                # stays intact (the claim row is updated, never deleted).
+                stale = conn.execute(
+                    "UPDATE memory_claims SET state='superseded' "
+                    "WHERE memory_id=? AND state='conflict'",
+                    (memory_id,)).rowcount
+                if stale:
+                    retired.append(memory_id)
+                continue
+            conflicts = conn.execute(
+                "SELECT claim_id, scope, subject, predicate, slot_key "
+                "FROM memory_claims WHERE memory_id=? AND state='conflict'",
+                (memory_id,)).fetchall()
+            for claim in conflicts:
+                rival = conn.execute(
+                    "SELECT 1 FROM memory_claims WHERE claim_id!=? AND state IN "
+                    "('active','conflict') AND scope=? AND subject=? AND "
+                    "predicate=? AND slot_key=? LIMIT 1",
+                    (claim["claim_id"], claim["scope"], claim["subject"],
+                     claim["predicate"], claim["slot_key"])).fetchone()
+                if rival is None:
+                    conn.execute(
+                        "UPDATE memory_claims SET state='active' "
+                        "WHERE claim_id=?", (claim["claim_id"],))
+                    released.append(str(claim["claim_id"]))
+            remaining = int(conn.execute(
+                "SELECT COUNT(*) FROM memory_claims "
+                "WHERE memory_id=? AND state='conflict'",
+                (memory_id,)).fetchone()[0])
+            if remaining:
+                if str(row["quality_state"]) != "conflict":
+                    conn.execute(
+                        "UPDATE memories SET quality_state='conflict',"
+                        "updated_at=? WHERE memory_id=?", (now, memory_id))
+                moved = conn.execute(
+                    "UPDATE memory_claims SET state='conflict' "
+                    "WHERE memory_id=? AND state='active'",
+                    (memory_id,)).rowcount
+                if moved:
+                    reflagged.append(memory_id)
+                continue
+            if str(row["quality_state"]) != "conflict":
+                continue
+            conn.execute(
+                "UPDATE memories SET quality_state='accepted',updated_at=? "
+                "WHERE memory_id=?", (now, memory_id))
+            cleared.append(memory_id)
+        return {"orphans_released": released, "quality_cleared": cleared,
+                "reflagged": reflagged, "stale_retired": retired}
+
+    def _slot_claims(self, conn: sqlite3.Connection,
+                     slot: Sequence[str]) -> List[sqlite3.Row]:
+        """Every claim in one (scope, subject, predicate, slot_key) tuple."""
+        return conn.execute("""
+            SELECT c.claim_id, c.memory_id, c.state, m.quality_state,
+                   m.lifecycle, m.task_id, m.project, m.content, m.metadata_json,
+                   m.source_agent, m.kind
+            FROM memory_claims c JOIN memories m ON m.memory_id=c.memory_id
+            WHERE c.scope=? AND c.subject=? AND c.predicate=? AND c.slot_key=?
+        """, tuple(slot)).fetchall()
+
+    def _claim_slot(self, conn: sqlite3.Connection,
+                    claim_id: str) -> Tuple[sqlite3.Row, Tuple[str, str, str, str]]:
+        claim = conn.execute("SELECT * FROM memory_claims WHERE claim_id=?",
+                             (claim_id,)).fetchone()
+        if claim is None:
+            raise LedgerError(f"未找到 claim: {claim_id}")
+        return claim, (claim["scope"], claim["subject"], claim["predicate"],
+                       claim["slot_key"])
+
+    def settle_claim_slot(self, claim_id: str, winner_memory_id: str = "",
+                          *, source_agent: str = "local-admin") -> Dict[str, Any]:
+        """Settle one conflict slot without the memory-wide blast radius.
+
+        ``resolve_claim`` demotes *every* claim of a losing memory, so crowning
+        a winner on one slot silently deletes that memory's unrelated facts
+        from recall.  On the production ledger that would have cost up to five
+        unrelated active claims per ruling.
+
+        This is the same decision scoped to the exact
+        (scope, subject, predicate, slot_key) tuple:
+
+        * the winner's claim in this slot becomes active;
+        * every other live claim in this slot becomes superseded;
+        * a losing memory is marked superseded only when no active claim is
+          left *anywhere* - otherwise it keeps its other facts;
+        * ``winner_memory_id=""`` retires the whole slot (no side survives).
+
+        Lineage is preserved either way: nothing is deleted and a superseded
+        memory still points at its ``superseded_by``.  ``settled`` in the
+        result says whether the crowned claim really ended up active - it is
+        False when the winning memory still holds conflicts in *other* slots,
+        which must be settled before this slot can take effect.
+        """
+        claim_id = _short(claim_id, 80)
+        winner_memory_id = _short(winner_memory_id, 80)
+        if not claim_id:
+            raise LedgerError("settle_claim_slot 需要 claim_id")
+        now = utc_now()
+
+        def write(conn: sqlite3.Connection) -> Dict[str, Any]:
+            claim, slot = self._claim_slot(conn, claim_id)
+            rows = self._slot_claims(conn, slot)
+            live = [r for r in rows if str(r["state"]) in ("active", "conflict")]
+            group_ids = {str(r["memory_id"]) for r in rows}
+            if winner_memory_id and winner_memory_id not in group_ids:
+                raise LedgerError("胜者不在该冲突组内")
+            retired: List[str] = []
+            for row in live:
+                mid = str(row["memory_id"])
+                if winner_memory_id and mid == winner_memory_id:
+                    continue
+                conn.execute(
+                    "UPDATE memory_claims SET state='superseded' WHERE claim_id=?",
+                    (str(row["claim_id"]),))
+                retired.append(str(row["claim_id"]))
+            crowned: List[str] = []
+            if winner_memory_id:
+                winner = conn.execute("SELECT * FROM memories WHERE memory_id=?",
+                                      (winner_memory_id,)).fetchone()
+                if winner is None:
+                    raise LedgerError("未找到胜者记忆")
+                # Restore the winner to a recallable state, mirroring
+                # resolve_claim (which had to fix lifecycle, not just quality).
+                conn.execute(
+                    "UPDATE memories SET quality_state='accepted',"
+                    "lifecycle=CASE WHEN lifecycle='superseded' THEN 'active' "
+                    "ELSE lifecycle END,"
+                    "superseded_by=CASE WHEN lifecycle='superseded' THEN '' "
+                    "ELSE superseded_by END,updated_at=? WHERE memory_id=?",
+                    (now, winner_memory_id))
+                conn.execute(
+                    "UPDATE memory_claims SET state='active' "
+                    "WHERE memory_id=? AND state!='active' "
+                    "AND scope=? AND subject=? AND predicate=? AND slot_key=?",
+                    (winner_memory_id, *slot))
+                crowned = [str(r["claim_id"]) for r in live
+                           if str(r["memory_id"]) == winner_memory_id]
+                has_fts = conn.execute(
+                    "SELECT 1 FROM memory_fts WHERE memory_id=?",
+                    (winner_memory_id,)).fetchone()
+                should_index = conn.execute(
+                    "SELECT 1 FROM memories WHERE memory_id=? AND "
+                    + fts_indexed_predicate(), (winner_memory_id,)).fetchone() is not None
+                if should_index and has_fts is None:
+                    fts_text = _fts_text(winner["content"],
+                                         json.loads(winner["metadata_json"] or "{}"))
+                    conn.execute(
+                        "INSERT INTO memory_fts(memory_id,content,task_id,project,"
+                        "source_agent,kind) VALUES(?,?,?,?,?,?)",
+                        (winner_memory_id, fts_text, winner["task_id"],
+                         winner["project"], winner["source_agent"], winner["kind"]))
+            # Losing memories: keep them alive while they still hold facts.
+            demoted: List[str] = []
+            for row in live:
+                mid = str(row["memory_id"])
+                if winner_memory_id and mid == winner_memory_id:
+                    continue
+                if str(row["quality_state"]) in ("quarantine", "expired"):
+                    continue
+                remaining = conn.execute(
+                    "SELECT COUNT(*) FROM memory_claims "
+                    "WHERE memory_id=? AND state IN ('active','conflict')",
+                    (mid,)).fetchone()[0]
+                if int(remaining):
+                    continue
+                conn.execute(
+                    "UPDATE memories SET quality_state='superseded',"
+                    "lifecycle='superseded',superseded_by=?,updated_at=? "
+                    "WHERE memory_id=?", (winner_memory_id, now, mid))
+                conn.execute("DELETE FROM memory_fts WHERE memory_id=?", (mid,))
+                demoted.append(mid)
+            touched = [str(r["memory_id"]) for r in rows]
+            state = self._converge_claim_memory(conn, touched, now)
+            settled = bool(winner_memory_id) and conn.execute(
+                "SELECT 1 FROM memory_claims WHERE claim_id=? AND state='active'",
+                (crowned[0],)).fetchone() is not None if crowned else False
+            digest = _hash("settle-slot", claim_id, winner_memory_id, *sorted(retired))
+            conn.execute("""
+                INSERT OR IGNORE INTO ledger_events(
+                    event_id,event_type,occurred_at,ingested_at,source_agent,session_id,
+                    task_id,project,role,scope,evidence_json,content,content_hash,
+                    metadata_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, ("evt_" + digest[:32], "resolve", now, now,
+                  _short(source_agent, 128), "", "", "", "system", claim["scope"],
+                  _json(["claim:" + claim_id], "evidence"), "", digest,
+                  _json({"claim_id": claim_id, "mode": "slot",
+                         "winner": winner_memory_id, "crowned": crowned,
+                         "retired": retired, "demoted": demoted,
+                         "settled": settled,
+                         "quality_cleared": state["quality_cleared"],
+                         "subject": claim["subject"],
+                         "predicate": claim["predicate"],
+                         "slot_key": claim["slot_key"]}, "metadata")))
+            return {"claim_id": claim_id, "winner": winner_memory_id,
+                    "crowned": crowned, "retired": retired, "demoted": demoted,
+                    "settled": settled,
+                    "quality_cleared": state["quality_cleared"],
+                    "reflagged": state["reflagged"]}
+
+        return self._transaction(write)
+
+    def release_claim_slot(self, claim_id: str, *,
+                           source_agent: str = "local-admin") -> Dict[str, Any]:
+        """Clear one slot's conflict without crowning a winner (keep-both).
+
+        ``resolve_claim`` always picks a winner, which is wrong for a slot whose
+        two sides are both legitimate: two different projects sharing a
+        predicate, or a fact plus its own refinement.  Deleting either side
+        would lose information, so this releases every live claim in the slot
+        back to ``active`` and leaves the memories alone.
+
+        Safety: nothing is retired - no memory changes lifecycle, no claim is
+        deleted, both values stay recallable.  A claim whose memory is out of
+        recall for an unrelated reason (superseded/expired) is refused rather
+        than activated, and a memory that still holds conflicts in *other*
+        slots cannot have active claims at all, so its release is reported as
+        ``blocked`` instead of producing a dangling claim.
+
+        Slot isolation: the release is scoped to the exact
+        (scope, subject, predicate, slot_key) tuple, so a memory holding other
+        facts keeps them.
+        """
+        claim_id = _short(claim_id, 80)
+        if not claim_id:
+            raise LedgerError("release_claim_slot 需要 claim_id")
+        now = utc_now()
+
+        def write(conn: sqlite3.Connection) -> Dict[str, Any]:
+            claim, slot = self._claim_slot(conn, claim_id)
+            rows = self._slot_claims(conn, slot)
+            released: List[str] = []
+            blocked: List[str] = []
+            for row in rows:
+                if str(row["state"]) != "conflict":
+                    continue
+                mid = str(row["memory_id"])
+                if str(row["lifecycle"]) != "active":
+                    blocked.append(str(row["claim_id"]))
+                    continue
+                others = int(conn.execute(
+                    "SELECT COUNT(*) FROM memory_claims WHERE memory_id=? "
+                    "AND state='conflict' AND NOT (scope=? AND subject=? "
+                    "AND predicate=? AND slot_key=?)",
+                    (mid, *slot)).fetchone()[0])
+                if others:
+                    blocked.append(str(row["claim_id"]))
+                    continue
+                conn.execute(
+                    "UPDATE memory_claims SET state='active' WHERE claim_id=?",
+                    (str(row["claim_id"]),))
+                released.append(str(row["claim_id"]))
+            touched = [str(r["memory_id"]) for r in rows]
+            state = self._converge_claim_memory(conn, touched, now)
+            retired = state.get("stale_retired") or []
+            if not released:
+                # The slot may still have been cleared by retiring stale
+                # conflicts on dead memories; report that honestly instead of
+                # claiming nothing happened.
+                return {"released": [], "blocked": blocked, "claim_id": claim_id,
+                        "slot_cleared": bool(retired),
+                        "quality_cleared": state["quality_cleared"],
+                        "stale_retired": retired}
+            digest = _hash("release-slot", claim_id, *sorted(released))
+            conn.execute("""
+                INSERT OR IGNORE INTO ledger_events(
+                    event_id,event_type,occurred_at,ingested_at,source_agent,
+                    session_id,task_id,project,role,scope,evidence_json,content,
+                    content_hash,metadata_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, ("evt_" + digest[:32], "release", now, now,
+                  _short(source_agent, 128), "", "", "", "system", claim["scope"],
+                  _json(["claim:" + claim_id], "evidence"), "", digest,
+                  _json({"claim_id": claim_id, "released": released,
+                         "blocked": blocked,
+                         "quality_cleared": state["quality_cleared"],
+                         "subject": claim["subject"],
+                         "predicate": claim["predicate"],
+                         "slot_key": claim["slot_key"]}, "metadata")))
+            return {"released": released, "blocked": blocked,
+                    "claim_id": claim_id, "slot_cleared": True,
+                    "quality_cleared": state["quality_cleared"],
+                    "stale_retired": retired}
 
         return self._transaction(write)
 

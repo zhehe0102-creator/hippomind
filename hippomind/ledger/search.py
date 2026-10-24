@@ -35,6 +35,16 @@ from ._helpers import (
     utc_now,
 )
 
+#: RRF 融合常数（Reciprocal Rank Fusion，k=60 是通行取值）。
+#: 之前 fts/like 两个通道的 1/(60+rank) 是硬编码字面量；提成常量后默认值
+#: 与字面量完全相同（60.0），生产排序逐字节不变（有测试锁定）。
+_RRF_K = 60.0
+
+#: 向量通道参与候选生成时，各通道各取多少条做 RRF 融合。
+#: 96 来自实测：15 条改写式查询 recall 0.333 -> 0.400，46 条关键词 1.000 -> 0.978。
+_DEFAULT_VECTOR_TOPN = 96
+
+
 class SearchMixin:
     """Lexical retrieval: FTS5, LIKE rescue, coverage scoring, ranking, paging."""
 
@@ -151,6 +161,90 @@ class SearchMixin:
         # 实测 50k 行救援路径 ~160ms，词项数是其主要成本项。
         return seen[:8]
 
+    def _vector_candidates(self, query: str, vector_index, clauses: Sequence[str],
+                           params: Sequence[object], *, topn: int = _DEFAULT_VECTOR_TOPN,
+                           include_cold: bool = True, as_of: str = ""
+                           ) -> Tuple[Dict[str, int], Dict[str, sqlite3.Row]]:
+        """神经向量候选通道：返回 (id->名次, id->账本行)。
+
+        与 embedder 的"重排"角色不同，这里向量**生成候选**——词法完全没命中的
+        改写式查询也能被召回，这是本次改造唯一的正收益来源（实测见
+        docs/SEMANTIC.md 的「神经向量」章节）。
+
+        三个必须做对的地方：
+
+        1. **过滤必须在 SQL 里重放**：向量索引覆盖全库 accepted+active，而本次
+           检索可能带 scope/project/task/时间窗口/raw_chat 过滤。只按 memory_id
+           取行而不重放 clauses，会让跨 scope 的记忆悄悄进入结果——那是越权
+           召回，不是"召回率提升"。
+        2. **按过滤损耗超额取数**：索引里 top-N 有一部分会被过滤掉，所以先取
+           topn * 4 再裁剪回 topn，避免过滤后通道过窄。
+        3. **永不抛异常**：索引/embedder 任何失败都返回空，调用方继续走纯词法
+           路径。检索不能因为可选组件而失败。
+        """
+        if vector_index is None or not str(query or "").strip():
+            return {}, {}, {}
+        try:
+            fetch = max(1, int(topn)) * 4
+            hits = vector_index.search_text(query, topn=fetch)
+        except Exception:
+            return {}, {}, {}
+        if not hits:
+            return {}, {}, {}
+        ranked: List[Tuple[str, int]] = []
+        # 余弦值必须一起带出来：下游的相关性门控（context_pack）要判断
+        # "这条是可靠的语义命中，还是仅仅话题相近"，只看名次不够。
+        similarity: Dict[str, float] = {}
+        seen = set()
+        for position, entry in enumerate(hits):
+            try:
+                memory_id = str(entry[0])
+            except (IndexError, TypeError):
+                continue
+            if memory_id and memory_id not in seen:
+                seen.add(memory_id)
+                ranked.append((memory_id, position))
+                try:
+                    similarity[memory_id] = float(entry[1])
+                except (IndexError, TypeError, ValueError):
+                    similarity[memory_id] = 0.0
+        if not ranked:
+            return {}, {}, {}
+        ids = [memory_id for memory_id, _position in ranked]
+        rows: Dict[str, sqlite3.Row] = {}
+        # SQLite 的变量上限（老版本 999）必须尊重：分批查询而不是一次塞几千个。
+        chunk = 500
+        try:
+            with self._reading() as conn:
+                for start in range(0, len(ids), chunk):
+                    batch = ids[start:start + chunk]
+                    where = ["m.memory_id IN (" + ",".join("?" for _ in batch) + ")",
+                             *clauses]
+                    for row in conn.execute(
+                            "SELECT m.* FROM memories m WHERE " + " AND ".join(where),
+                            (*batch, *params)).fetchall():
+                        rows[row["memory_id"]] = row
+        except sqlite3.DatabaseError:
+            return {}, {}, {}
+        if not rows:
+            return {}, {}, {}
+        # 名次按"过滤后仍然存在"重新紧凑编号：否则被过滤掉的 top 行会留下空洞，
+        # 让 RRF 的 1/(k+rank) 系统性偏小。
+        order: Dict[str, int] = {}
+        kept: Dict[str, sqlite3.Row] = {}
+        for memory_id in ids:
+            row = rows.get(memory_id)
+            if row is None or memory_id in order:
+                continue
+            order[memory_id] = len(order)
+            kept[memory_id] = row
+            if len(order) >= max(1, int(topn)):
+                break
+        # 余弦随候选一起返回，而不是挂在 self 上：daemon 是多线程的，
+        # 实例属性会在并发查询之间互相污染。
+        return order, kept, {memory_id: similarity.get(memory_id, 0.0)
+                             for memory_id in order}
+
     @staticmethod
     def _query_coverage(query: str, corpus: str) -> Tuple[float, bool]:
         """Measure meaningful textual overlap independently of FTS rank.
@@ -236,7 +330,9 @@ class SearchMixin:
                roles: Optional[Sequence[str]] = None, from_time: str = "", to_time: str = "",
                include_raw_chat: bool = False, require_evidence: bool = True,
                include_cold: bool = True, limit: int = 80, offset: int = 0,
-               embedder=None, as_of: str = "") -> List[Dict[str, Any]]:
+               embedder=None, as_of: str = "",
+               vector_index=None, vector_topn: int = _DEFAULT_VECTOR_TOPN,
+               rrf_k: float = _RRF_K) -> List[Dict[str, Any]]:
         started = _time_mod.perf_counter()
         try:
             return self._search_impl(
@@ -244,7 +340,8 @@ class SearchMixin:
                 source_agents=source_agents, roles=roles, from_time=from_time,
                 to_time=to_time, include_raw_chat=include_raw_chat,
                 require_evidence=require_evidence, include_cold=include_cold,
-                limit=limit, offset=offset, embedder=embedder, as_of=as_of)
+                limit=limit, offset=offset, embedder=embedder, as_of=as_of,
+                vector_index=vector_index, vector_topn=vector_topn, rrf_k=rrf_k)
         finally:
             self._record_search_latency(_time_mod.perf_counter() - started)
 
@@ -253,10 +350,24 @@ class SearchMixin:
                      roles: Optional[Sequence[str]] = None, from_time: str = "", to_time: str = "",
                      include_raw_chat: bool = False, require_evidence: bool = True,
                      include_cold: bool = True, limit: int = 80, offset: int = 0,
-                     embedder=None, as_of: str = "") -> List[Dict[str, Any]]:
-        """``embedder``：可选向量通道（EmbeddingAdapter）。仅做重排融合，
+                     embedder=None, as_of: str = "",
+                     vector_index=None, vector_topn: int = _DEFAULT_VECTOR_TOPN,
+                     rrf_k: float = _RRF_K) -> List[Dict[str, Any]]:
+        """embedder：可选向量通道（EmbeddingAdapter）。仅做重排融合，
         不参与候选生成；候选数超过 600 时自动跳过以约束成本。
-        ``as_of``：双时态历史切片（对齐 zep/Graphiti point-in-time 语义）——
+
+        vector_index：可选神经向量索引（vector_index.VectorIndex）。与 embedder
+        的分工是本次改造的核心实测结论——**向量只进重排会让指标变差**（46 条
+        关键词查询 recall 1.000 -> 0.85~0.91，因为 phrase 命中时 lexical 恒为
+        1.0，0.2 权重的向量压不过它）；让向量**参与候选生成**（向量 top-N 与
+        FTS/LIKE 做 RRF）才有正收益（改写集 0.333 -> 0.400）。因此这里把向量
+        召回当作第三路候选来源，并按名次参与既有 RRF 打分。
+
+        **默认关闭**：vector_index=None 时本函数行为与改造前逐字节相同（有测试
+        锁定）。索引打不开 / 查询向量为空 / 维度不符时静默退化为纯词法路径，
+        绝不抛异常——检索不能因为可选组件而失败。
+
+        as_of：双时态历史切片（对齐 zep/Graphiti point-in-time 语义）——
         给定 ISO 时间点时，valid_from/valid_until 窗口按该时刻求值，
         可回答"当时系统认为什么为真"；默认空 = 现在。"""
         query = _text(query, MAX_QUERY_CHARS, "query")
@@ -319,7 +430,13 @@ class SearchMixin:
         cache_key = (self.generation, query, scope, task_id, project,
                      tuple(source_agents), tuple(roles), from_time, to_time,
                      include_raw_chat, require_evidence, include_cold,
-                     limit, offset, embedder is not None, as_of)
+                     limit, offset, embedder is not None, as_of,
+                     # 向量通道必须进缓存键：否则开关它时同一 query 会命中上一次
+                     # 的缓存页，A/B 对比直接失真（context_pack 的
+                     # fold/hybrid_rerank 开关踩过同一个坑）。
+                     id(vector_index) if vector_index is not None else None,
+                     int(vector_topn) if vector_index is not None else None,
+                     float(rrf_k) if vector_index is not None else None)
         cached = self._search_cached(cache_key) if query else None
         if cached is not None:
             return cached
@@ -493,7 +610,28 @@ class SearchMixin:
                          min(_LIKE_SCAN_WINDOW, max(limit + offset, limit * 8)),
                          *bg_params[len(params):]),
                     ).fetchall()
-        if query and not candidate_rows:
+        # 神经向量候选通道（可选，默认关闭）。与 embedder 的"重排"角色不同：
+        # 这里向量**生成候选**，因此词法完全没命中的改写式查询也能被召回。
+        # 实测（docs/SEMANTIC.md「神经向量」）：15 条改写式查询 recall
+        # 0.333 -> 0.400；46 条关键词 1.000 -> 0.978（可接受的轻微下降）。
+        #
+        # 顺序很关键：向量候选在**词法候选生成全部跑完之后**才追加，且下面
+        # 仅剩的词法回退用 lexical_empty（而非 not candidate_rows）判断。
+        # 否则"向量先找到东西"会让 LIKE 救援通道被跳过，开启向量反而改变了
+        # 词法行为——那就不是叠加，而是替换了。
+        lexical_empty = not candidate_rows
+        vector_order: Dict[str, int] = {}
+        vector_rows: Dict[str, sqlite3.Row] = {}
+        vector_similarity: Dict[str, float] = {}
+        if query and vector_index is not None:
+            vector_order, vector_rows, vector_similarity = self._vector_candidates(
+                query, vector_index, clauses, params,
+                topn=vector_topn, include_cold=include_cold, as_of=as_of)
+            if vector_rows:
+                present = {row["memory_id"] for row in candidate_rows}
+                candidate_rows.extend(row for memory_id, row in vector_rows.items()
+                                      if memory_id not in present)
+        if query and lexical_empty:
             terms_like = self._like_terms(query)
             if not terms_like:
                 return []
@@ -536,14 +674,20 @@ class SearchMixin:
             fts = (fts / max_fts if max_fts else 0.0) * coverage
             # RRF 双通道融合加分：FTS 与 LIKE 各按名次贡献 1/(60+rank)，
             # 归一化后作为小权重信号——两路独立命中的证据更可信。
+            # 向量通道加入后归一化分母同步变化：三通道各贡献 1/(k+0)=1/k，
+            # 归一化后仍是 0..1，因此既有两通道的相对强弱不被改写。
+            channel_count = 3 if vector_order else 2
             rrf = 0.0
             position = fts_order.get(item["memory_id"])
             if position is not None:
-                rrf += 1.0 / (60.0 + position)
+                rrf += 1.0 / (rrf_k + position)
             position = like_order.get(item["memory_id"])
             if position is not None:
-                rrf += 1.0 / (60.0 + position)
-            rrf_norm = min(1.0, rrf / (2.0 / 61.0))
+                rrf += 1.0 / (rrf_k + position)
+            position = vector_order.get(item["memory_id"])
+            if position is not None:
+                rrf += 1.0 / (rrf_k + position)
+            rrf_norm = min(1.0, rrf / (channel_count / (rrf_k + 1.0)))
             vec_sim = 0.0
             if use_vector:
                 corpus_vec = embedder.embed(corpus)
@@ -592,6 +736,14 @@ class SearchMixin:
                                    "pinned": pinned}
             if use_vector:
                 item["score_parts"]["vec"] = round(vec_sim, 4)
+            if vector_order:
+                position = vector_order.get(item["memory_id"])
+                if position is not None:
+                    item["score_parts"]["vec_rank"] = position
+                    # 语义余弦必须写进 score_parts：下游相关性门控靠它区分
+                    # "可靠的语义命中"与"仅仅话题相近"，只看名次不够。
+                    item["score_parts"]["vec"] = round(
+                        float(vector_similarity.get(item["memory_id"], 0.0)), 4)
             results.append(item)
         results.sort(key=lambda item: (item["score"], item.get("created_at", ""), item["updated_at"]), reverse=True)
         page = results[offset:offset + limit]

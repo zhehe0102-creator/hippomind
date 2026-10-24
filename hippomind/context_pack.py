@@ -337,6 +337,13 @@ def _passes_relevance_gate(candidate: Mapping[str, Any], min_score: float) -> bo
         coverage = float(parts.get("coverage", 0.0) or 0.0)
     except (TypeError, ValueError):
         return True
+    # 这里**不能**加"语义近邻"作为独立证据来源。实测过：把向量名次 <20
+    # 当作通过条件后，"今天天气怎么样""1+1等于几"这类无关提问会立刻开始
+    # 注入（改造前它们被正确拒绝），且注入内容与提问不相关。
+    # 根因是账本里 95% 是重复的 raw 会话，任何短提问都能在向量空间里找到
+    # "话题相近"的邻居——语义近邻证明的是话题相似，不是事实相关。
+    # 因此自动注入的可靠性仍只认词面证据；向量只参与候选生成与排序，
+    # 由它带来的候选照样要过这道词面门。宁可少注入，也不注入错的。
     return fts > 0.0 or coverage >= 0.6
 
 
@@ -431,10 +438,16 @@ def _fold_key(item: Mapping[str, Any]) -> Tuple[str, Tuple[str, ...]]:
 class ContextPackBuilder:
     """Hybrid recall, MMR reranking and compact task-oriented formatting."""
 
-    def __init__(self, ledger: SQLiteLedger, embedder=None):
+    def __init__(self, ledger: SQLiteLedger, embedder=None, vector_index=None):
         self.ledger = ledger
         # 可选向量通道（EmbeddingAdapter）：默认关闭；传入即启用重排融合。
         self.embedder = embedder
+        # 可选神经向量索引（vector_index.VectorIndex）：作为**第三路候选生成**
+        # 参与 RRF，而不是塞进重排。实测（docs/SEMANTIC.md「神经向量」）：
+        # 只进重排会让 46 条关键词查询 recall 1.000 -> 0.85~0.91；进候选生成
+        # 则改写式查询 recall 0.200 -> 0.533，关键词集持平（1.000 -> 1.000）。
+        # 默认 None：行为与改造前逐字节相同。索引不可用时静默退化为纯词法。
+        self.vector_index = vector_index
         self._cache: Dict[Tuple[Any, ...], Tuple[float, Dict[str, Any]]] = {}
         self._cache_ttl = 2.0
         # 命中率观测（迭代30）：daemon 持有单例 builder，计数跨请求累积。
@@ -504,6 +517,7 @@ class ContextPackBuilder:
         # similarity, or two distinct word-level overlaps (词序不同的自然问句，
         # 如「业务部署在哪个区域」↔「业务已迁移到华北二区域」) are acceptable;
         # otherwise return an honest empty pack.
+        # 同上：语义近邻不是可靠性的替代证据，见 _passes_relevance_gate 的说明。
         reliable_text = (phrase or coverage >= 0.35
                          or (topic >= 0.18 and fts >= 0.12)
                          or (coverage >= 0.25 and topic >= 0.18))
@@ -657,6 +671,7 @@ class ContextPackBuilder:
                 limit=limit,
                 embedder=self.embedder if use_embedder else None,
                 as_of=options.as_of,
+                vector_index=self.vector_index,
             )
             if len(deeper) <= len(current):
                 # 已到该查询能返回的上限，继续加深无收益。
@@ -1071,6 +1086,7 @@ class ContextPackBuilder:
             limit=initial_limit,
             embedder=None if options.hybrid_rerank else self.embedder,
             as_of=options.as_of,
+            vector_index=self.vector_index,
         )
         # Resolve shared task titles before grouping. This is intentionally a
         # second, narrow query: it prevents host-specific directory hints or
@@ -1086,6 +1102,7 @@ class ContextPackBuilder:
                 from_time=eff_from, to_time=eff_to,
                 include_raw_chat=options.raw_chat, require_evidence=options.require_evidence,
                 limit=initial_limit, as_of=options.as_of,
+                vector_index=self.vector_index,
             )
         # 自适应加深：重复密度高时增加取数深度，直到折叠后凑够不同候选。
         if options.fold_duplicates and candidates:

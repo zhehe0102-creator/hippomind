@@ -138,7 +138,7 @@ class QueryValidationTests(unittest.TestCase):
                 eval_memory.load_queries(Path(tmp) / "missing.json")
 
     def test_builtin_labelled_set_is_well_formed(self):
-        specs = eval_memory.validate_queries(eval_memory.LABELLED_QUERIES)
+        specs = eval_memory.validate_queries(eval_memory.KEYWORD_QUERIES)
         self.assertGreaterEqual(len(specs), 30)
         ids = [spec["id"] for spec in specs]
         self.assertEqual(len(ids), len(set(ids)))
@@ -148,6 +148,95 @@ class QueryValidationTests(unittest.TestCase):
         for spec in specs:
             self.assertTrue(spec["query"])
             self.assertTrue(spec["expect"])
+
+    def test_labelled_queries_alias_points_at_the_keyword_set(self):
+        self.assertIs(eval_memory.LABELLED_QUERIES,
+                      eval_memory.KEYWORD_QUERIES)
+
+    def test_query_sets_registry_covers_every_order_entry(self):
+        self.assertEqual(set(eval_memory.QUERY_SETS), set(eval_memory.SET_ORDER))
+        self.assertIs(eval_memory.QUERY_SETS["keyword"],
+                      eval_memory.KEYWORD_QUERIES)
+        self.assertIs(eval_memory.QUERY_SETS["semantic"],
+                      eval_memory.SEMANTIC_QUERIES)
+
+
+class SemanticQuerySetTests(unittest.TestCase):
+    """The paraphrase set is the whole point of this change: guard its shape.
+
+    These assertions are deliberately about *label quality*, not about the
+    score.  A query that could never hit (blank expectation, expectation that
+    leaks into the query, id collision) makes the metric lie, so it is a test
+    failure rather than a low number.
+    """
+
+    REQUIRED_CATEGORIES = {"hippomind", "android_ops", "project", "ops",
+                           "english"}
+
+    def setUp(self):
+        self.specs = eval_memory.validate_queries(eval_memory.SEMANTIC_QUERIES)
+
+    def test_has_at_least_forty_queries(self):
+        self.assertGreaterEqual(len(self.specs), 40)
+
+    def test_covers_all_five_categories(self):
+        categories = {spec.get("category") for spec in self.specs}
+        self.assertTrue(self.REQUIRED_CATEGORIES.issubset(categories),
+                        "missing: %s" % (self.REQUIRED_CATEGORIES - categories))
+
+    def test_ids_are_unique_and_disjoint_from_the_keyword_set(self):
+        ids = [spec["id"] for spec in self.specs]
+        self.assertEqual(len(ids), len(set(ids)))
+        keyword_ids = {spec["id"] for spec in
+                       eval_memory.validate_queries(eval_memory.KEYWORD_QUERIES)}
+        self.assertEqual(keyword_ids & set(ids), set())
+
+    def test_every_query_is_a_paraphrase_not_a_keyword_echo(self):
+        """No expected substring may appear in its own query.
+
+        If it did, the query would be answerable by plain term matching and the
+        set would stop measuring cross-vocabulary recall.
+        """
+        leaks = []
+        for spec in self.specs:
+            query = spec["query"].lower()
+            for term in spec["expect"]:
+                if term.lower() in query:
+                    leaks.append((spec["id"], term))
+        self.assertEqual(leaks, [], "expectation leaked into its own query")
+
+    def test_every_query_records_auditable_provenance(self):
+        for spec in self.specs:
+            self.assertTrue(spec.get("source_ids"),
+                            "%s has no source_ids" % spec["id"])
+            for memory_id in spec["source_ids"]:
+                self.assertTrue(memory_id.startswith("mem_"),
+                                "%s has a malformed source id %r"
+                                % (spec["id"], memory_id))
+
+    def test_expect_hits_are_positive(self):
+        """A recorded expect_hits of 0 means the label was never grounded."""
+        for spec in self.specs:
+            self.assertGreaterEqual(spec.get("expect_hits", 0), 1,
+                                    "%s expectation never matched the ledger"
+                                    % spec["id"])
+
+    def test_semantic_thresholds_are_a_ratchet_under_the_measured_baseline(self):
+        thresholds = eval_memory.SET_THRESHOLDS["semantic"]
+        baseline = eval_memory.SET_BASELINE["semantic"]
+        self.assertLess(thresholds["min_recall_at_k"],
+                        baseline["recall_at_k"])
+        self.assertLess(thresholds["min_mrr"], baseline["mrr"])
+        self.assertGreater(thresholds["max_duplicate_rate"],
+                           baseline["duplicate_rate"])
+        self.assertGreaterEqual(thresholds["min_queries"], 40)
+
+    def test_keyword_thresholds_stay_stricter_than_semantic(self):
+        keyword = eval_memory.SET_THRESHOLDS["keyword"]
+        semantic = eval_memory.SET_THRESHOLDS["semantic"]
+        self.assertGreater(keyword["min_recall_at_k"],
+                           semantic["min_recall_at_k"])
+        self.assertGreater(keyword["min_mrr"], semantic["min_mrr"])
 
 
 class LedgerEvaluationTests(unittest.TestCase):
@@ -316,6 +405,126 @@ class MainEntrypointTests(unittest.TestCase):
         dumped = json.loads(out.read_text(encoding="utf-8"))
         self.assertGreaterEqual(len(dumped), 30)
         self.assertEqual(len({item["id"] for item in dumped}), len(dumped))
+
+    def test_main_dumps_the_semantic_set(self):
+        out = self.dir / "semantic.json"
+        code, _ = self._main(["--set", "semantic", "--dump-queries", str(out)])
+        self.assertEqual(code, 0)
+        dumped = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual(len(dumped), len(eval_memory.SEMANTIC_QUERIES))
+        self.assertIn("expect_hits", dumped[0])
+        self.assertIn("source_ids", dumped[0])
+
+    def test_main_dumps_both_sets_keyed_by_name(self):
+        out = self.dir / "all.json"
+        code, _ = self._main(["--set", "all", "--dump-queries", str(out)])
+        self.assertEqual(code, 0)
+        dumped = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual(set(dumped), {"keyword", "semantic"})
+        self.assertEqual(len(dumped["keyword"]),
+                         len(eval_memory.KEYWORD_QUERIES))
+
+    def test_main_defaults_to_the_keyword_set(self):
+        code, output = self._main([
+            "--ledger", str(self.ledger_path),
+            "--queries", str(self.query_path),
+            "--json",
+            "--min-recall", "0.5", "--min-mrr", "0.4",
+            "--max-duplicate-rate", "0.5", "--max-p95-ms", "10000",
+            "--min-queries", "2",
+        ])
+        self.assertEqual(code, 0)
+        payload = json.loads(output)
+        self.assertEqual(payload["set"], "keyword")
+        self.assertNotIn("sets", payload)
+
+    def test_main_runs_the_semantic_set_and_reports_its_own_thresholds(self):
+        code, output = self._main([
+            "--ledger", str(self.ledger_path),
+            "--queries", str(self.query_path),
+            "--set", "semantic", "--json",
+            "--min-recall", "0.0", "--min-mrr", "0.0",
+            "--max-duplicate-rate", "1.0", "--max-p95-ms", "10000",
+            "--min-queries", "2",
+        ])
+        self.assertEqual(code, 0)
+        payload = json.loads(output)
+        self.assertEqual(payload["set"], "semantic")
+        self.assertTrue(payload["gate"]["passed"])
+
+    def test_main_semantic_defaults_apply_when_flags_are_omitted(self):
+        """Omitted flags must fall back to the set's own thresholds."""
+        code, output = self._main([
+            "--ledger", str(self.ledger_path),
+            "--queries", str(self.query_path),
+            "--set", "semantic", "--json", "--no-gate",
+        ])
+        self.assertEqual(code, 0)
+        payload = json.loads(output)
+        thresholds = payload["gate"]["thresholds"]
+        self.assertEqual(thresholds["min_queries"],
+                         eval_memory.SEMANTIC_THRESHOLDS["min_queries"])
+        self.assertEqual(thresholds["min_recall_at_k"],
+                         eval_memory.SEMANTIC_THRESHOLDS["min_recall_at_k"])
+
+    def test_main_set_all_reports_both_sets_and_combines_the_gate(self):
+        code, output = self._main([
+            "--ledger", str(self.ledger_path),
+            "--set", "all", "--json",
+            "--min-recall", "0.0", "--min-mrr", "0.0",
+            "--max-duplicate-rate", "1.0", "--max-p95-ms", "10000",
+            "--min-queries", "1",
+        ])
+        self.assertEqual(code, 0)
+        payload = json.loads(output)
+        self.assertEqual(set(payload["sets"]), {"keyword", "semantic"})
+        self.assertEqual(payload["queries"],
+                         len(eval_memory.KEYWORD_QUERIES)
+                         + len(eval_memory.SEMANTIC_QUERIES))
+        self.assertTrue(payload["gate"]["passed"])
+        self.assertEqual(payload["gate"]["failures"], [])
+
+    def test_main_set_all_fails_when_either_set_fails(self):
+        """A combined gate must not let one passing set mask a failing one."""
+        code, output = self._main([
+            "--ledger", str(self.ledger_path),
+            "--set", "all", "--json",
+            "--min-recall", "1.0", "--min-queries", "1",
+            "--max-p95-ms", "10000",
+        ])
+        self.assertEqual(code, 1)
+        payload = json.loads(output)
+        self.assertFalse(payload["gate"]["passed"])
+        # Both sets contain a miss, so both must be named in the failures.
+        self.assertTrue(any(f.startswith("keyword:") for f in payload["gate"]["failures"]))
+        self.assertTrue(any(f.startswith("semantic:") for f in payload["gate"]["failures"]))
+
+    def test_main_human_report_for_all_names_both_sets(self):
+        code, output = self._main([
+            "--ledger", str(self.ledger_path),
+            "--set", "all",
+            "--min-recall", "0.0", "--min-mrr", "0.0",
+            "--max-duplicate-rate", "1.0", "--max-p95-ms", "10000",
+            "--min-queries", "1",
+        ])
+        self.assertEqual(code, 0)
+        self.assertIn("== set: keyword ==", output)
+        self.assertIn("== set: semantic ==", output)
+        self.assertIn("== combined ==", output)
+        self.assertIn("gate: PASS", output)
+
+    def test_main_rejects_queries_file_combined_with_set_all(self):
+        code, _ = self._main([
+            "--ledger", str(self.ledger_path),
+            "--queries", str(self.query_path),
+            "--set", "all",
+        ])
+        self.assertEqual(code, 2)
+
+    def test_main_rejects_unknown_set_name(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                eval_memory.main(["--set", "nope"])
 
 
 if __name__ == "__main__":
