@@ -164,8 +164,15 @@ class SearchMixin:
     def _vector_candidates(self, query: str, vector_index, clauses: Sequence[str],
                            params: Sequence[object], *, topn: int = _DEFAULT_VECTOR_TOPN,
                            include_cold: bool = True, as_of: str = ""
-                           ) -> Tuple[Dict[str, int], Dict[str, sqlite3.Row]]:
-        """神经向量候选通道：返回 (id->名次, id->账本行)。
+                           ) -> Tuple[Dict[str, int], Dict[str, sqlite3.Row],
+                                      Dict[str, float], Dict[str, str]]:
+        """神经向量候选通道：返回 (id->名次, id->账本行, id->余弦, id->claim)。
+
+        支持两种索引粒度（memory 级 VectorIndex / claim 级 ClaimVectorIndex）：
+        两者都实现 `search_text(query, topn) -> [(memory_id, cosine, ...)]`，
+        即**记忆级去重已经在索引里做完**，本方法只做 SQL 过滤重放与名次紧凑化。
+        claim 级条目多一个第三元 `claim_id`，这里顺手记进 `claim_of`，供
+        `score_parts["vec_claim"]` 审计"是哪条 claim 把这条记忆拉上来的"。
 
         与 embedder 的"重排"角色不同，这里向量**生成候选**——词法完全没命中的
         改写式查询也能被召回，这是本次改造唯一的正收益来源（实测见
@@ -183,18 +190,21 @@ class SearchMixin:
            路径。检索不能因为可选组件而失败。
         """
         if vector_index is None or not str(query or "").strip():
-            return {}, {}, {}
+            return {}, {}, {}, {}
         try:
             fetch = max(1, int(topn)) * 4
             hits = vector_index.search_text(query, topn=fetch)
         except Exception:
-            return {}, {}, {}
+            return {}, {}, {}, {}
         if not hits:
-            return {}, {}, {}
+            return {}, {}, {}, {}
         ranked: List[Tuple[str, int]] = []
         # 余弦值必须一起带出来：下游的相关性门控（context_pack）要判断
         # "这条是可靠的语义命中，还是仅仅话题相近"，只看名次不够。
         similarity: Dict[str, float] = {}
+        # claim 级索引的条目是 (memory_id, cosine, claim_id)：第三个元素只用于
+        # 审计，不进排序。memory 级索引没有它，这里是可选的。
+        claim_of: Dict[str, str] = {}
         seen = set()
         for position, entry in enumerate(hits):
             try:
@@ -208,8 +218,14 @@ class SearchMixin:
                     similarity[memory_id] = float(entry[1])
                 except (IndexError, TypeError, ValueError):
                     similarity[memory_id] = 0.0
+                try:
+                    claim_id = str(entry[2])
+                except (IndexError, TypeError):
+                    claim_id = ""
+                if claim_id:
+                    claim_of[memory_id] = claim_id
         if not ranked:
-            return {}, {}, {}
+            return {}, {}, {}, {}
         ids = [memory_id for memory_id, _position in ranked]
         rows: Dict[str, sqlite3.Row] = {}
         # SQLite 的变量上限（老版本 999）必须尊重：分批查询而不是一次塞几千个。
@@ -225,9 +241,9 @@ class SearchMixin:
                             (*batch, *params)).fetchall():
                         rows[row["memory_id"]] = row
         except sqlite3.DatabaseError:
-            return {}, {}, {}
+            return {}, {}, {}, {}
         if not rows:
-            return {}, {}, {}
+            return {}, {}, {}, {}
         # 名次按"过滤后仍然存在"重新紧凑编号：否则被过滤掉的 top 行会留下空洞，
         # 让 RRF 的 1/(k+rank) 系统性偏小。
         order: Dict[str, int] = {}
@@ -242,8 +258,11 @@ class SearchMixin:
                 break
         # 余弦随候选一起返回，而不是挂在 self 上：daemon 是多线程的，
         # 实例属性会在并发查询之间互相污染。
-        return order, kept, {memory_id: similarity.get(memory_id, 0.0)
-                             for memory_id in order}
+        return (order, kept,
+                {memory_id: similarity.get(memory_id, 0.0) for memory_id in order},
+                {memory_id: claim_of[memory_id] for memory_id in order
+                 if memory_id in claim_of})
+
 
     @staticmethod
     def _query_coverage(query: str, corpus: str) -> Tuple[float, bool]:
@@ -623,8 +642,10 @@ class SearchMixin:
         vector_order: Dict[str, int] = {}
         vector_rows: Dict[str, sqlite3.Row] = {}
         vector_similarity: Dict[str, float] = {}
+        vector_claim: Dict[str, str] = {}
         if query and vector_index is not None:
-            vector_order, vector_rows, vector_similarity = self._vector_candidates(
+            (vector_order, vector_rows, vector_similarity,
+             vector_claim) = self._vector_candidates(
                 query, vector_index, clauses, params,
                 topn=vector_topn, include_cold=include_cold, as_of=as_of)
             if vector_rows:
@@ -744,6 +765,11 @@ class SearchMixin:
                     # "可靠的语义命中"与"仅仅话题相近"，只看名次不够。
                     item["score_parts"]["vec"] = round(
                         float(vector_similarity.get(item["memory_id"], 0.0)), 4)
+                    # claim 级索引额外记下命中的 claim：审计"是哪条 claim 把
+                    # 这条记忆拉上来的"，也让"粒度到底改了名次"可被逐条核对。
+                    claim_id = vector_claim.get(item["memory_id"])
+                    if claim_id:
+                        item["score_parts"]["vec_claim"] = claim_id
             results.append(item)
         results.sort(key=lambda item: (item["score"], item.get("created_at", ""), item["updated_at"]), reverse=True)
         page = results[offset:offset + limit]

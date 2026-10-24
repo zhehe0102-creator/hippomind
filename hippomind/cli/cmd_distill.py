@@ -17,9 +17,15 @@ def cmd_distill(args) -> int:
     if provider == "heuristic":
         extractor = None
     else:
+        # --provider claude now means "a model, by whichever transport works":
+        # the direct API when it is configured, the CLI otherwise.  The old gate
+        # failed the command whenever the CLI was missing even though the
+        # endpoint was reachable, which is exactly the state this machine was in.
         extractor = ClaudeExtractor()
         if provider == "claude" and not extractor.available:
-            print("claude CLI 不可用；请改用 --provider heuristic 或安装 Claude Code", file=sys.stderr)
+            print("模型后端不可用：请配置 HIPPOMIND_LLM_BASE_URL / HIPPOMIND_LLM_API_KEY"
+                  "（或 ~/.claude/settings.json），或改用 --provider heuristic",
+                  file=sys.stderr)
             return 1
     engine = DistillEngine(ledger, extractor=extractor)
     result = engine.run(limit=int(getattr(args, "limit", 32) or 32),

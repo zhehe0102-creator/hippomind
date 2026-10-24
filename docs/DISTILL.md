@@ -262,9 +262,13 @@ python3 -m hippomind.cli distill --limit 64 --provider claude
 4. **本机 claude CLI 实测不可用**（`claude -p` 无输出挂起 180s，最终 `ECONNRESET`）。
    批大小实验走的是 CLI 配置的同一个后端（`ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY`，
    来自 `~/.claude/settings.json`），prompt 与 `ClaudeExtractor.extract` 逐字一致。
-   这意味着**生产路径目前实际在走启发式回退**（daemon /stats 显示
+   当时这意味着**生产路径实际在走启发式回退**（daemon /stats 显示
    extractor 为 heuristic）。熔断器语义（连续 2 次失败 → 10 分钟冷却）保持不变。
    修好 CLI 后批大小结论仍成立，因为 prompt 和模型都没变。
+
+   > **2026-10-24 更新**：该问题已由第七节解决——提炼改为直连 LLM API，
+   > 不再经过 CLI。CLI 本身仍然坏着，它现在只是第二顺位回退。
+   > 上面 3.x 的批大小结论依然成立，理由不变：prompt 与模型都没变。
 
 5. **去重的代价**：重复行共享代表行的 claims。如果代表行提炼错了，重复行会一起错。
    缓解手段是 `dedupe_of` 游标——删掉那条游标，该行会重新入队。
@@ -273,3 +277,132 @@ python3 -m hippomind.cli distill --limit 64 --provider claude
 6. **`distill_status.py` 的去重扫描是全表读**（当前约 4,000 行，实测 < 1s）。
    如果 backlog 涨到十万级，`--scan-limit` 会截断并在输出里明确警告，
    不会静默给出偏低的去重数。
+
+---
+
+## 七、直连 LLM API：从 CLI 挂起到真实模型
+
+### 7.1 问题：生产一直在走启发式
+
+本机 `claude` CLI **完全不可用**：它的默认模型 `zcode/GLM-5.3-Flash[1m]` 不在该版本
+的模型目录里，`claude -p` 会挂起或直接失败。后果不是"慢"，而是：
+
+```
+ClaudeExtractor.extract() 失败 -> 熔断器打开（连续 2 次 / 冷却 600s）-> _claims_for 回退
+```
+
+即 **每一轮提炼都在用启发式**。生产账本的 `metadata.extractor` 分布证实了这一点
+（只读副本统计，2026-10-24）：
+
+| extractor | 记忆数 |
+| --- | --- |
+| claude | 651 |
+| **heuristic** | **247** |
+
+而 CLI 背后的**端点本身是好的**。同一套凭据直接 `POST {base}/v1/messages`，
+3–6 秒返回正常内容。所以缺的只是一层传输。
+
+### 7.2 做法：只换传输层，不动 prompt
+
+新增 `hippomind/llm_client.py`（纯标准库 `urllib`，零新依赖）：
+
+* 配置优先级：环境变量（`HIPPOMIND_LLM_BASE_URL` / `HIPPOMIND_LLM_API_KEY` /
+  `HIPPOMIND_LLM_MODEL`）→ `~/.claude/settings.json` 的 `env` 段 → 不可用。
+* `complete()` 任何失败都返回 `None`，**绝不抛异常**——调用方永远能无痛回退。
+* `describe()` 只报 base / model / **是否有 key**，不报 key 内容；`LLMConfig.__repr__`
+  也把 key 打码；错误信息在进 `last_error` 前先做脱敏。
+* 熔断器语义与原来一致（连续 2 次失败 → 600s 冷却）。
+
+`ClaudeExtractor` 的顺序变为 **API → CLI → 启发式**，并且 `name` 会如实报告是
+`api` / `cli` 还是 `heuristic`。**prompt、8 条/批、claims 结构、source 编号语义
+一律没动**——这正是下面这组对比能成立的前提。
+
+### 7.3 实测对比（只读副本，同样 26 条，同样 batch=8）
+
+副本由 `sqlite3 .backup` 从生产账本复制，全程不写生产库。
+
+| 指标 | heuristic | api |
+| --- | --- | --- |
+| 条目数 | 26 | 26 |
+| 产出 claims | 2 | **28** |
+| 条目覆盖率 | 3.8% | **42.3%** |
+| claims/条目 | 0.08 | **1.08** |
+| 墙钟 | 0.5s | 72.3s |
+| 实际使用的 extractor | heuristic ×26 | **api ×26** |
+
+逐条对比：**两边都覆盖 1 条，只有 API 覆盖 10 条，只有启发式覆盖 0 条。**
+
+覆盖率的分母是 26 条待提炼行，其中大量是 15–68 字符的短句（"Bing 可用。读取搜索结果："），
+本身几乎没有可提炼内容——所以 42.3% 不是"模型只做对了四成"，而是**这些行确实大半没有稳定事实**。
+关键是启发式在同样的行上只认出 2 条。
+
+### 7.4 质量抽查：API 的 claims 是不是真的有用
+
+不能只看条数。人工看了全部 34 条 claims（另一轮跑出的），**32/34 是有意义的**，例如：
+
+```
+netproxy | 故障根因 | root_cause   | Worker 带 staging 模块路径启动，目录移动后驻留进程仍读取不存在的路径
+netproxy | 修复决定 | fix_decision | Start() 比对驻留进程的 --module-config，不一致时先 Stop
+用户     | 使用偏好 | usage_preference | 不打游戏，只追求日常使用最优
+手机优化任务 | 执行原则 | execution_principles | 只读探测优先、每步可回滚、改动全部记录
+```
+
+**必须诚实指出 2 条退化值**（6%）：`待处理新增需求数量 = "3"`、`Bing 可用 = "可用"`。
+这类值信息量很低，启发式反而不会产出（启发式只认决策句）。这是 API 路径的真实代价，
+不是可以粉饰的收益。
+
+### 7.5 三个必须记下来的坑
+
+**坑 1：`max_tokens` 太小会让整批静默失效。**
+第一版把输出预算设成 2048。实测一个 8 条的密集批次需要约 2,600 token，
+响应被**截断在 JSON 中间**，`json.loads` 抛错 → 整批 8 条全部回退启发式，
+而调用方只看到"这批没提炼出东西"。CLI 传输没有这个上限，所以低预算会让 API 路径
+比 CLI **更差**。现改为 8192，并有回归测试钉住下限。
+
+**坑 2：端点会偶发 `RemoteDisconnected`，而且只在大请求上出现。**
+同一个 prompt 可能这次 10s 正常返回，下次直接断连（实测约 1/6 概率）。
+小请求（"回复 ok"）10/10 成功，所以容易被误判为"网络没问题"。
+没有重试的话，**一个断连就静默废掉一整批**——这正是本节开头那个故障模式的重演。
+现在对**连接级**错误重试 2 次（指数退避 1s/2s），但 HTTP 4xx/5xx 和坏 JSON **不重试**
+（那是服务器的真实回答，重试只是浪费预算）。加上重试后，同一批从 3.8% 恢复到 42.3%。
+
+**坑 3：一轮 run() 可能混用多种 extractor，只报最后一个会骗人。**
+某批的模型回答是**合法的空 claims 数组**时，那一批回退启发式是正确行为。
+但 `summary["extractor"]` 只记录最后一批，于是一次"2 批 API + 1 批启发式"的运行
+会被显示成 `heuristic`。现在额外输出 `summary["extractors"]` 计数
+（如 `{"api": 2, "heuristic": 1}`），`extractor` 保留兼容。
+
+### 7.6 参数与开关
+
+| 环境变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `HIPPOMIND_LLM_BASE_URL` | 取自 settings.json | 端点 |
+| `HIPPOMIND_LLM_API_KEY` | 取自 settings.json | 凭据（**不要写进任何提交的文件**） |
+| `HIPPOMIND_LLM_MODEL` | `deepseek-v4.1-flash` | 模型 |
+| `HIPPOMIND_DISTILL_TRANSPORT` | `auto` | `auto` / `api` / `cli`；无法识别一律按 `auto` |
+
+```bash
+# 端点是否可用（不打印密钥）
+python3 -c "from hippomind.llm_client import describe; print(describe())"
+
+# 真实跑一轮，看 extractor 是不是 api
+python3 -m hippomind.cli distill --limit 16 --provider claude
+
+# 冲突裁决也走同一个传输层
+python3 scripts/conflict_review.py --decider llm --limit 5
+```
+
+### 7.7 诚实的边界
+
+1. **API 比启发式慢两个数量级**（72s vs 0.5s，26 条）。这是必然的：
+   启发式是纯正则，API 是真的推理。daemon 的 300s tick 装得下，但不要把
+   `HIPPOMIND_DISTILL_LIMIT` 调大到一轮跑不完。
+2. **42.3% 的覆盖率不等于"剩下 58% 提炼失败"**。见 7.3，很多行本来就没有稳定事实。
+   真正的判据是逐条对比：API 覆盖 11 条，启发式 1 条。
+3. **6% 的退化值是真的。** 短句上的 API 会给出 `"3"`、`"可用"` 这类低信息量值。
+   如果下游对槽位质量敏感，应该在 claim 落库前加一道最小长度/信息量过滤——
+   这不在本任务范围内，别假装已经解决。
+4. **端点偶发断连没有被根治**，只是用重试掩盖了。如果断连率上升，
+   需要看服务端，而不是继续加重试次数。
+5. **`claude` CLI 仍然不可用**，它现在只是第二顺位回退。在它修好之前，
+   `--provider claude` 的实际含义是"用 API"。

@@ -424,12 +424,20 @@ class MemoryHubService:
             while not self._stop_event.is_set():
                 try:
                     from .semantic_onnx import load_onnx_embedder
-                    from .vector_index import load_vector_index
+                    from .vector_index import load_granular_index
                     embedder = load_onnx_embedder()
                     if embedder is None:
                         self.health["vector_index"] = {"state": "unavailable"}
                     else:
-                        index = load_vector_index(self.ledger, embedder, sync=True)
+                        # claim 级优先：真正的瓶颈是索引粒度。一条提炼记忆把
+                        # 5-10 个互不相关的事实塞进 ~550 字符正文，整体
+                        # embedding 被稀释成一个"什么都像一点"的中心点。按
+                        # claim 建索引后 semantic recall 0.200 -> 0.467（纯索引
+                        # 口径）、pipeline 0.067 -> 0.733，keyword 集不退化。
+                        # 这里必须 sync=True：daemon 负责构建与增量，注入路径
+                        # （auto_context）只读盘——全量构建 56-86s，而注入预算
+                        # 只有 700ms，在请求里重建等于把冷启动变成超时。
+                        index = load_granular_index(self.ledger, embedder, sync=True)
                         if index is None:
                             self.health["vector_index"] = {"state": "unavailable"}
                         else:
@@ -438,8 +446,10 @@ class MemoryHubService:
                             # Swap the live builder onto the index so new packs
                             # use semantic recall without a restart.
                             self.contexts.vector_index = index
-                            self.health["vector_index"] = dict(index.stats(),
-                                                               state="ready")
+                            stats = dict(index.stats(), state="ready")
+                            stats["granularity"] = str(
+                                getattr(index, "granularity", "claim"))
+                            self.health["vector_index"] = stats
                 except Exception as exc:  # never take the hub down
                     self.health["vector_index"] = {
                         "state": "error",

@@ -242,7 +242,8 @@ class ThroughputKnobTests(unittest.TestCase):
     # -- circuit breaker survives the bigger batch -------------------------
 
     def test_breaker_still_opens_with_a_large_batch(self):
-        extractor = distill.ClaudeExtractor(timeout=1)
+        # use_api=False: the assertion is about the CLI transport's breaker.
+        extractor = distill.ClaudeExtractor(timeout=1, use_api=False)
         extractor.binary = "/bin/false"
         candidates = [distill.Candidate("m%d" % i, "task", "内容", "codex",
                                         "", "", "", "", {}) for i in range(16)]
@@ -255,7 +256,7 @@ class ThroughputKnobTests(unittest.TestCase):
 
     def test_open_breaker_falls_back_to_heuristic_without_stalling(self):
         """A dead API must still make progress, not burn the whole pass."""
-        dead = distill.ClaudeExtractor(timeout=1)
+        dead = distill.ClaudeExtractor(timeout=1, use_api=False)
         dead.binary = "/bin/false"
         dead._cooldown_until = 10 ** 12          # already open
         engine = DistillEngine(self.ledger, extractor=dead)

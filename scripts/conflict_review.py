@@ -36,8 +36,10 @@ Three separable stages, so each can be inspected and reverted:
 2. **adjudicate** - decide ``supersede_a`` / ``supersede_b`` / ``keep_both`` /
    ``needs_human``.  Two deciders, and every verdict records which one spoke:
 
-   * ``--decider llm`` - the local Claude Code CLI (the one
-     ``hippomind/distill.py`` uses), given only the two evidence records.
+   * ``--decider llm`` - the model endpoint, reached directly over HTTP via
+     ``hippomind/llm_client.py`` (the same transport ``hippomind/distill.py``
+     uses; the local Claude Code CLI remains a fallback), given only the two
+     evidence records.
    * ``--decider rules`` - a deterministic, offline policy (the fallback, and
      what the tests exercise).
 
@@ -98,6 +100,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from hippomind import llm_client  # noqa: E402
 from hippomind.ledger import LedgerError, SQLiteLedger, utc_now  # noqa: E402
 
 DEFAULT_LEDGER = os.path.expanduser(
@@ -134,6 +137,10 @@ TRUNCATION_MARKERS = ("（片段截断，完整范围未知）", "（片段截�
 BREAKER_THRESHOLD = 2
 COOLDOWN_SECONDS = 600.0
 DEFAULT_TIMEOUT = 60.0
+#: Output budget for one verdict.  The answer is a four-field JSON object with a
+#: one-sentence reason, so this is deliberately generous: a truncated object is
+#: an unparseable verdict, which costs a model call *and* falls back to rules.
+DECIDE_MAX_TOKENS = 1_024
 
 REVIEW_TABLE = "memory_claim_reviews"
 
@@ -519,21 +526,33 @@ claim_id: %s
 
 
 class ClaudeDecider:
-    """Local Claude Code CLI, with the same breaker discipline as distill.
+    """Model decider: direct API first, the local CLI as a fallback.
+
+    The transport order mirrors :class:`hippomind.distill.ClaudeExtractor`, and
+    for the same measured reason: on this host ``claude -p`` hangs (its default
+    model is missing from the installed version's catalogue) while the endpoint
+    behind it answers in seconds.  Asking the API first is what makes
+    ``--decider llm` actually consult a model instead of silently degrading to
+    the rules engine.
 
     ``available`` turns False after ``BREAKER_THRESHOLD`` consecutive failures
     and stays False for ``COOLDOWN_SECONDS``; callers then fall back to
     ``rules_decide`` for the rest of the run.  ``timeout`` bounds each call so a
-    hung CLI cannot stall a review session (measured: the local CLI can hang
-    indefinitely when its upstream API is unreachable, which is exactly what
-    the breaker is for).
+    hung transport cannot stall a review session (measured: the local CLI can
+    hang indefinitely when its upstream API is unreachable, which is exactly
+    what the breaker is for).
+
+    A ``runner`` is an explicit transport: when one is injected it is the *only*
+    thing used, so a test that supplies a runner never reaches a socket.
     """
 
     name = "llm"
 
     def __init__(self, *, timeout: float = DEFAULT_TIMEOUT,
                  binary: str = "",
-                 runner: Optional[Callable[[str], Any]] = None):
+                 runner: Optional[Callable[[str], Any]] = None,
+                 use_api: bool = True,
+                 complete: Optional[Callable[..., Any]] = None):
         candidates = [binary, shutil.which("claude") or "",
                       str(Path.home() / ".local" / "bin" / "claude"),
                       "/usr/local/bin/claude", "/opt/homebrew/bin/claude"]
@@ -547,14 +566,21 @@ class ClaudeDecider:
         self.calls = 0
         self.model = ""
         #: Injection seam for tests: called with the prompt, returns raw
-        #: stdout.  When set, no subprocess is ever spawned.
+        #: stdout.  When set, no subprocess and no socket is ever touched.
         self.runner = runner
+        #: Direct-API transport.  Enabled only when the caller did not inject a
+        #: runner and a runner is not the point of this instance.
+        self.use_api = bool(use_api) and runner is None
+        self._complete = complete
+        self.transport = ""
 
     @property
     def available(self) -> bool:
-        if self.runner is None and not self.binary:
+        if time.time() < self._cooldown_until:
             return False
-        return time.time() >= self._cooldown_until
+        if self.runner is not None or self.binary:
+            return True
+        return bool(self.use_api and llm_client.available())
 
     @property
     def tripped(self) -> bool:
@@ -573,8 +599,26 @@ class ClaudeDecider:
         self._cooldown_until = 0.0
 
     def _run(self, prompt: str) -> str:
+        """Produce the model's raw answer, or raise (the caller records failure).
+
+        Order: injected runner, then the direct API, then the CLI.  An API miss
+        is not fatal on its own -- a host with a working CLI but no endpoint
+        configuration still gets a model answer -- but every miss is recorded on
+        the breaker so a dead transport stops costing calls.
+        """
         if self.runner is not None:
+            self.transport = "runner"
             return str(self.runner(prompt) or "")
+        if self.use_api:
+            caller = self._complete or llm_client.complete
+            answer = caller(prompt, max_tokens=DECIDE_MAX_TOKENS,
+                            timeout=self.timeout)
+            if answer:
+                self.transport = "api"
+                return answer
+            self._record_failure(RuntimeError("api returned no usable answer"))
+            if not self.binary or self.tripped:
+                raise RuntimeError("api returned no usable answer")
         env = os.environ.copy()
         extra = [str(Path.home() / ".local" / "bin"),
                  "/usr/local/bin", "/opt/homebrew/bin"]
@@ -585,6 +629,7 @@ class ClaudeDecider:
             timeout=self.timeout, cwd=str(Path.home()), env=env)
         if completed.returncode != 0:
             raise RuntimeError((completed.stderr or "")[-300:])
+        self.transport = "cli"
         return completed.stdout
 
     def decide(self, group: Group) -> Optional[Verdict]:
@@ -822,7 +867,6 @@ def review(ledger: SQLiteLedger, *, decider: str = "rules",
             verdict = rules_decide(group)
             if decider == "llm" and group.cause in MODEL_WORTHY:
                 verdict.reason = "[LLM 不可用，回退规则] " + verdict.reason
-        run.llm_breaker = bool(model is not None and getattr(model, "tripped", False))
         # A low-confidence supersede is never executed: escalate instead.  This
         # is the guard that keeps a hallucinating model from silently removing
         # a fact from recall.
@@ -877,6 +921,11 @@ def review(ledger: SQLiteLedger, *, decider: str = "rules",
             ledger, group, verdict, evidence_digest=digest,
             applied=item["applied"], outcome=item["outcome"])
         run.results.append(item)
+    # Report the model's state once, after the loop: both facts describe the
+    # whole run, and inside the loop a run with no groups never set them.
+    if model is not None:
+        run.llm_breaker = bool(getattr(model, "tripped", False))
+        run.llm_transport = str(getattr(model, "transport", "") or "")
     return run
 
 

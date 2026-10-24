@@ -516,7 +516,9 @@ class ModelDeciderTests(LedgerCase):
         self.assertIn("低于阈值", run.results[0]["reason"])
 
     def test_decider_without_binary_or_runner_is_unavailable(self):
-        decider = cr.ClaudeDecider(binary="/nonexistent/claude")
+        # use_api=False: "no transport at all" is the state under test, so the
+        # direct API must not quietly make this decider available.
+        decider = cr.ClaudeDecider(binary="/nonexistent/claude", use_api=False)
         decider.binary = ""
         self.assertFalse(decider.available)
         self.assertIsNone(decider.decide(self.group_for("port"))

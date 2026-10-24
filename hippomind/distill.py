@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from . import llm_client
 from .ledger import LedgerError, SQLiteLedger, utc_now
 from .textutil import content_fingerprint
 
@@ -75,6 +76,34 @@ DEFAULT_BATCH_SIZE = 8
 MAX_BATCH = 48
 MAX_CLAIMS_PER_SOURCE = 8
 MAX_SOURCE_CHARS = 1_200
+#: Output budget for one extraction call.
+#:
+#: Measured, not guessed: at 2,048 the answer is cut mid-object and the whole
+#: batch is lost to a JSON parse error (the model emits up to 8 claims per item
+#: with Chinese values, and 8 items can need ~2,600 tokens).  The CLI transport
+#: this replaced had no explicit cap, so a low cap here would have silently made
+#: the API path *worse* than the CLI on exactly the densest batches.  8,192
+#: covers the measured worst case with headroom while still bounding a runaway
+#: completion.
+EXTRACT_MAX_TOKENS = 8_192
+#: Which transports the extractor may use (HIPPOMIND_DISTILL_TRANSPORT).
+#:
+#:   auto (default)  direct API, then the claude CLI, then the heuristic
+#:   api             direct API only -- the CLI on this host hangs (measured:
+#:                   180s with no output, then ECONNRESET), so an operator whose
+#:                   endpoint is healthy may want to rule it out entirely
+#:   cli             the legacy CLI only, for hosts where the API is not
+#:                   configured but the CLI works
+#:
+#: Anything unrecognised means "auto": a typo must not silently disable
+#: extraction.
+TRANSPORTS = ("auto", "api", "cli")
+
+
+def default_transport() -> str:
+    """Transport policy for new extractors (HIPPOMIND_DISTILL_TRANSPORT)."""
+    raw = os.environ.get("HIPPOMIND_DISTILL_TRANSPORT", "").strip().lower()
+    return raw if raw in TRANSPORTS else "auto"
 DEFAULT_CONFIDENCE = 0.55
 #: How many candidates one run() pass may claim.  The daemon calls run() on a
 #: timer, so this only bounds one tick's work, not the whole backlog.
@@ -150,11 +179,29 @@ class Candidate:
 
 
 class ClaudeExtractor:
-    """Use the installed Claude Code CLI as a local extraction model."""
+    """Extraction model, reached by direct API first and the CLI only as a fallback.
 
-    name = "claude"
+    History matters here.  This class used to shell out to ``claude -p``, and on
+    this machine that CLI is broken (its default model is absent from the
+    installed version's catalogue, so it hangs or fails).  Every pass therefore
+    tripped the breaker and production distilled with the heuristic -- visible as
+    ``extractor=heuristic`` in /stats.  The endpoint behind the CLI was fine all
+    along, so the transport is now a plain HTTP call
+    (:mod:`hippomind.llm_client`); the CLI is kept as a second chance for hosts
+    where it does work.
 
-    def __init__(self, timeout: float = 45.0):
+    What deliberately did *not* change: the prompt, the 8-items-per-call batching,
+    the claim schema and the source-number semantics.  Swapping only the
+    transport is what makes the heuristic-vs-api comparison in docs/DISTILL.md
+    a measurement of the model rather than of a rewritten prompt.
+
+    ``name`` reports the transport that actually answered, so a caller can tell
+    ``api`` from ``cli`` from the ``heuristic`` fallback in the ledger.
+    """
+
+    def __init__(self, timeout: float = 45.0, *, use_api: bool = True,
+                 use_cli: bool = True, complete: Any = None,
+                 transport: str = ""):
         candidates = [shutil.which("claude"),
                       str(Path.home() / ".local" / "bin" / "claude"),
                       "/usr/local/bin/claude", "/opt/homebrew/bin/claude"]
@@ -164,10 +211,37 @@ class ClaudeExtractor:
         self._failures = 0
         self._cooldown_until = 0.0
         self.last_error = ""
+        #: Which transports this instance may use, in order.  Tests pin these to
+        #: isolate one path; the default is "API if configured, else the CLI".
+        policy = str(transport or default_transport()).strip().lower()
+        if policy not in TRANSPORTS:
+            # An unrecognised policy means "auto", never "nothing": a typo must
+            # not silently disable extraction.
+            policy = "auto"
+        self.transport_policy = policy
+        self.use_api = (bool(use_api) and policy in ("auto", "api")
+                        and llm_client.available())
+        self.use_cli = bool(use_cli) and policy in ("auto", "cli")
+        #: Injection seam: a callable(prompt, timeout=...) -> Optional[str].
+        #: When set, no socket and no subprocess is touched.
+        self._complete = complete
+        #: Transport that produced the most recent successful extraction.
+        self.transport = ""
+
+    @property
+    def name(self) -> str:
+        """The transport that answered last: api, cli, or claude (unresolved)."""
+        if self.transport:
+            return self.transport
+        if self.use_api:
+            return "api"
+        return "cli" if self.binary else "claude"
 
     @property
     def available(self) -> bool:
-        return bool(self.binary) and time.time() >= self._cooldown_until
+        if time.time() < self._cooldown_until:
+            return False
+        return bool(self.use_api or (self.use_cli and self.binary))
 
     def _record_failure(self, exc: Exception) -> None:
         self._failures += 1
@@ -175,6 +249,55 @@ class ClaudeExtractor:
         if self._failures >= 2:
             self._cooldown_until = time.time() + 600.0
             self._failures = 0
+
+    def _ask(self, prompt: str, max_tokens: int) -> Optional[str]:
+        """Send one prompt through the first transport that answers.
+
+        Returning ``None` here means "no transport produced text"; the caller
+        then falls back to the heuristic.  A transport failure is recorded on
+        the breaker but never raised, so one dead path cannot abort a pass.
+        """
+        if self.use_api:
+            caller = self._complete or llm_client.complete
+            try:
+                answer = caller(prompt, max_tokens=max_tokens, timeout=self.timeout)
+            except Exception as exc:  # noqa: BLE001 - a transport must not escape
+                self._record_failure(exc)
+                answer = None
+            if answer:
+                self.transport = "api"
+                return answer
+            self._record_failure(RuntimeError("api returned no usable answer"))
+        if not (self.use_cli and self.binary):
+            return None
+        try:
+            answer = self._run_cli(prompt)
+        except (OSError, subprocess.SubprocessError) as exc:
+            self._record_failure(exc)
+            return None
+        if answer:
+            self.transport = "cli"
+        return answer
+
+    def _run_cli(self, prompt: str) -> Optional[str]:
+        """The legacy transport: ``claude -p`` in print mode."""
+        env = os.environ.copy()
+        extra_paths = [
+            str(Path.home() / ".local" / "bin"),
+            str(Path.home() / ".local" / "share" / "pi-node"
+                / "node-v22.23.2-darwin-arm64" / "bin"),
+            "/usr/local/bin", "/opt/homebrew/bin",
+        ]
+        env["PATH"] = os.pathsep.join(extra_paths + [env.get("PATH", "/usr/bin:/bin")])
+        completed = subprocess.run(
+            [self.binary, "-p", "--output-format", "text"],
+            input=prompt, text=True, capture_output=True,
+            timeout=self.timeout, cwd=str(Path.home()), env=env,
+        )
+        if completed.returncode != 0:
+            self._record_failure(RuntimeError(completed.stderr[-300:]))
+            return None
+        return completed.stdout.strip()
 
     def extract(self, candidates: Sequence[Candidate]) -> Optional[List[Dict[str, Any]]]:
         if not self.available or not candidates:
@@ -196,27 +319,9 @@ value（值）、confidence（0-1）、source（对应片段编号）。
 片段：
 %s
 """ % "\n\n".join(snippets)
-        try:
-            env = os.environ.copy()
-            extra_paths = [
-                str(Path.home() / ".local" / "bin"),
-                str(Path.home() / ".local" / "share" / "pi-node"
-                    / "node-v22.23.2-darwin-arm64" / "bin"),
-                "/usr/local/bin", "/opt/homebrew/bin",
-            ]
-            env["PATH"] = os.pathsep.join(extra_paths + [env.get("PATH", "/usr/bin:/bin")])
-            completed = subprocess.run(
-                [self.binary, "-p", "--output-format", "text"],
-                input=prompt, text=True, capture_output=True,
-                timeout=self.timeout, cwd=str(Path.home()), env=env,
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            self._record_failure(exc)
+        text = self._ask(prompt, EXTRACT_MAX_TOKENS)
+        if not text:
             return None
-        if completed.returncode != 0:
-            self._record_failure(RuntimeError(completed.stderr[-300:]))
-            return None
-        text = completed.stdout.strip()
         start = text.find("{")
         end = text.rfind("}")
         if start < 0 or end <= start:
@@ -576,8 +681,8 @@ class DistillEngine:
                    "fetched": len(candidates),
                    "batch_size": size, "batches": 0, "claims": 0,
                    "distilled": 0, "skipped": 0, "errors": 0,
-                   "extractor": "none", "conflicts_resolved": 0,
-                   "elapsed_ms": 0.0}
+                   "extractor": "none", "extractors": {},
+                   "conflicts_resolved": 0, "elapsed_ms": 0.0}
         last_by_subject: Dict[str, str] = {}
         for start in range(0, len(representatives), size):
             batch = representatives[start:start + size]
@@ -585,7 +690,15 @@ class DistillEngine:
                 continue
             summary["batches"] += 1
             claims, extractor_name = self._claims_for(batch)
+            # "extractor" is the last transport that ran (kept for compatibility
+            # with existing dashboards); "extractors" counts them, because a
+            # single pass can genuinely mix them -- a batch whose model answer is
+            # an empty claims array legitimately falls back for that batch only.
+            # Reporting just the last one made a mostly-API run look entirely
+            # heuristic, which is exactly the number an operator would trust.
             summary["extractor"] = extractor_name
+            counts = summary["extractors"]
+            counts[extractor_name] = counts.get(extractor_name, 0) + 1
             by_source: Dict[int, List[Dict[str, Any]]] = {}
             for claim in claims:
                 source = int(claim.get("source", 0) or 0)
@@ -651,4 +764,5 @@ class DistillEngine:
                 "SELECT COUNT(*) FROM memory_claims WHERE state='conflict'").fetchone()[0])
         return {"memories": total, "distilled": distilled, "claims": claims,
                 "conflicts": conflicts, "extractor": getattr(self.extractor, "name", "heuristic"),
-                "available": bool(getattr(self.extractor, "available", False))}
+                "available": bool(getattr(self.extractor, "available", False)),
+                "transport": getattr(self.extractor, "transport", "") or ""}

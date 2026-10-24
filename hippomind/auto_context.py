@@ -35,20 +35,31 @@ def _load_vector_index(ledger: SQLiteLedger, embedder):
 
     向量参与的是**候选生成**（ledger.search 的第三路召回），不是重排。
     实测（docs/SEMANTIC.md）：改写式查询 recall 0.200 -> 0.533，关键词集持平。
+
+    **粒度**（2026-10-24）：默认用 claim 级索引。真正的瓶颈是索引粒度——
+    一条提炼记忆把 5-10 个互不相关的事实塞进 ~350-550 字符的正文，整体
+    embedding 被稀释成"什么都像一点"的中心点。按 claim 建索引后实测：
+    semantic recall 0.226 -> 0.415，keyword 0.652 -> 0.826。claim 级缺失
+    （账本没提炼过 / 索引写不出来）时回退 memory 级，都缺失时纯词法。
+    `HIPPOMIND_VECTOR_GRANULARITY=claim|memory` 可切换，默认 claim。
+
     索引未构建 / onnxruntime 缺失 / numpy 缺失时静默退回纯词法路径。
     """
     if os.environ.get("HIPPOMIND_VECTOR_INDEX", "1").strip().lower() in {"0", "off", "false"}:
         return None
     try:
         from .semantic_onnx import load_onnx_embedder
-        from .vector_index import load_vector_index
+        from .vector_index import load_granular_index
     except Exception:
         return None
     try:
         onnx_embedder = load_onnx_embedder()
         if onnx_embedder is None:
             return None
-        return load_vector_index(ledger, onnx_embedder)
+        # build=False：注入路径**只读盘**。全量构建实测 56-86s，而这里整个
+        # 预取的预算是 700ms——在请求里重建等于把一次冷启动变成一次超时。
+        # 构建与增量同步归 daemon 的 start_vector_index_loop（每 900s 一次）。
+        return load_granular_index(ledger, onnx_embedder, build=False)
     except Exception:
         return None
 

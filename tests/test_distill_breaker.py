@@ -15,7 +15,9 @@ from hippomind.distill import ClaudeExtractor, Candidate
 
 class CircuitBreakerTests(unittest.TestCase):
     def test_two_failures_open_the_breaker(self):
-        extractor = ClaudeExtractor(timeout=1)
+        # use_api=False pins the CLI transport: this test is about what happens
+        # when *that* transport fails, and it must never reach a socket.
+        extractor = ClaudeExtractor(timeout=1, use_api=False)
         extractor.binary = "/bin/false"
         candidate = Candidate("m1", "task", "内容", "codex", "", "", "", "", {})
         with mock.patch("subprocess.run", side_effect=OSError("boom")):
@@ -26,7 +28,7 @@ class CircuitBreakerTests(unittest.TestCase):
         self.assertIn("OSError", extractor.last_error)
 
     def test_success_resets_the_breaker(self):
-        extractor = ClaudeExtractor(timeout=1)
+        extractor = ClaudeExtractor(timeout=1, use_api=False)
         extractor.binary = "/bin/echo"
         candidate = Candidate("m1", "task", "内容", "codex", "", "", "", "", {})
         payload = '{"claims":[{"subject":"S","predicate":"P","slot_key":"k","value":"v","confidence":0.9,"source":1}]}'

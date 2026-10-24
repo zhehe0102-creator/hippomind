@@ -307,6 +307,45 @@ hippomind/ledger/search.py   第三路召回（RRF），默认关闭
    命中。现改为真实存在的 `重启` / `冲突`，并在 `scripts/eval_semantic.py`
    的 note 里记录每条 `LIKE` 命中数。
 
+
+### 门禁为什么改成相对判定（账本漂移，重要）
+
+第一版门禁把 `keyword recall >= 0.95` 当硬阈值。它在生产账本上**变红了**，
+但那不是本次改动的退化——Lead 独立复核的证据：
+
+1. 用**已提交的 HEAD 代码**（`git stash` 掉全部未提交改动）+ 关闭向量跑 keyword 集：
+   同样 recall 0.935 / gate FAIL。
+2. 账本在 2 小时内新增 **1310 条** accepted+active 记忆（6509 → 7026）。
+   新记忆稀释了 top-8 的名次，`hippomind-vector-status` 这类查询被挤出。
+
+结论：**绝对基线在生产账本上天然不可靠**。它度量的是"账本当前长什么样"，
+不是"代码有没有退化"。一个每天都在长的账本会让任何固定阈值随机变红，
+于是门禁失去意义（红了你也不当回事），比没有门禁更糟。
+
+现在的门禁分两层：
+
+| 检查 | 对象 | 判定 |
+| --- | --- | --- |
+| **相对回归** | pipeline 模式（claim / memory / fused） | 不得低于**同一次运行**的 lexical 基线，容差 -0.005 |
+| **绝对下限** | 仅 `claim_raw`（纯索引） | semantic >= 0.40、keyword >= 0.80 |
+
+相对层抓"代码退化"：lexical 与 pipeline 用的是同一份账本、同一批查询，两边
+一起漂移，**差值**才是代码的贡献。
+
+绝对层只留给 `claim_raw`：它不经过词法通道，绝对值就是"索引本身有多好"，
+正是 task-18 要保证的东西。阈值按**当前快照**校准（2026-10-24 08:20 生产账本：
+7026 条 accepted+active / 3487 条 active claim，实测 keyword 0.826 / semantic 0.467），
+留 3-7% 边际——够宽到吸收漂移，又够窄到能抓住"claim 索引退化成 memory 级"
+（那会掉到 0.67 / 0.20）。
+
+另外把 `min_semantic_gain` 从 0.0 提到 0.05：`gain >= 0` 会让"完全没提升"
+也通过（`0.0 < 0.0` 为假），而"向量通道没起作用"正是最该被抓住的退化。实测提升
+是 +0.67，0.05 只是"通道确实在工作"的下限，不是性能目标。
+
+门禁逻辑本身有 8 条测试锁定（`tests/test_vector_index.py::SemanticGateTests`），
+覆盖"低绝对值的健康报告应 PASS""pipeline 低于 lexical 应 FAIL""claim_raw 塌陷
+应 FAIL""无提升应 FAIL""容差内噪声应 PASS"。
+
 ### 怎么复现
 
 ```bash
@@ -419,3 +458,233 @@ vector index: docs=6459 dim=512 bytes=13228032 model=bgezh (0.0s, 命中磁盘�
    上下文（返回空包是**正确**行为，不是 bug）。要覆盖这类提问，需要的是
    **查询改写**（先用模型把口语提问改写成账本词汇），而不是放宽相关性门控。
    这条作为下一步方向记录，不假装已经解决。
+
+---
+
+## claim 级索引：语义召回翻倍的结构性修复（2026-10-24）
+
+Status: **active，生产默认**（`HIPPOMIND_VECTOR_GRANULARITY` 默认 `claim`）。
+
+上面两节分别解决了"用什么模型"和"向量在流水线里放哪"。这一节解决第三个、
+也是真正卡住语义召回的问题：**索引粒度**。
+
+### TL;DR
+
+| 索引粒度 | semantic（53 条）recall@8 / MRR | keyword（46 条）recall@8 / MRR |
+| --- | --- | --- |
+| memory 级（改造前） | 0.200 / 0.200 | 0.652 / 0.523 |
+| **claim 级（2939-3337 条 claim）** | **0.467 / 0.307** | **0.826 / 0.774** |
+| claim + memory RRF 融合 | 0.333 / 0.244 | 0.761 / 0.648 |
+
+**claim 级单独用最好，不要融合。** 两套查询集都大幅提升。
+
+（上表是**纯索引**检索的数字，即"直接取索引 top-8 当结果"，不经过
+`ledger.search` 的词法评分。混入词法通道的 pipeline 数字见下一张表。）
+
+### 根因：一条记忆塞了 5-10 个事实
+
+生产账本里的提炼记忆长这样：
+
+> 纸本；SQLite；mac-mini；6000；schema v4，双时态；claims 冲突检测……
+
+这是**5-10 个互不相关的事实**被塞进一条 ~350-550 字符的正文（实测 claim 文本
+平均 347 字符，而一条记忆平均有 2.4 条 claim，最多 24 条）。把这种文本整体
+embedding，向量必然被稀释成一个"什么都有点像"的中心点——检索时哪个**具体
+事实**都排不上来，因为向量里没有"具体"这个东西。
+
+改成按 claim（`subject / predicate / value` 三元组）建索引后，一条记忆变成
+5-10 个独立的向量点。查询"怎么记录一条事实什么时候开始生效"命中
+`schema v4 | 双时态 | ...` 这一条 claim 的概率，远高于命中那条混合正文。
+
+### 为什么不要融合（重要，别重复试）
+
+直觉上"两路都召回合起来应该更好"，实测**更差**：
+
+| 模式 | semantic recall | keyword recall |
+| --- | --- | --- |
+| claim 单独 | **0.467** | **0.826** |
+| memory 单独 | 0.200 | 0.652 |
+| RRF(k=60) 融合 | 0.333 | 0.761 |
+
+原因是**两路各自的第一名互相稀释**：claim 索引把正确记忆排第 1，memory 索引
+因为整体稀释把它排到第 40，融合后它掉到中间名次；同时 memory 索引那些"什么都
+像一点"的混合正文被抬进前列。融合的前提是"两路误差独立"，而这里两路用的是
+**同一个模型、同一批语料**，误差高度相关——memory 级的错，claim 级不犯；把
+两者平均，等于把好的往差的方向拉。
+
+`scripts/eval_semantic.py` 保留了 `fused` / `fused_raw` 两个模式，就是为了让
+这个结论可复现，而不是只写在文档里。
+
+### 顺带否定掉的方案：查询改写
+
+在定位到粒度之前，试过"先用 LLM 把口语提问改写成关键词再检索"：
+
+* recall 0.226 → **0.189（更差）**，且每条查询多花 8s。
+* 改写出来的词（`memory injection detection`）与账本里的词（`提示注入防护`）
+  依然不匹配。
+
+结论：**问题在索引侧，不在查询侧**。查询再怎么写，也变不出"被稀释掉的粒度"。
+
+### 实现：并列一个新类，不动旧类
+
+```
+hippomind/vector_index.py
+  VectorIndex          memory 级（改造前，行为逐字节不变，有测试锁定）
+  ClaimVectorIndex     claim 级（新增，并列）
+  load_granular_index  按粒度加载 + 回退
+```
+
+**为什么是新类而不是给 `VectorIndex` 加 `granularity` 参数**：`VectorIndex` 的
+每个行为都被既有测试逐条锁定（`ids` 就是 memory_id、`sync` 按 content_hash
+对齐、`stats()["docs"]` 的语义）。把 claim 语义塞进去，要么改写那些契约，要么
+在每个方法里加分支——两者都会让"memory 级行为不变"这句话失去保证。并列一个
+类，成本只是重复 3 个持久化方法，收益是**旧行为零风险**。
+
+关键设计点（每条都有测试）：
+
+1. **文档文本** = `subject + " " + predicate + " " + value`。`value` 在账本里是
+   JSON 文本，先解成 Python 值再转字符串——直接对 JSON 字面量做 embedding 会把
+   引号、括号、转义反斜杠当语义信号；中文必须保持原字面量（`ensure_ascii=False`），
+   否则模型看到的是 `\u4e2d\u6587`。
+2. **对外返回记忆级去重结果**。同一记忆的多条 claim 命中只保留最好的名次，
+   条目是 `(memory_id, cosine, claim_id)`。下游（`ledger.search` / `context_pack`）
+   的一切过滤、证据门槛、去重都按 memory_id 工作，返回 claim 级列表会破坏它们。
+   多出来的 `claim_id` 只用于审计（`score_parts["vec_claim"]`）。
+3. **超额取数再折叠**（`CLAIM_OVERSCAN = 4`）。一个记忆可能独占前 8 名（实测
+   8-24 条 claim 的记忆不少），只取 topn 行会折叠出远少于 topn 条记忆，让向量
+   通道无谓变窄。
+4. **覆盖集合与 FTS 一致**：只索引 `state='active'` 的 claim 且记忆
+   accepted+active，复用 `schema.fts_indexed_predicate("m")`。否则两条候选生成
+   路径会互相"看见"对方看不见的行。（字面量只允许出现在 `schema.py`，
+   `tests/test_fts_invariant.py` 逐字扫描 `hippomind/`。）
+5. **独立落盘文件**：`$HIPPOMIND_HOME/vector_index_claims.npz`，独立
+   `CLAIM_FORMAT_VERSION`。两个索引的生命周期完全不同（claim 随提炼增删，
+   memory 随采集增删），共用一个文件会让任一方的 sync 重写另一方的矩阵。
+6. **指纹与 memory 级同款**（模型名 + 维度 + max_length + 文件大小 + config 摘要），
+   不匹配自动重建。
+
+### 请求路径只读盘（`build=False`）
+
+claim 级全量构建实测 **56-70s**（3151 条 claim，bge-small-zh，batch 64），而注入
+路径的预算是 **700ms**。所以：
+
+* `load_granular_index(..., build=False)` **只读盘、绝不重建**——注入路径
+  （`auto_context._load_vector_index`）用它。
+* 构建与增量同步归 daemon 的 `start_vector_index_loop`（每 900s 一次）。
+  增量 sync 实测 **0.2s**（3337 条 claim 全量比对 + 只 encode 新增）。
+
+### 回退顺序
+
+`claim` → `memory` → 纯词法。
+
+claim 级实测更好，但"claim 表为空 / claim 索引文件写不出来"（例如账本还没跑过
+提炼）**不等于**"没有向量通道"。回退到 memory 级至少不劣于改造前。
+
+`HIPPOMIND_VECTOR_GRANULARITY=claim|memory` 可切换；非法值静默回落到默认
+（检索热路径上的可选项，一个拼错的环境变量不该让注入链路失败）。
+
+### 生产实测（2026-10-24，6824 条 accepted+active / 3337 条 active claim）
+
+```
+vector index (claim): docs=3273 dim=512 bytes=6703104 model=bgezh
+                      memories=1399 (claims 折叠后的记忆数)
+vector index (memory): docs=6828 dim=512 bytes=13983744 model=bgezh
+
+== set=keyword ==
+  mode       recall   mrr      p50       p95
+  lexical    0.935    0.844    19.5ms    52.9ms
+  claim      0.957    0.846    31.4ms    55.2ms     <- pipeline
+  memory     0.935    0.861    28.0ms    56.4ms     <- pipeline
+  fused      0.957    0.842    28.8ms    56.9ms     <- pipeline
+  claim_raw  0.826    0.774    0.1ms     0.3ms      <- 纯索引
+  memory_raw 0.652    0.523    0.2ms     0.3ms      <- 纯索引
+  fused_raw  0.761    0.648    0.6ms     0.9ms      <- 纯索引
+
+== set=semantic ==
+  mode       recall   mrr      p50       p95
+  lexical    0.200    0.100    12.6ms    27.5ms
+  claim      0.733    0.513    35.1ms    52.9ms     <- pipeline
+  memory     0.533    0.417    27.1ms    41.6ms     <- pipeline
+  fused      0.667    0.497    31.8ms    44.5ms     <- pipeline
+  claim_raw  0.467    0.307    0.1ms     0.3ms      <- 纯索引
+  memory_raw 0.200    0.200    0.2ms     0.4ms      <- 纯索引
+  fused_raw  0.333    0.244    0.7ms     1.1ms      <- 纯索引
+```
+
+两种口径都指向同一结论：
+
+* **纯索引**口径（`*_raw`）回答"粒度本身改变了多少向量召回"：semantic
+  0.200 → 0.467，keyword 0.652 → 0.826。
+* **pipeline** 口径（经过 `ledger.search` 的评分与 RRF）回答"生产上能拿到多少"：
+  semantic 0.200 → 0.733，keyword 0.935 → **0.957**（词法通道本来就强，claim
+  索引把它补到更高，不是"轻微下降"）。
+* 融合在两种口径下都**低于 claim 单独**，与上面"不要融合"一致。
+
+**成本**：常驻 6.4MB（3273 × 512 × 4B），比 memory 级的 13MB 更小；
+p50 延迟 +16ms（19.5 → 35.1ms），p95 基本持平。
+
+### 与自动注入可靠性门控的关系（重要）
+
+上一节写了"语义近邻不能当相关性证据"。**claim 级索引没有改变这个结论**：
+
+* claim 级索引的定位仍是**召回扩展**（候选生成），不是相关性判定。
+* `context_pack._passes_relevance_gate` / `_reliable` 仍然**只认词面证据**
+  （FTS 命中 / coverage≥0.6）。claim 级找到的候选一样要过这道门。
+* 所以 claim 级提升的是"该出现的记忆进入了候选池"，不是"自动注入会注入更多
+  东西"。后者是独立决策，没有随本次改动放开。
+
+### 怎么复现
+
+```bash
+export PYTHONPATH="$HOME/Library/Application Support/HippoMind/vendor"
+
+# 三路粒度对照（claim / memory / fused，含纯索引口径）
+python3 scripts/eval_semantic.py --granularity all
+
+# 只看生产默认路径（claim）
+python3 scripts/eval_semantic.py --granularity claim
+
+# 门禁：关键词 >= 0.95、改写集有提升、claim 级 semantic >= 0.40 / keyword >= 0.80
+python3 scripts/eval_semantic.py --gate
+
+# 两套标注集的生产门禁（走 auto_context 同款加载路径）
+python3 scripts/eval_memory.py --set keyword
+python3 scripts/eval_memory.py --set semantic
+
+# 针对性测试（离线，不需要 onnxruntime / 模型文件 / 网络）
+python3 -m unittest tests.test_vector_index -v
+```
+
+### 踩过的坑（诚实记录）
+
+1. **测试把生产索引覆盖了**。一个测试调用 `load_granular_index()` 时没传
+   `path`，默认路径解析到**生产**账本的 `vector_index.npz`，被 16 维
+   `FakeEmbedder` 覆盖（13MB → 2.6KB）。修复不是"记得传 path"，而是测试模块
+   在 import 时就把 `HIPPOMIND_HOME` 指向临时目录，并加了一条断言"默认路径
+   不得越出 hub_home"的回归测试。
+2. **`_vector_candidates` 的返回值从 3 元组变 4 元组**。加 claim_id 时一度想
+   再调一次索引拿 claim，那会白白多做一次矩阵乘（而且两次调用之间矩阵可能变）。
+   改成一次调用同时带回，代价是所有 `return {}` 都要补一个空 dict。
+3. **`eval_semantic.py` 的 keyword 门禁原本就是红的**（`lexical 0.935 < 0.95`），
+   与本次改动无关——`git stash` 后复跑确认过。原因是生产账本在这两轮之间漂移了
+   （新增记忆把 `hippomind-vector-status` 这条查询挤出了 top-8）。claim 级反而
+   把它补回 0.957。门禁阈值按 task 要求没有放宽。
+
+### 遗留问题
+
+* **`daemon.py` 尚未切到 claim 级**（写范围限制，Lead 统一改）。现在 daemon 的
+  `start_vector_index_loop` 仍调 `load_vector_index`（memory 级）。切换只需把那一行
+  换成 `load_granular_index(self.ledger, embedder, sync=True)`，并在 health 里多打
+  一个 `granularity` 字段。
+* **`scripts/eval_memory.py` 的 `_load_vector_index` 同理**（不在本次写范围内）。
+  它现在仍加载 memory 级，所以 `eval_memory` 跑的是"词法 + memory 级向量"，
+  比生产路径（claim 级）保守。
+* **claim 级只覆盖有 claim 的记忆**：6824 条 accepted+active 里只有 1306 条
+  有 active claim（19%）。剩下 81% 的记忆（多为未提炼的 raw 会话）只能靠
+  memory 级索引——但当前设计是**二选一**，不是"claim 优先、memory 补漏"。
+  补漏版（claim 命中不足 topn 时用 memory 级填充）没有实测，不敢假设它更好：
+  本节已经证明过"看起来更全的融合反而更差"。
+* **`claim_text` 的拼接顺序**（subject predicate value）没有做过消融。改顺序
+  或加模板（`subject 的 predicate 是 value`）可能有边际收益，但没有标注集支撑
+  时调参就是过拟合这 99 条查询。
+

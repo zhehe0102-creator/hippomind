@@ -9,6 +9,11 @@
 5. **RRF 融合正确性**：ledger.search(vector_index=...) 的默认行为零变化，
    开启后只在候选生成/名次上生效，且不引入越权召回（过滤必须重放）。
 
+6. **claim 级索引**（task-18，2026-10-24）：构建/持久化/指纹失效/增量、
+   记忆级去重、claim 失效移除、粒度回退顺序。claim 级是**并列**的新能力，
+   上面 1-5 锁定的 memory 级行为一个字都不能变——本文件的后半部分就是
+   这条约束的回归测试。
+
 全部离线：假 embedder 注入，不依赖 onnxruntime / 模型文件 / 网络。
 """
 
@@ -16,16 +21,32 @@ from __future__ import annotations
 
 import math
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any, Dict
 
 import numpy as np
 
+# 门禁逻辑在 scripts/ 下（不是包），按脚本自身的方式导入。
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+import eval_semantic  # noqa: E402
+
+# 隔离：本模块任何代码路径都不得读写**真实**的 $HIPPOMIND_HOME。
+# 曾经踩过：一个测试调用 load_granular_index() 没传 path，于是默认路径解析到
+# 生产账本的 vector_index.npz，被 FakeEmbedder（16 维）覆盖。测试进程必须
+# 从一开始就指向临时目录，而不是依赖每个测试自觉传 path。
+_HERMETIC_HOME = tempfile.mkdtemp(prefix="hippo-vi-home-")
+os.environ["HIPPOMIND_HOME"] = _HERMETIC_HOME
+
 from hippomind.ledger import SQLiteLedger
 from hippomind.vector_index import (
-    FORMAT_VERSION, VectorIndex, content_hash, corpus_text, default_index_path,
-    fingerprint_of, load_vector_index)
+    CLAIM_FORMAT_VERSION, CLAIM_INDEX_FILENAME, CLAIM_OVERSCAN, DEFAULT_GRANULARITY,
+    ENV_GRANULARITY, FORMAT_VERSION, GRANULARITY_CLAIM, GRANULARITY_MEMORY,
+    ClaimVectorIndex, VectorIndex, claim_text, configured_granularity, content_hash,
+    corpus_text, default_claim_index_path, default_index_path, fingerprint_of,
+    load_claim_vector_index, load_granular_index, load_vector_index)
 
 
 class FakeEmbedder:
@@ -71,6 +92,26 @@ def _ingest(ledger, content, **extra):
               "scope": "shared", "evidence": ["vi:" + content]}
     record.update(extra)
     return ledger.ingest(record).memory_id
+
+
+def _claim(subject, predicate, value, slot_key=None):
+    """构造一条 claim（账本要求 subject/predicate/slot_key/value 齐全）。"""
+    return {"subject": subject, "predicate": predicate,
+            "slot_key": slot_key or ("%s.%s" % (subject, predicate)),
+            "value": value}
+
+
+def _ingest_claims(ledger, content, claims, **extra):
+    """写入一条带 claims 的记忆，返回 (memory_id, [claim_id, ...])。"""
+    record = {"content": content, "kind": "fact", "source_agent": "vi-tester",
+              "scope": "shared", "evidence": ["vi:" + content], "claims": claims}
+    record.update(extra)
+    memory_id = ledger.ingest(record).memory_id
+    with ledger._reading() as conn:
+        rows = conn.execute(
+            "SELECT claim_id FROM memory_claims WHERE memory_id=? ORDER BY claim_id",
+            (memory_id,)).fetchall()
+    return memory_id, [str(row["claim_id"]) for row in rows]
 
 
 class LedgerCase(unittest.TestCase):
@@ -561,6 +602,624 @@ class SearchIntegrationTests(LedgerCase):
         self.assertTrue(hits)
         ranked = [hit for hit in hits if "vec_rank" in hit["score_parts"]]
         self.assertLessEqual(len(ranked), 1)
+
+
+
+# ---------------------------------------------------------------------------
+# claim 级索引（task-18）
+# ---------------------------------------------------------------------------
+# 背景（实测见 docs/SEMANTIC.md「claim 级索引」）：真正的瓶颈是索引粒度。
+# 生产提炼记忆把 5-10 个互不相关的事实塞进一条 350-550 字符的正文，整体
+# embedding 被稀释成"什么都像一点"的中心点。按 claim 建索引后两套查询集都
+# 大幅提升（semantic 0.226 -> 0.415，keyword 0.652 -> 0.826）。
+#
+# 这些测试锁定的契约：
+#   1. 只索引 state='active' 且记忆 accepted+active 的 claim（与 FTS 同集合）；
+#   2. 对外返回**记忆级**去重结果（同一记忆多条 claim 只留最好的名次）；
+#   3. 持久化独立文件 + 独立 format_version + 指纹失效重建；
+#   4. 增量：只 encode 新增/内容变化的 claim，失效 claim 移除；
+#   5. 降级：numpy/embedder/账本缺失一律返回 None；
+#   6. memory 级行为零变化（上面的测试类就是那条约束的回归）。
+
+
+class ClaimTextTests(unittest.TestCase):
+    """claim 文本 = subject + " " + predicate + " " + value（value 先解 JSON）。"""
+
+    def test_joins_three_parts(self):
+        self.assertEqual("RelayDesk 运行方式 LaunchAgent 启动",
+                         claim_text("RelayDesk", "运行方式", '"LaunchAgent 启动"'))
+
+    def test_decodes_json_string_value(self):
+        # 账本里 value 是 JSON 文本；直接 embed 字面量会把引号当语义信号。
+        self.assertEqual("端口 5432", claim_text("端口", "是", '"5432"').replace("是 ", ""))
+
+    def test_flattens_json_object_value(self):
+        text = claim_text("配置", "包含", '{"b": 2, "a": "中文"}')
+        self.assertIn("中文", text)
+        self.assertNotIn("\\u", text, "中文必须以原字面量出现，不能是 JSON 转义")
+
+    def test_invalid_json_falls_back_to_raw_text(self):
+        self.assertEqual("a b {not json", claim_text("a", "b", "{not json"))
+
+    def test_none_value_is_omitted(self):
+        self.assertEqual("a b", claim_text("a", "b", None))
+
+    def test_blank_parts_are_skipped(self):
+        self.assertEqual("subject predicate",
+                         claim_text("subject", "predicate", "   "))
+
+
+class ClaimBuildTests(LedgerCase):
+    def test_build_indexes_active_claims_of_accepted_memories(self):
+        first, first_claims = _ingest_claims(self.ledger, "记忆一", [
+            _claim("PostgreSQL", "端口", 5432),
+            _claim("PostgreSQL", "部署", "db-01"),
+        ])
+        second, second_claims = _ingest_claims(self.ledger, "记忆二", [
+            _claim("Redis", "端口", 6379),
+        ])
+        index = ClaimVectorIndex.build(self.ledger, self.embedder)
+        self.assertIsNotNone(index)
+        self.assertEqual(3, len(index), "矩阵行是 claim，不是记忆")
+        self.assertEqual(sorted(first_claims + second_claims),
+                         sorted(index.claim_ids))
+        self.assertEqual(2, len(set(index.memory_ids)), "两条记忆")
+        self.assertEqual(16, index.dim)
+
+    def test_build_skips_memories_outside_fts_predicate(self):
+        keep, _ = _ingest_claims(self.ledger, "可召回", [_claim("A", "b", 1)])
+        drop, _ = _ingest_claims(self.ledger, "隔离", [_claim("B", "c", 2)])
+        with self.ledger._connect(write=True) as conn:
+            conn.execute("UPDATE memories SET quality_state=? WHERE memory_id=?",
+                         ("quarantine", drop))
+        index = ClaimVectorIndex.build(self.ledger, self.embedder)
+        self.assertEqual([keep], list(dict.fromkeys(index.memory_ids)))
+
+    def test_build_skips_non_active_claims(self):
+        memory_id, claim_ids = _ingest_claims(self.ledger, "记忆", [
+            _claim("A", "b", 1), _claim("C", "d", 2)])
+        with self.ledger._connect(write=True) as conn:
+            conn.execute("UPDATE memory_claims SET state=? WHERE claim_id=?",
+                         ("superseded", claim_ids[0]))
+        index = ClaimVectorIndex.build(self.ledger, self.embedder)
+        self.assertEqual([claim_ids[1]], index.claim_ids)
+
+    def test_build_returns_none_without_claims(self):
+        _ingest(self.ledger, "没有 claim 的记忆")
+        self.assertIsNone(ClaimVectorIndex.build(self.ledger, self.embedder))
+
+    def test_build_returns_none_without_embedder(self):
+        _ingest_claims(self.ledger, "记忆", [_claim("A", "b", 1)])
+        self.assertIsNone(ClaimVectorIndex.build(self.ledger, None))
+
+    def test_rows_are_normalised_and_finite(self):
+        for index in range(4):
+            _ingest_claims(self.ledger, "记忆 %d" % index,
+                           [_claim("S%d" % index, "p", index)])
+        built = ClaimVectorIndex.build(self.ledger, self.embedder)
+        self.assertTrue(bool(np.isfinite(built.matrix).all()))
+        for norm in np.linalg.norm(built.matrix, axis=1):
+            self.assertAlmostEqual(1.0, float(norm), places=5)
+
+    def test_stats_reports_claims_and_memories(self):
+        _ingest_claims(self.ledger, "记忆", [_claim("A", "b", 1), _claim("C", "d", 2)])
+        built = ClaimVectorIndex.build(self.ledger, self.embedder)
+        stats = built.stats()
+        self.assertEqual(2, stats["claims"])
+        self.assertEqual(1, stats["memories"])
+        self.assertEqual(2, stats["docs"])
+        self.assertEqual(16, stats["dim"])
+        self.assertEqual(2 * 16 * 4, stats["bytes"])
+        self.assertEqual("claim", stats["granularity"])
+
+
+class ClaimSearchTests(LedgerCase):
+    """检索必须返回**记忆级**去重结果，同一记忆只保留最好的名次。"""
+
+    def setUp(self):
+        super().setUp()
+        # 一条"什么都塞进去"的记忆：3 条互不相关的 claim（这正是生产形态）。
+        self.dense, self.dense_claims = _ingest_claims(
+            self.ledger, "纸本；SQLite；mac-mini；6000；schema v4", [
+                _claim("纸本", "用途", "纸质笔记本"),
+                _claim("SQLite", "用途", "本地账本存储"),
+                _claim("mac-mini", "角色", "常驻主机"),
+            ])
+        self.other, _ = _ingest_claims(self.ledger, "Redis 端口", [
+            _claim("Redis", "端口", 6379)])
+        self.index = ClaimVectorIndex.build(self.ledger, self.embedder)
+
+    def test_search_deduplicates_to_memory_level(self):
+        results = self.index.search_text("纸本 SQLite mac-mini", topn=10)
+        memory_ids = [memory_id for memory_id, _score, _claim in results]
+        self.assertEqual(len(memory_ids), len(set(memory_ids)),
+                         "同一记忆的多条 claim 只能出现一次")
+        self.assertIn(self.dense, memory_ids)
+
+    def test_search_returns_best_claim_for_the_memory(self):
+        results = self.index.search_text("纸本 SQLite mac-mini", topn=10)
+        for memory_id, _score, claim_id in results:
+            if memory_id == self.dense:
+                # 保留的是**最好**的那条 claim（名次最靠前），不是随便一条。
+                best = max(
+                    ((cid, float(np.dot(self.index.matrix[
+                        self.index.claim_ids.index(cid)],
+                        np.asarray(self.embedder.embed("纸本 SQLite mac-mini"),
+                                   dtype=np.float32))))
+                     for cid in self.dense_claims),
+                    key=lambda pair: pair[1])
+                self.assertEqual(best[0], claim_id)
+                break
+        else:  # pragma: no cover - 前提不成立说明索引本身坏了
+            self.fail("目标记忆必须出现在结果里")
+
+    def test_search_topn_counts_memories_not_claims(self):
+        results = self.index.search_text("纸本 SQLite mac-mini", topn=1)
+        self.assertEqual(1, len(results), "topn 的语义是记忆数")
+
+    def test_search_scores_are_descending(self):
+        scores = [score for _m, score, _c in self.index.search_text("端口", topn=10)]
+        self.assertEqual(sorted(scores, reverse=True), scores)
+
+    def test_search_is_deterministic(self):
+        first = self.index.search_text("端口", topn=10)
+        second = self.index.search_text("端口", topn=10)
+        self.assertEqual(first, second)
+
+    def test_empty_and_blank_query_return_nothing(self):
+        self.assertEqual([], self.index.search_text(""))
+        self.assertEqual([], self.index.search_text("   "))
+
+    def test_wrong_dimension_query_returns_nothing(self):
+        self.assertEqual([], self.index.search([0.5] * 3))
+
+    def test_nan_query_returns_nothing(self):
+        vector = np.ones(16, dtype=np.float32)
+        vector[0] = np.nan
+        self.assertEqual([], self.index.search(vector))
+
+    def test_embedder_failure_degrades_to_empty(self):
+        class Boom(FakeEmbedder):
+            def embed(self, text):
+                raise RuntimeError("embedder down")
+
+        index = ClaimVectorIndex(self.embedder, self.index.claim_ids,
+                                 self.index.memory_ids, self.index.matrix)
+        index.embedder = Boom()
+        self.assertEqual([], index.search_text("端口"))
+
+    def test_zero_rows_are_masked_out(self):
+        matrix = self.index.matrix.copy()
+        matrix[0] = 0.0
+        index = ClaimVectorIndex(self.embedder, self.index.claim_ids,
+                                 self.index.memory_ids, matrix)
+        self.assertEqual(len(self.index) - 1, int(index._valid.sum()))
+        results = index.search_text("端口", topn=10)
+        for _memory_id, score, _claim in results:
+            self.assertTrue(math.isfinite(score))
+        dropped = self.index.claim_ids[0]
+        self.assertNotIn(dropped, [claim for _m, _s, claim in results])
+
+    def test_overscan_collapses_dense_memories(self):
+        """一个记忆独占很多 claim 时，topn 仍应尽量凑满不同的记忆。"""
+        # 8 条 claim 全在同一记忆上：只取 topn 行会折叠出 1 条记忆。
+        _ingest_claims(self.ledger, "稠密记忆", [
+            _claim("稠密主题", "项 %d" % index, "值 %d" % index) for index in range(8)])
+        index = ClaimVectorIndex.build(self.ledger, self.embedder)
+        results = index.search_text("稠密主题", topn=3)
+        self.assertGreater(len(results), 1,
+                           "超额取数 %d 倍后应折叠出多于 1 条记忆" % CLAIM_OVERSCAN)
+
+
+class ClaimPersistenceTests(LedgerCase):
+    def setUp(self):
+        super().setUp()
+        self.memory_id, self.claim_ids = _ingest_claims(self.ledger, "记忆", [
+            _claim("PostgreSQL", "端口", 5432), _claim("Redis", "端口", 6379)])
+        self.index = ClaimVectorIndex.build(self.ledger, self.embedder)
+
+    def test_save_and_load_roundtrip(self):
+        path = self.root / "claims.npz"
+        self.assertIsNotNone(self.index.save(path))
+        self.assertTrue(path.is_file())
+        loaded = ClaimVectorIndex.load(self.embedder, path)
+        self.assertIsNotNone(loaded)
+        self.assertEqual(self.index.claim_ids, loaded.claim_ids)
+        self.assertEqual(self.index.memory_ids, loaded.memory_ids)
+        self.assertTrue(bool(np.array_equal(self.index.matrix, loaded.matrix)))
+        self.assertEqual(self.index.fingerprint, loaded.fingerprint)
+
+    def test_save_leaves_no_temporary_file(self):
+        self.index.save(self.root / "claims.npz")
+        self.assertEqual([], [p.name for p in self.root.iterdir()
+                              if p.name.endswith(".tmp")])
+
+    def test_load_missing_file_returns_none(self):
+        self.assertIsNone(ClaimVectorIndex.load(self.embedder, self.root / "nope.npz"))
+
+    def test_load_corrupt_file_returns_none(self):
+        path = self.root / "corrupt.npz"
+        path.write_bytes(b"not an npz at all")
+        self.assertIsNone(ClaimVectorIndex.load(self.embedder, path))
+
+    def test_fingerprint_mismatch_forces_rebuild(self):
+        path = self.root / "claims.npz"
+        self.index.save(path)
+        self.assertIsNone(ClaimVectorIndex.load(FakeEmbedder(name="other"), path))
+        self.assertIsNone(ClaimVectorIndex.load(FakeEmbedder(dim=32), path))
+
+    def test_claim_and_memory_indexes_use_separate_files(self):
+        self.assertEqual("vector_index.npz", default_index_path().name)
+        self.assertEqual(CLAIM_INDEX_FILENAME, default_claim_index_path().name)
+        self.assertNotEqual(default_index_path(), default_claim_index_path())
+
+    def test_format_versions_are_independent(self):
+        self.assertEqual(1, CLAIM_FORMAT_VERSION)
+        self.assertEqual(1, FORMAT_VERSION)
+
+    def test_load_or_build_uses_existing_file(self):
+        path = self.root / "claims.npz"
+        first = ClaimVectorIndex.load_or_build(self.ledger, self.embedder, path=path)
+        self.assertIsNotNone(first)
+        self.embedder.encoded.clear()
+        second = ClaimVectorIndex.load_or_build(self.ledger, self.embedder, path=path)
+        self.assertEqual(first.claim_ids, second.claim_ids)
+        self.assertEqual([], self.embedder.encoded, "命中磁盘索引不应重新 encode")
+
+    def test_default_claim_path_uses_hub_home(self):
+        previous = os.environ.get("HIPPOMIND_HOME")
+        os.environ["HIPPOMIND_HOME"] = str(self.root)
+        try:
+            self.assertEqual(self.root / CLAIM_INDEX_FILENAME,
+                             default_claim_index_path())
+        finally:
+            if previous is None:
+                os.environ.pop("HIPPOMIND_HOME", None)
+            else:
+                os.environ["HIPPOMIND_HOME"] = previous
+
+
+class ClaimIncrementalTests(LedgerCase):
+    def test_sync_adds_only_new_claims(self):
+        _ingest_claims(self.ledger, "已有", [_claim("A", "b", 1)])
+        index = ClaimVectorIndex.build(self.ledger, self.embedder)
+        self.embedder.encoded.clear()
+        _ingest_claims(self.ledger, "新增", [_claim("C", "d", 2)])
+        outcome = index.sync(self.ledger)
+        self.assertEqual(1, outcome["added"])
+        self.assertEqual(0, outcome["removed"])
+        self.assertEqual(2, outcome["docs"])
+        self.assertEqual(1, len(self.embedder.encoded), "只 encode 新增那条")
+
+    def test_sync_removes_superseded_claims(self):
+        memory_id, claim_ids = _ingest_claims(self.ledger, "记忆", [
+            _claim("A", "b", 1), _claim("C", "d", 2)])
+        index = ClaimVectorIndex.build(self.ledger, self.embedder)
+        with self.ledger._connect(write=True) as conn:
+            conn.execute("UPDATE memory_claims SET state=? WHERE claim_id=?",
+                         ("superseded", claim_ids[0]))
+        outcome = index.sync(self.ledger)
+        self.assertEqual(1, outcome["removed"])
+        self.assertEqual([claim_ids[1]], index.claim_ids)
+
+    def test_sync_removes_claims_of_deactivated_memories(self):
+        keep, keep_claims = _ingest_claims(self.ledger, "保留", [_claim("A", "b", 1)])
+        drop, drop_claims = _ingest_claims(self.ledger, "下线", [_claim("C", "d", 2)])
+        index = ClaimVectorIndex.build(self.ledger, self.embedder)
+        with self.ledger._connect(write=True) as conn:
+            conn.execute("UPDATE memories SET lifecycle=? WHERE memory_id=?",
+                         ("cold", drop))
+        outcome = index.sync(self.ledger)
+        self.assertEqual(1, outcome["removed"])
+        self.assertEqual(keep_claims, index.claim_ids)
+        self.assertEqual([keep], index.memory_ids)
+
+    def test_sync_reencodes_changed_value(self):
+        memory_id, claim_ids = _ingest_claims(self.ledger, "记忆", [_claim("A", "b", "旧值")])
+        index = ClaimVectorIndex.build(self.ledger, self.embedder)
+        before = index.matrix[0].copy()
+        # claim_id 是 (memory_id, subject, predicate, slot_key) 的哈希：value 变了
+        # id 不变，所以"内容哈希"这一层是发现变化的唯一途径。
+        with self.ledger._connect(write=True) as conn:
+            conn.execute("UPDATE memory_claims SET value_json=? WHERE claim_id=?",
+                         ('"完全不同的新值 爵士乐和弦"', claim_ids[0]))
+        self.embedder.encoded.clear()
+        outcome = index.sync(self.ledger)
+        self.assertEqual(1, outcome["updated"])
+        self.assertEqual(1, len(self.embedder.encoded))
+        self.assertFalse(bool((index.matrix[0] == before).all()))
+
+    def test_sync_is_idempotent(self):
+        _ingest_claims(self.ledger, "稳定", [_claim("A", "b", 1)])
+        index = ClaimVectorIndex.build(self.ledger, self.embedder)
+        self.embedder.encoded.clear()
+        outcome = index.sync(self.ledger)
+        self.assertEqual({"added": 0, "removed": 0, "updated": 0, "docs": 1,
+                          "memories": 1}, outcome)
+        self.assertEqual([], self.embedder.encoded)
+
+    def test_add_many_skips_blank_text(self):
+        index = ClaimVectorIndex(self.embedder, [], [],
+                                 np.zeros((0, 16), dtype=np.float32))
+        self.assertEqual(0, index.add_many([("c1", "m1", "   "), ("c2", "m2", "")]))
+        self.assertEqual(0, len(index))
+
+    def test_remove_unknown_claim_is_noop(self):
+        _ingest_claims(self.ledger, "记忆", [_claim("A", "b", 1)])
+        index = ClaimVectorIndex.build(self.ledger, self.embedder)
+        self.assertEqual(0, index.remove(["cl_nope"]))
+        self.assertEqual(1, len(index))
+
+
+class ClaimDegradationTests(LedgerCase):
+    def test_load_claim_vector_index_returns_none_without_embedder(self):
+        _ingest_claims(self.ledger, "记忆", [_claim("A", "b", 1)])
+        self.assertIsNone(load_claim_vector_index(self.ledger, None))
+
+    def test_load_claim_vector_index_returns_none_for_empty_ledger(self):
+        self.assertIsNone(load_claim_vector_index(self.ledger, self.embedder))
+
+    def test_load_claim_vector_index_survives_embedder_explosion(self):
+        class Boom(FakeEmbedder):
+            def encode_matrix(self, texts):
+                raise RuntimeError("encoder down")
+
+        _ingest_claims(self.ledger, "记忆", [_claim("A", "b", 1)])
+        self.assertIsNone(load_claim_vector_index(self.ledger, Boom()))
+
+    def test_index_rejects_row_count_mismatch(self):
+        with self.assertRaises(ValueError):
+            ClaimVectorIndex(self.embedder, ["c1"], [], np.zeros((1, 16), dtype=np.float32))
+
+    def test_index_rejects_memory_id_count_mismatch(self):
+        with self.assertRaises(ValueError):
+            ClaimVectorIndex(self.embedder, ["c1"], ["m1", "m2"],
+                             np.zeros((1, 16), dtype=np.float32))
+
+    def test_index_rejects_mismatched_embedder_dim(self):
+        with self.assertRaises(ValueError):
+            ClaimVectorIndex(FakeEmbedder(dim=8), ["c1"], ["m1"],
+                             np.zeros((1, 16), dtype=np.float32))
+
+
+class GranularityTests(LedgerCase):
+    """粒度选择：环境变量、回退顺序、默认值。"""
+
+    def setUp(self):
+        super().setUp()
+        self.memory_id, self.claim_ids = _ingest_claims(self.ledger, "记忆", [
+            _claim("PostgreSQL", "端口", 5432)])
+
+    def tearDown(self):
+        os.environ.pop(ENV_GRANULARITY, None)
+        super().tearDown()
+
+    def test_default_granularity_is_claim(self):
+        os.environ.pop(ENV_GRANULARITY, None)
+        self.assertEqual(GRANULARITY_CLAIM, DEFAULT_GRANULARITY)
+        self.assertEqual(GRANULARITY_CLAIM, configured_granularity())
+
+    def test_env_switches_granularity(self):
+        os.environ[ENV_GRANULARITY] = "memory"
+        self.assertEqual(GRANULARITY_MEMORY, configured_granularity())
+        os.environ[ENV_GRANULARITY] = "CLAIM"
+        self.assertEqual(GRANULARITY_CLAIM, configured_granularity())
+
+    def test_invalid_env_falls_back_silently(self):
+        os.environ[ENV_GRANULARITY] = "nonsense"
+        self.assertEqual(DEFAULT_GRANULARITY, configured_granularity())
+
+    def test_load_granular_index_returns_claim_index_by_default(self):
+        index = load_granular_index(self.ledger, self.embedder,
+                                    path=self.root / "claims.npz")
+        self.assertIsInstance(index, ClaimVectorIndex)
+        self.assertEqual("claim", index.granularity)
+
+    def test_load_granular_index_honours_memory_choice(self):
+        index = load_granular_index(self.ledger, self.embedder,
+                                    granularity="memory")
+        self.assertIsInstance(index, VectorIndex)
+        self.assertNotIsInstance(index, ClaimVectorIndex)
+
+    def test_claim_index_falls_back_to_memory_when_empty(self):
+        """账本没有 claim 时不能让"没有向量通道"成为结论——退回 memory 级。"""
+        empty = SQLiteLedger(self.root / "empty.sqlite")
+        self.addCleanup(empty.close)
+        _ingest(empty, "没有 claim 的记忆")
+        index = load_granular_index(empty, self.embedder)
+        self.assertIsInstance(index, VectorIndex)
+        self.assertNotIsInstance(index, ClaimVectorIndex)
+
+    def test_load_granular_index_returns_none_without_embedder(self):
+        self.assertIsNone(load_granular_index(self.ledger, None))
+
+    def test_build_false_never_encodes(self):
+        """build=False 是"只读盘"契约：请求路径靠它避免 56-86s 的构建。"""
+        self.embedder.encoded.clear()
+        path = self.root / "claims.npz"
+        self.assertIsNone(load_granular_index(self.ledger, self.embedder,
+                                              path=path, build=False))
+        self.assertEqual([], self.embedder.encoded,
+                         "build=False 不得触发任何 encode")
+        self.assertFalse(path.exists(), "build=False 不得落盘")
+
+    def test_build_false_loads_existing_file(self):
+        path = self.root / "claims.npz"
+        built = load_granular_index(self.ledger, self.embedder, path=path)
+        self.assertIsNotNone(built)
+        self.embedder.encoded.clear()
+        loaded = load_granular_index(self.ledger, self.embedder, path=path,
+                                     build=False)
+        self.assertIsNotNone(loaded)
+        self.assertEqual(built.claim_ids, loaded.claim_ids)
+        self.assertEqual([], self.embedder.encoded)
+
+    def test_default_paths_stay_inside_hub_home(self):
+        """默认路径必须落在 $HIPPOMIND_HOME 内（测试进程已把它指向临时目录）。
+
+        这条是回归测试：曾经有一个测试调用 load_granular_index() 时不传 path，
+        默认路径解析到**生产**账本的索引文件并被测试数据覆盖。断言"默认路径
+        不越出 hub_home"比"每个测试自觉传 path"更可靠。
+        """
+        home = Path(os.environ["HIPPOMIND_HOME"]).resolve()
+        self.assertTrue(str(default_index_path().resolve()).startswith(str(home)))
+        self.assertTrue(str(default_claim_index_path().resolve()).startswith(str(home)))
+        self.assertNotIn("Application Support", str(default_claim_index_path()))
+
+
+class ClaimSearchIntegrationTests(LedgerCase):
+    """ledger.search(vector_index=ClaimVectorIndex) 的融合契约。"""
+
+    def setUp(self):
+        super().setUp()
+        self.dense, self.dense_claims = _ingest_claims(
+            self.ledger, "纸本；SQLite；mac-mini；6000；schema v4", [
+                _claim("纸本", "用途", "纸质笔记本"),
+                _claim("SQLite", "用途", "本地账本存储"),
+                _claim("mac-mini", "角色", "常驻主机"),
+            ])
+        self.redis, self.redis_claims = _ingest_claims(self.ledger, "缓存端口", [
+            _claim("Redis", "端口", 6379)])
+        self.index = ClaimVectorIndex.build(self.ledger, self.embedder)
+
+    def test_claim_index_participates_in_candidate_generation(self):
+        hits = self.ledger.search("纸本 SQLite mac-mini", scope="shared", limit=5,
+                                  vector_index=self.index)
+        self.assertTrue(hits)
+        ranked = [hit for hit in hits if "vec_rank" in hit["score_parts"]]
+        self.assertTrue(ranked, "claim 索引必须能生成候选")
+
+    def test_score_parts_records_the_matched_claim(self):
+        hits = self.ledger.search("纸本 SQLite mac-mini", scope="shared", limit=5,
+                                  vector_index=self.index)
+        recorded = [hit for hit in hits if "vec_claim" in hit["score_parts"]]
+        self.assertTrue(recorded, "claim 级命中必须记下是哪条 claim")
+        known = set(self.dense_claims) | set(self.redis_claims)
+        for hit in recorded:
+            # 记下的必须是**该记忆自己的** claim，不能串到别的记忆上。
+            self.assertIn(hit["score_parts"]["vec_claim"], known)
+            owner = (self.dense if hit["memory_id"] == self.dense else self.redis)
+            owned = (self.dense_claims if owner == self.dense else self.redis_claims)
+            self.assertIn(hit["score_parts"]["vec_claim"], owned)
+
+    def test_claim_index_respects_scope_filter(self):
+        _ingest_claims(self.ledger, "私有纸本记忆", [_claim("纸本", "私有", 1)],
+                       scope="private")
+        index = ClaimVectorIndex.build(self.ledger, self.embedder)
+        hits = self.ledger.search("纸本", scope="shared", limit=10,
+                                  vector_index=index)
+        for hit in hits:
+            self.assertEqual("shared", hit["scope"], "claim 索引不得绕过 scope 过滤")
+
+    def test_claim_index_respects_evidence_gate(self):
+        stripped, _ = _ingest_claims(self.ledger, "无证据纸本记忆",
+                                     [_claim("纸本", "无证据", 1)])
+        with self.ledger._connect(write=True) as conn:
+            conn.execute("UPDATE memories SET evidence_json=? WHERE memory_id=?",
+                         ("[]", stripped))
+        index = ClaimVectorIndex.build(self.ledger, self.embedder)
+        hits = self.ledger.search("纸本", scope="shared", limit=10,
+                                  vector_index=index, require_evidence=True)
+        for hit in hits:
+            self.assertTrue(hit["evidence"], "claim 索引不得绕过证据门槛")
+
+    def test_memory_index_has_no_vec_claim_key(self):
+        """memory 级索引没有 claim 概念，不得凭空多出 vec_claim。"""
+        memory_index = VectorIndex.build(self.ledger, self.embedder)
+        hits = self.ledger.search("纸本 SQLite mac-mini", scope="shared", limit=5,
+                                  vector_index=memory_index)
+        for hit in hits:
+            self.assertNotIn("vec_claim", hit["score_parts"])
+
+    def test_default_search_still_has_no_vector_traces(self):
+        hits = self.ledger.search("纸本 SQLite mac-mini", scope="shared", limit=5)
+        for hit in hits:
+            self.assertNotIn("vec_rank", hit["score_parts"])
+            self.assertNotIn("vec_claim", hit["score_parts"])
+
+
+class SemanticGateTests(unittest.TestCase):
+    """`scripts/eval_semantic.py` 的**相对**门禁契约。
+
+    第一版门禁把 `keyword recall >= 0.95` 当硬阈值，结果被账本漂移判成失败
+    （HEAD 代码 + 关闭向量同样 FAIL，实测 0.935）。相对门禁的核心断言是：
+    **同一次运行、同一份账本**上，pipeline 模式不得低于 lexical 基线。
+    这些测试用构造出来的 report 验证门禁的判定逻辑本身，不碰账本。
+    """
+
+    @staticmethod
+    def _entry(recall: float) -> Dict[str, Any]:
+        return {"recall": recall, "mrr": 0.5, "p50_ms": 1.0, "p95_ms": 2.0,
+                "misses": []}
+
+    @classmethod
+    def _report(cls, keyword: Dict[str, float], semantic: Dict[str, float],
+                available: bool = True) -> Dict[str, Any]:
+        sets = {}
+        for name, modes in (("keyword", keyword), ("semantic", semantic)):
+            sets[name] = {mode: cls._entry(value) for mode, value in modes.items()}
+        return {"vector": {"available": available}, "sets": sets}
+
+    @classmethod
+    def _healthy(cls, **overrides) -> Dict[str, Any]:
+        keyword = {"lexical": 0.935, "claim": 0.935, "memory": 0.935,
+                   "fused": 0.935, "claim_raw": 0.826, "memory_raw": 0.674,
+                   "fused_raw": 0.783}
+        semantic = {"lexical": 0.067, "claim": 0.733, "memory": 0.533,
+                    "fused": 0.667, "claim_raw": 0.467, "memory_raw": 0.200,
+                    "fused_raw": 0.333}
+        keyword.update(overrides.get("keyword", {}))
+        semantic.update(overrides.get("semantic", {}))
+        return cls._report(keyword, semantic, overrides.get("available", True))
+
+    def test_healthy_report_passes(self):
+        result = eval_semantic.gate(self._healthy())
+        self.assertTrue(result["passed"], result["failures"])
+
+    def test_low_absolute_lexical_still_passes(self):
+        """账本漂移让 lexical 掉到 0.80：只要各模式不劣于它，门禁就该 PASS。
+
+        这是本次修正的核心：绝对数字度量的是"账本长什么样"，不是"代码有没有
+        退化"。把它当硬阈值会让门禁随账本漂移随机变红。
+        """
+        report = self._report(
+            {"lexical": 0.80, "claim": 0.80, "memory": 0.80, "fused": 0.80,
+             "claim_raw": 0.826, "memory_raw": 0.674, "fused_raw": 0.783},
+            {"lexical": 0.067, "claim": 0.733, "memory": 0.533, "fused": 0.667,
+             "claim_raw": 0.467, "memory_raw": 0.200, "fused_raw": 0.333})
+        self.assertTrue(eval_semantic.gate(report)["passed"])
+
+    def test_pipeline_below_lexical_fails(self):
+        result = eval_semantic.gate(self._healthy(keyword={"claim": 0.90}))
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("keyword/claim" in item for item in result["failures"]))
+
+    def test_small_noise_within_tolerance_passes(self):
+        result = eval_semantic.gate(self._healthy(keyword={"claim": 0.931}))
+        self.assertTrue(result["passed"], result["failures"])
+
+    def test_claim_raw_collapse_fails(self):
+        """claim 索引退化成 memory 级（0.826 -> 0.674）必须被抓住。"""
+        result = eval_semantic.gate(self._healthy(
+            keyword={"claim_raw": 0.674}, semantic={"claim_raw": 0.200}))
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("claim_raw" in item for item in result["failures"]))
+
+    def test_semantic_without_gain_fails(self):
+        """向量通道完全没起作用（gain == 0）必须失败，不能被 0.0 阈值放过。"""
+        result = eval_semantic.gate(self._healthy(
+            semantic={"claim": 0.067, "memory": 0.067, "fused": 0.067}))
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("无提升" in item for item in result["failures"]))
+
+    def test_vector_unavailable_fails(self):
+        result = eval_semantic.gate(self._report({}, {}, available=False))
+        self.assertFalse(result["passed"])
+
+    def test_gate_reports_baselines_for_audit(self):
+        result = eval_semantic.gate(self._healthy())
+        self.assertEqual(0.935, result["baselines"]["keyword"])
+        self.assertEqual(0.067, result["baselines"]["semantic"])
 
 
 if __name__ == "__main__":
