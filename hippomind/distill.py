@@ -315,6 +315,56 @@ class DistillEngine:
         self.ledger.set_cursor(CURSOR_PREFIX + candidate.memory_id, "1",
                                metadata={"claims": claims, "at": utc_now()})
 
+    def associate(self, *, limit: int = 24, per_memory: int = 3) -> Dict[str, int]:
+        """Link distilled memories that share a claim subject.
+
+        Distillation already links consecutive same-subject memories inside one
+        batch, but that map resets every run, so cross-batch associations were
+        never created: production had 1,847 claims and only 41 relations.  This
+        pass walks recent distilled memories and joins each to a few older
+        memories on the same subject, which is what makes the graph and the
+        associative retrieval channel useful.
+        """
+        limit = max(1, min(200, int(limit)))
+        per_memory = max(1, min(8, int(per_memory)))
+        created = 0
+        scanned = 0
+        with self.ledger._reading() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT m.memory_id FROM memories m "
+                "JOIN memory_claims c ON c.memory_id = m.memory_id "
+                "WHERE m.source_agent = 'hippomind-distill' AND m.lifecycle = 'active' "
+                "ORDER BY m.created_at DESC LIMIT ?", (limit,)).fetchall()
+        for row in rows:
+            memory_id = str(row["memory_id"])
+            scanned += 1
+            with self.ledger._reading() as conn:
+                subjects = [str(item["subject"]) for item in conn.execute(
+                    "SELECT DISTINCT subject FROM memory_claims "
+                    "WHERE memory_id=? AND state IN ('active','conflict') LIMIT 4",
+                    (memory_id,)).fetchall() if str(item["subject"] or "")]
+                if not subjects:
+                    continue
+                marks = ",".join("?" for _ in subjects)
+                related = conn.execute(
+                    "SELECT memory_id, MAX(confidence) score FROM memory_claims "
+                    "WHERE subject IN (" + marks + ") AND memory_id != ? "
+                    "AND state IN ('active','conflict') "
+                    "GROUP BY memory_id ORDER BY score DESC LIMIT ?",
+                    tuple(subjects) + (memory_id, per_memory)).fetchall()
+            parents = [{"memory_id": str(item["memory_id"]),
+                        "relation_type": "related_to",
+                        "confidence": round(float(item["score"] or 0.5), 3)}
+                       for item in related]
+            if not parents:
+                continue
+            try:
+                result = self.ledger.add_relations(memory_id, parents)
+            except (LedgerError, ValueError):
+                continue
+            created += int(result.get("created", 0) or 0)
+        return {"scanned": scanned, "created": created}
+
     def resolve_conflicts(self, *, limit: int = 200) -> int:
         if hasattr(self.ledger, "repair_claim_states"):
             self.ledger.repair_claim_states()
@@ -400,6 +450,10 @@ class DistillEngine:
                     summary["errors"] += 1
         if not dry_run:
             summary["conflicts_resolved"] = self.resolve_conflicts()
+            try:
+                summary["associated"] = self.associate()
+            except Exception:
+                summary["associated"] = {"scanned": 0, "created": 0}
             # resolve_claim can leave a losing memory with claims that are no
             # longer consistent with its lifecycle; converge once per cycle.
             if hasattr(self.ledger, "repair_claim_states"):

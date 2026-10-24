@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 from ._helpers import (
     LedgerError,
     _clamp_int,
+    _hash,
     _json,
     _mapping,
     _short,
@@ -49,6 +50,52 @@ class GraphMixin:
                 item.pop("value_json", None)
             result.append(item)
         return result
+
+    def add_relations(self, child_memory_id: str,
+                      parents: Sequence[Mapping[str, Any]]) -> Dict[str, int]:
+        """Insert causal/associative parent edges for an existing memory.
+
+        ``ingest`` can only attach relations at creation time, so a later
+        association pass had no way to link memories that were written
+        separately.  This keeps the same cycle guard and ``INSERT OR IGNORE``
+        idempotence, and never rewrites an existing edge.
+        """
+        child_memory_id = _short(child_memory_id, 80)
+        if not child_memory_id:
+            raise LedgerError("child_memory_id 不能为空")
+        prepared = []
+        for parent in parents:
+            parent_id = _short(parent.get("memory_id", ""), 80)
+            if not parent_id or parent_id == child_memory_id:
+                continue
+            prepared.append((parent_id,
+                             _short(parent.get("relation_type", "related_to"), 64) or "related_to",
+                             float(parent.get("confidence", 0.5) or 0.5)))
+        if not prepared:
+            return {"created": 0, "skipped": 0}
+        now = utc_now()
+
+        def write(conn: sqlite3.Connection) -> Dict[str, int]:
+            created = 0
+            skipped = 0
+            for parent_id, relation_type, confidence in prepared:
+                if conn.execute("SELECT 1 FROM memories WHERE memory_id=?", (parent_id,)).fetchone() is None:
+                    skipped += 1
+                    continue
+                if self._relation_would_cycle(conn, parent_id, child_memory_id):
+                    skipped += 1
+                    continue
+                relation_id = "rel_" + _hash(parent_id, child_memory_id, relation_type)[:32]
+                cursor = conn.execute("""
+                    INSERT OR IGNORE INTO memory_relations(
+                        relation_id,parent_memory_id,child_memory_id,relation_type,confidence,created_at
+                    ) VALUES(?,?,?,?,?,?)
+                """, (relation_id, parent_id, child_memory_id, relation_type,
+                      max(0.0, min(1.0, confidence)), now))
+                created += 1 if cursor.rowcount else 0
+            return {"created": created, "skipped": skipped}
+
+        return self._transaction(write)
 
     def causal_ancestors(self, memory_ids: Sequence[str], *, max_depth: int = 2,
                          limit: int = 32, scope: str = "", require_evidence: bool = False,
