@@ -11,6 +11,25 @@
 原有实验使用说明见 [USAGE_GUIDE.md](USAGE_GUIDE.md)；长期运行的 daemon、迁移、隐私和接入见 [MEMORY_HUB_GUIDE.md](MEMORY_HUB_GUIDE.md)。跨电脑安装、恢复和安全迁移见 [docs/PORTABILITY.md](docs/PORTABILITY.md)；发布前检查和 GitHub 发布清单见 [docs/RELEASE.md](docs/RELEASE.md)。
 第一次阅读建议从 [详细拆解指南](docs/DETAILED_GUIDE.md) 开始；它用流程图、生命周期图和 GUI 截图解释从安装到排错的完整路径。
 
+## 自动记忆环路（v2，2026-10-24）
+
+记忆系统现在**装完就忘**：不需要在提问里写任何标记。
+
+- **自动采集**：daemon 每 60 秒增量读取 Claude Code、Codex、Gemini/Antigravity、
+  Pi/PiDeck 的原生会话存储，DSH 由 Cordis 插件在会话结束写回；每来源独立游标，
+  单文件损坏不影响其它来源。
+- **自动提炼**：每 5 分钟取 16 条未提炼记忆（结构化 50% + 最新 raw 50%），用本机
+  `claude -p` 抽 claims，失败回退确定性抽取；连续 2 次失败熔断 10 分钟，成功后复位。
+- **相关性门控注入**：每轮普通用户文本开始前预取，`min_score=0.20` 且**必须**有
+  FTS 命中或 coverage ≥0.6；"今天天气怎么样"这类无关请求不注入。每次注入写
+  `injection.jsonl`（agent / query 哈希 / 条目数 / 字符数，不存原文）。
+- **冲突自动裁决**：`confidence × source_trust` 明显领先时直接裁决；模糊冲突按最新
+  `asserted_at` 胜出；两条 ≥0.9 的强断言仍留人工；裁决后自动 `repair_claim_states`。
+
+`记忆：<问题>` 仍然可用，作用变成**强制指定查询**。完整运维手册（验证命令、
+可调环境变量、故障恢复、未覆盖范围）见
+[docs/AUTOMATIC_MEMORY.md](docs/AUTOMATIC_MEMORY.md)。
+
 ## v1.0.0 全面重构（2026-10-19）
 
 一次针对**真实线上账本实测问题**的重构，全部改动带回归测试，完整审查与取舍见
@@ -95,10 +114,12 @@ python3 -m hippomind install-agents --agent all
 python3 -m hippomind install-agents --auto
 python3 -m hippomind discover-agents
 
-# 默认每轮自动预取（无标记）；也可在普通文本中写 记忆： 强制指定查询，例如：
+# 默认每轮自动预取（无标记），并且过相关性门控：没有真正相关的记忆就不注入。
+# 仍可在普通文本中写 记忆： 强制指定查询，例如：
 # “检查服务状态。记忆：检查 daemon API 的并发限制”。标记可在自然语言任意位置。
-# 没有相关记忆时不注入；引用、代码块、行内代码和空标记不会触发强制查询。
+# 引用、代码块、行内代码和空标记不会触发强制查询。
 # 首次安装或规则更新后，新建任务或重载对应 Agent；可用 agent-status 核验原生接入。
+# 自动采集/提炼节奏、可调变量与故障恢复见 docs/AUTOMATIC_MEMORY.md。
 # 需要检查结果时才手工运行：
 printf '%s\n' "检查服务状态。记忆：检查 daemon API 的并发限制" | \
   python3 -m hippomind auto-context --stdin --trigger-mode anywhere --cwd "$PWD" --format text
@@ -215,7 +236,7 @@ shared_ids = mind.publish_commons(source_agent="my-agent", source_session="task-
 ## 一键启动（macOS）
 
 在 Finder 中双击项目根目录的 `start-hippomind.command`，即可启动或复用本机 daemon 和 watcher。
-启动器还会幂等刷新所有已支持 Agent 的显式记忆接入。v2 默认每轮自动预取；没有相关结果不会注入，记忆：仍可强制指定查询。
+启动器还会幂等刷新所有已支持 Agent 的自动记忆接入。v2 默认每轮自动预取（无标记）并通过相关性门控：没有相关结果不会注入；`记忆：` 仍可强制指定查询。daemon 每 60 秒自动采集 Claude/Codex/Gemini/Pi 会话，每 5 分钟自动提炼 claims，细节见 [docs/AUTOMATIC_MEMORY.md](docs/AUTOMATIC_MEMORY.md)。
 添加 `--gui` 才按需打开全屏中文层状记忆网络。后台账本和旧实验 JSON 相互独立，找不到归档时服务仍可用并会报告单一来源错误。
 
 ## 快速开始

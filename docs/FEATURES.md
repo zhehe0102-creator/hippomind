@@ -56,7 +56,7 @@
 | 命令 | 干什么 |
 |---|---|
 | `context` | **核心命令**：按任务组装最小 Context Pack（分层预算、coverage 门控防误召回、缓存命中 ~0.02ms） |
-| `auto-context` | 同上但解析"记忆："触发标记，适合挂到 Agent 钩子 |
+| `auto-context` | 同上；v2 默认每轮自动预取（`--trigger-mode always`，无标记），"记忆："仍可强制指定查询；自动路径过 `min_score=0.20` + 词法证据门 |
 | `inject` | 开关下一轮自动注入（采集维护不受影响） |
 | `facts` | 结构化事实投影（活跃 claim 视图） |
 | `skills` | 程序性记忆投影（怎么做的步骤） |
@@ -165,7 +165,14 @@
 ## 7. daemon 内部机制
 
 - **自动采集**：watcher 每 30s 扫描归档根（支持多根轮换），新 Agent 出现
-  上报 `new_agents`，webhook 通知（尽力而为 3s）
+  上报 `new_agents`，webhook 通知（尽力而为 3s）；另有原生采集循环每 60s 增量读取
+  Claude/Codex/Gemini/Pi 会话，DSH 由插件会话结束写回
+- **自动提炼**：每 5 分钟取 16 条未提炼记忆（结构化 50% + 最新 raw 50%），本机
+  `claude -p` 抽 claims，失败回退确定性抽取；连续 2 次失败熔断 10 分钟
+- **相关性门控**：自动注入需 `min_score=0.20` 且有 FTS 命中或 coverage ≥0.6，
+  每次注入写 `injection.jsonl`（不含原文）
+- **冲突裁决**：明显领先直接裁决，模糊冲突 newest-wins，两条 ≥0.9 强断言留人工，
+  裁决后自动 `repair_claim_states`
 - **睡眠巩固**：空闲 >10min 自动深维护（consolidate+raw 归档+WAL 检查点），
   每空闲期只跑一次
 - **指标趋势**：后台周期采样进 /metrics 与 stats.trend
@@ -210,6 +217,12 @@ open -a Terminal python3 -m hippomind.main   # 打开可视化工作台
 ## 11. 已知边界（诚实清单）
 
 - 纯中文 FTS 依赖 trigram（旧 SQLite 优雅回退 LIKE）；跨词边界查询走 LIKE 门控
-- embedding 向量通道接口就绪但默认关闭（本机无模型运行时，见 ROADMAP P1）
-- raw 蒸馏管线待 LLM 运行时
+- embedding 向量通道接口就绪但默认关闭（本机无模型运行时，见 ROADMAP P1）；
+  检索主通道仍是词法，同义改写仍可能漏召回
+- 自动提炼已上线（本机 `claude -p` + 确定性回退），但吞吐 16 条/5 分钟，
+  25 万 raw 历史尚未回填完
+- Cursor 本机未安装、无持久会话库，暂无采集适配器（见 AGENT_CAPTURE_COVERAGE.md）
+- 注入效果闭环缺失：只有 `injection.jsonl` 的注入留痕，没有“注入后是否被用上”的评估
 - 投影 API 返回形态不完全统一（list vs dict，消费方已适配）
+
+完整的自动环路验证、可调变量与故障恢复见 [AUTOMATIC_MEMORY.md](AUTOMATIC_MEMORY.md)。

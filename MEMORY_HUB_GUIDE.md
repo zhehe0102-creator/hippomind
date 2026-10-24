@@ -79,11 +79,11 @@ python3 -m hippomind login-remove
 python3 -m hippomind install-agents --agent all
 ```
 
-macOS 下直接双击 `start-hippomind.command` 也会先启动或复用 daemon，再幂等刷新同一套接入。v2 默认每轮自动预取，无需标记；也可在普通用户文本中加入 `记忆：` 或 `记忆:` 强制指定查询，例如“继续验收。记忆：检查 daemon API 的并发限制”。
+macOS 下直接双击 `start-hippomind.command` 也会先启动或复用 daemon，再幂等刷新同一套接入。v2 默认每轮自动预取，无需标记；也可在普通用户文本中加入 `记忆：` 或 `记忆:` 强制指定查询，例如“继续验收。记忆：检查 daemon API 的并发限制”。自动采集、提炼节奏、相关性门控与故障恢复见 [自动记忆环路](docs/AUTOMATIC_MEMORY.md)。
 
 安装器会为 Codex 注册并验证 UserPromptSubmit 原生 Hook，为 DeepSeek Harness（DSH）部署 Cordis 原生插件（见下节），并把 MCP server 注册到 Pi 的 `~/.pi/agent/mcp.json`、Claude、Cursor、Gemini 的实际用户配置；同时在 Pi、Claude、Cursor、Gemini、DeepSeek 与 local Agent 的规则位置插入并维护带标记的 HippoMind 区块，保留其他用户规则。`~/.agents/mcp.json` 还提供受管的通用 MCP 入口，遵循该标准的新 Agent 可在安装后直接发现 Hub。重复运行幂等。v2 默认每轮自动预取（规则/Hook 传入 `--trigger-mode always`）；`记忆：` 作为强制查询入口保留。没有相关结果时不注入；引用行、代码块、行内代码与空标记不会触发强制查询。
 
-首次安装或规则升级后，需要重载相应 Agent 的规则或新建任务；后台服务不能追溯改写一个已经开启的模型上下文。对于完全未知、未配置的 Agent 客户端，本机服务只生成适配报告，绝不强行注入。自定义 Agent 可使用 [AGENTS.md.template](integrations/AGENTS.md.template)、[pi-memory-hook.md](integrations/pi-memory-hook.md) 或 [AGENT_MEMORY_PROTOCOL.md](integrations/AGENT_MEMORY_PROTOCOL.md)。
+首次安装或规则升级后，需要重载相应 Agent 的规则或新建任务；后台服务不能追溯改写一个已经开启的模型上下文。对于完全未知、未配置的 Agent 客户端，本机服务只生成适配报告，绝不强行注入。安装器写入的 Codex Hook 与 DSH 插件补丁都带 `--trigger-mode always` / `triggerMode: always`，因此日常路径不读 `HIPPOMIND_AUTO_INJECT`；该变量只在 Hook 未显式传参时生效。自定义 Agent 可使用 [AGENTS.md.template](integrations/AGENTS.md.template)、[pi-memory-hook.md](integrations/pi-memory-hook.md) 或 [AGENT_MEMORY_PROTOCOL.md](integrations/AGENT_MEMORY_PROTOCOL.md)。
 
 当前发布契约：自动、MCP 与 DSH 注入均最多 8 项、默认 6000 token，另有 16000 字符运输上限；raw chat 仍默认不注入。旧版段落中的 5000 字符仅作历史说明。
 
@@ -107,13 +107,42 @@ printf '%s\n' "继续验收。记忆：检查 SQLite WAL 的并发事务" | pyth
 - **MCP Resource 选择器**：支持 Resources 的宿主可挂载 `hippomind://projects/{name}/active-context`，适合先浏览项目当前状态、再决定是否带入对话。
 - **诊断与开关**：`hippomind context <query> --debug` 显示命中、过滤与证据；`hippomind inject off --agent <agent>` 立即禁止下一轮注入。
 
-`记忆：`比仅凭自动猜测更可靠：它把调用权留给用户，又保留在一句自然语言请求中完成检索的便利。
+`记忆：`比仅凭自动猜测更可靠：它把调用权留给用户，又保留在一句自然语言请求中完成检索的便利。v2 的自动路径还有一道相关性门控：候选必须过 `min_score=0.20`（`HIPPOMIND_MIN_SCORE`）且真有 FTS 命中或 coverage ≥0.6，因此“今天天气怎么样”这类无关请求不会注入；每次实际注入都会写一行 `injection.jsonl` 留痕。
 
 输出只有任务、目标、当前进度、关键决定、相关文件、阻塞、下一步、少量用户偏好和证据。没有可靠命中时返回空项目和“未找到有证据且相关的记忆”，不会用低相关旧聊天填满预算。解释选择与过滤原因：
 
 ```bash
 python3 -m hippomind context "Memory Hub" --debug
 ```
+
+## 自动记忆环路（采集 → 提炼 → 注入）
+
+v2 起，daemon 自己完成三件事，用户不需要写标记：
+
+| 环节 | 节奏 | 做什么 | 健康字段 |
+| --- | --- | --- | --- |
+| 自动采集 | 每 60 秒 | 增量读取 Claude Code / Codex 的 JSONL、Gemini/Antigravity 的 `conversation_summaries.db`、Pi/PiDeck 会话；DSH 由插件在会话结束写回 | `/stats` 与 `/api/v1/health` 的 `capture` |
+| 自动提炼 | 每 5 分钟 | 取 16 条未提炼记忆（结构化 50% + 最新 raw 50%），用本机 `claude -p` 抽 claims；失败回退确定性抽取，连续 2 次失败熔断 10 分钟 | `distill` |
+| 自动注入 | 每轮请求前 | 过 `min_score=0.20` 且必须有 FTS 命中或 coverage ≥0.6，最多 8 项 / 6000 token / 16000 字符；每次写 `injection.jsonl` | `injection` |
+
+验证与调参（完整版见 [自动记忆环路](docs/AUTOMATIC_MEMORY.md)）：
+
+```bash
+python3 -m hippomind doctor                 # 就绪自检，FAIL 时 exit 1
+python3 -m hippomind agent-status --agent all   # 接入与原生 Hook/插件真实运行态
+python3 -m hippomind sync-transcripts       # 手工补采一次
+python3 -m hippomind distill --limit 16     # 手工提炼一轮
+tail -n 5 "$HOME/Library/Application Support/HippoMind/injection.jsonl"
+python3 scripts/eval_memory.py              # 46 条标注查询的检索门禁
+```
+
+可调环境变量：`HIPPOMIND_MIN_SCORE`（默认 0.20）、`HIPPOMIND_DISTILL_PROVIDER`（`auto`/`heuristic`）、
+`HIPPOMIND_INJECTION_TRACE`（默认 1）、`HIPPOMIND_AUTO_INJECT`（仅在 Hook 未显式传参时生效）、
+`HIPPOMIND_TRANSCRIPT_ROOTS`、`HIPPOMIND_PI_SESSION_ROOTS`。改完需要重启 daemon。
+
+冲突策略：`confidence × source_trust` 明显领先时直接裁决；模糊冲突按最新 `asserted_at` 胜出；
+两条 ≥0.9 的强断言仍留人工；每次裁决后自动 `repair_claim_states`，可用 `hippomind conflicts` /
+`hippomind resolve --claim <id> --winner <memory_id>` 复核与翻案。
 
 ## 写入结构化事实
 
