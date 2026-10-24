@@ -13,7 +13,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Mapping
+from typing import Any, Dict, List, Mapping, Sequence
 
 
 def trace_path() -> Path:
@@ -28,7 +28,8 @@ def _hash(text: str) -> str:
 
 def record(*, agent: str, query: str, context: str = "",
            item_count: int = 0, injected: bool = True,
-           source: str = "auto") -> Dict[str, Any]:
+           source: str = "auto",
+           memory_ids: Sequence[str] = ()) -> Dict[str, Any]:
     entry = {
         "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "agent": str(agent or "")[:64],
@@ -38,6 +39,10 @@ def record(*, agent: str, query: str, context: str = "",
         "items": int(item_count),
         "chars": len(str(context or "")),
         "injected": bool(injected),
+        # Which memories were offered, so a later pass can check whether the
+        # agent's next message actually reused any of them.  Bounded and never
+        # the memory text itself.
+        "memory_ids": [str(item)[:80] for item in list(memory_ids)[:8]],
     }
     path = trace_path()
     try:

@@ -94,8 +94,14 @@ def build_hook_response(payload: Mapping[str, Any], *, agent_config: str,
             trigger_mode == "always" or os.environ.get("HIPPOMIND_AUTO_INJECT") == "always"):
         try:
             from .injection_trace import record
+            memory_ids = []
+            for item in pack.get("items", []) or []:
+                for evidence in (item.get("evidence") or [])[:2]:
+                    if isinstance(evidence, dict) and evidence.get("memory_id"):
+                        memory_ids.append(str(evidence["memory_id"]))
             record(agent="codex", query=request, context=context,
-                   item_count=len(pack.get("items", [])), source="codex-hook")
+                   item_count=len(pack.get("items", [])), source="codex-hook",
+                   memory_ids=memory_ids[:8])
         except Exception:
             pass
     return {
