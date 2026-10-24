@@ -111,3 +111,66 @@ python3 -m hippomind.cli agent-status
 curl -s -H "X-HippoMind-Token: $(cat ~/Library/Application\ Support/HippoMind/hippomindd.token)" \
   http://127.0.0.1:8765/api/v1/health | python3 -m json.tool
 ```
+
+---
+
+# Round 6 — 注入质量、会话摘要与联想边
+
+日期：2026-10-24
+
+## 1. 注入质量首次被真实测量
+
+之前只测 ledger.search（候选排序），没测模型实际收到的 Context Pack。
+新增 python3 scripts/eval_memory.py --mode pack 后发现两个真问题：
+
+| 问题 | 现象 | 修复 |
+| --- | --- | --- |
+| 任务锚点过激 | coverage >= 0.60 就把整包收窄到单一任务，"HippoMind GUI 主题 纸本" 丢掉含答案的记忆 | 阈值提到 0.90；真正的任务标题（coverage 1.0）仍锚定 |
+| 构建过慢 | 每条候选重复分词 + 每行重复分词，单查询 4.5s、p95 1.2s，超过 DSH 700ms 超时 | token 集合缓存 + 候选只分词一次 + 门控开启时取数深度收到 384 |
+
+结果（46 查询）：pack recall@8 0.587 -> 0.957，MRR 0.587 -> 0.957，
+p50 ~120ms、p95 ~250ms；search 模式不变（recall 1.000、p95 45ms）。
+daemon 启动时预热 SQLite 与 builder，首个真实请求从 650ms 降到 ~500ms，
+重复请求 2-3ms。
+
+## 2. 会话摘要：25 万 raw 的吞吐路径
+
+hippomind/session_digest.py 按会话聚合 raw 消息，生成一段提取式摘要
+（开场请求 + 决策密集行 + 收尾），一次模型调用消化整段会话，
+digest:<session> 游标保证幂等。
+
+- 质量门：剥离宿主注入的标签与逐轮句子；纯 harness 流量、自我指涉的提炼器
+  会话、被注入记忆上下文主导的会话直接跳过。
+- hippomind digest --drain 循环清空积压；--min-messages 控制最短会话。
+- 生产实测：983/983 会话全部处理（945 条保留，218 条自我指涉与
+  134 条纯上下文被清洗），单批 50 会话约 0.7s（确定性抽取）。
+- 摘要 importance=7，确保交接摘要排在其来源 raw 消息之前。
+
+## 3. 联想边
+
+提炼只在单批次内连接同 subject 的记忆（映射每轮重置），生产库曾有
+1,847 claims 但只有 41 条关系。新增 associate() 遍历近期提炼记忆，
+按共享 claim subject 连接最多 3 条更早记忆（无向 related_to，幂等）；
+ledger 新增 add_relations() 复用同样的环检测与 INSERT OR IGNORE。
+
+生产：关系数 41 -> 151。3 个测试覆盖连接、幂等、无关 subject 不连。
+
+## 4. 当前分数（更新）
+
+| 维度 | 权重 | 上轮 | 本轮 | 说明 |
+| --- | --- | --- | --- | --- |
+| 采集覆盖 | 15% | 85 | 85 | 5 类自动；Cursor 未安装 |
+| 自动提炼 | 25% | 70 | 80 | 会话摘要清空 983 会话积压；claims 1,800+ |
+| 检索质量 | 20% | 80 | 82 | search recall 1.0 / MRR 0.87 |
+| 注入质量 | 15% | 80 | 90 | pack recall 0.587->0.957，有独立门禁 |
+| 可靠性 | 10% | 85 | 88 | 熔断器、claim 修复、启动预热、health 检查 |
+| 使用成本 | 15% | 85 | 85 | 登录自启 + 零标记 |
+
+加权约 84 分。仍差：真实语义 embedding、Cursor、注入效果闭环。
+
+## 5. 复现
+
+    python3 scripts/eval_memory.py                 # search 模式门禁
+    python3 scripts/eval_memory.py --mode pack     # 注入内容门禁
+    python3 -m hippomind.cli digest --drain --provider heuristic
+    python3 -m unittest discover -s tests -p 'test_*.py'
