@@ -221,7 +221,10 @@ class DistillEngine:
     @staticmethod
     def _heuristic(candidate: Candidate) -> List[Dict[str, Any]]:
         claims: List[Dict[str, Any]] = []
-        subject = candidate.project or candidate.task_id or "general"
+        # Prefer the concrete task id; a shared project name or a synthetic
+        # "outside-of-project" bucket would make unrelated sessions collide in
+        # the same slot and manufacture conflicts.
+        subject = candidate.task_id or candidate.project or candidate.memory_id
         metadata = candidate.metadata if isinstance(candidate.metadata, Mapping) else {}
         context = metadata.get("context") if isinstance(metadata.get("context"), Mapping) else {}
         for field in ("goal", "progress", "key_decisions", "next_steps", "blockers", "preferences"):
@@ -233,8 +236,11 @@ class DistillEngine:
             for value in values[:3]:
                 text = _clean(value, 500)
                 if text:
+                    # Slot keys are memory-scoped: deterministic extraction has
+                    # no stable global slot, so two different sessions must not
+                    # be treated as contradicting each other.
                     claims.append({"subject": subject, "predicate": field,
-                                   "slot_key": candidate.task_id or candidate.memory_id,
+                                   "slot_key": candidate.memory_id + ":" + field,
                                    "value": text, "confidence": DEFAULT_CONFIDENCE,
                                    "source": 0})
         if claims:
@@ -245,7 +251,8 @@ class DistillEngine:
             if len(text) < 8 or not any(marker in text for marker in DECISION_MARKERS):
                 continue
             claims.append({"subject": subject, "predicate": "statement",
-                           "slot_key": "s_" + hashlib.sha1(text.encode("utf-8")).hexdigest()[:12],
+                           "slot_key": candidate.memory_id + ":s_"
+                                       + hashlib.sha1(text.encode("utf-8")).hexdigest()[:12],
                            "value": text, "confidence": 0.5, "source": 0})
             if len(claims) >= 3:
                 break
@@ -328,22 +335,17 @@ class DistillEngine:
             second = ranked[1]
             top_score = float(top.get("confidence", 0) or 0) * float(top.get("source_trust", 0.5) or 0.5)
             second_score = float(second.get("confidence", 0) or 0) * float(second.get("source_trust", 0.5) or 0.5)
-            predicate = str(top.get("predicate", "")).lower()
-            slot = str(top.get("slot_key", "")).lower()
-            status_like = any(token in predicate + " " + slot for token in
-                              ("status", "progress", "stage", "当前", "进度", "阶段"))
             if top_score < second_score + 0.10 and float(top.get("confidence", 0) or 0) < 0.90:
-                # Status-like facts are explicitly temporal: the newest
-                # observation wins when confidence is close.  Other claims
-                # stay in the conflict queue for human review.
-                if not status_like:
+                # Confidence cannot decide.  Two equally strong (>=0.9)
+                # contradictory claims are a genuine disagreement that needs a
+                # human; anything weaker is treated as an evolving fact, where
+                # the newest assertion wins.  The loser stays as superseded with
+                # superseded_by pointing at the winner, so the decision remains
+                # auditable and reversible.
+                strong = [item for item in group if float(item.get("confidence", 0) or 0) >= 0.90]
+                if len({str(item.get("value_hash", item.get("value_json", ""))) for item in strong}) > 1:
                     continue
-                newest = max(group, key=lambda item: str(item.get("asserted_at", "")))
-                if newest is top:
-                    pass
-                else:
-                    top = newest
-                    top_score = float(top.get("confidence", 0) or 0) * float(top.get("source_trust", 0.5) or 0.5)
+                top = max(group, key=lambda item: str(item.get("asserted_at", "")))
             try:
                 self.ledger.resolve_claim(str(top.get("claim_id", "")),
                                           str(top.get("memory_id", "")),
@@ -397,6 +399,10 @@ class DistillEngine:
                     summary["errors"] += 1
         if not dry_run:
             summary["conflicts_resolved"] = self.resolve_conflicts()
+            # resolve_claim can leave a losing memory with claims that are no
+            # longer consistent with its lifecycle; converge once per cycle.
+            if hasattr(self.ledger, "repair_claim_states"):
+                self.ledger.repair_claim_states()
         summary["elapsed_ms"] = round((time.time() - started) * 1000.0, 1)
         return summary
 
