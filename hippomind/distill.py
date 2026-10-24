@@ -171,22 +171,38 @@ class DistillEngine:
 
     def _candidates(self, limit: int) -> List[Candidate]:
         limit = max(1, min(200, int(limit)))
-        with self.ledger._reading() as conn:
-            rows = conn.execute(
-                "SELECT m.memory_id,m.kind,m.content,m.source_agent,m.project,m.task_id,"
+        # Keep both queues moving: half the batch from structured projections
+        # (task/progress/decision), half from newest raw chat.  A pure
+        # created_at sort would let 250k raw rows starve structured memory; a
+        # pure structured-first sort would delay new sessions for days.
+        structured_limit = max(1, limit // 2)
+        raw_limit = max(1, limit - structured_limit)
+        base = ("SELECT m.memory_id,m.kind,m.content,m.source_agent,m.project,m.task_id,"
                 "m.session_id,m.created_at,m.metadata_json FROM memories m "
                 "LEFT JOIN source_cursors c ON c.source_id='distill:' || m.memory_id "
                 "WHERE c.source_id IS NULL AND m.quality_state='accepted' "
                 "AND m.lifecycle='active' AND m.source_agent!='hippomind-distill' "
                 "AND m.kind IN ('task','progress','decision','semantic','fact',"
-                "'preference','procedural','raw_chat') "
-                "ORDER BY CASE WHEN m.raw_chat=1 THEN 1 ELSE 0 END, m.created_at DESC "
-                "LIMIT ?", (limit,)).fetchall()
-        return [Candidate(str(row["memory_id"]), str(row["kind"]), str(row["content"] or ""),
-                          str(row["source_agent"] or ""), str(row["project"] or ""),
-                          str(row["task_id"] or ""), str(row["session_id"] or ""),
-                          str(row["created_at"] or ""),
-                          _json_value(row["metadata_json"], {})) for row in rows]
+                "'preference','procedural','raw_chat') ")
+        with self.ledger._reading() as conn:
+            structured = conn.execute(base + "AND m.raw_chat=0 ORDER BY m.created_at DESC LIMIT ?",
+                                      (structured_limit,)).fetchall()
+            raw = conn.execute(base + "AND m.raw_chat=1 ORDER BY m.created_at DESC LIMIT ?",
+                               (raw_limit,)).fetchall()
+        rows = list(structured) + list(raw)
+        seen = set()
+        output: List[Candidate] = []
+        for row in rows:
+            memory_id = str(row["memory_id"])
+            if memory_id in seen:
+                continue
+            seen.add(memory_id)
+            output.append(Candidate(memory_id, str(row["kind"]), str(row["content"] or ""),
+                                    str(row["source_agent"] or ""), str(row["project"] or ""),
+                                    str(row["task_id"] or ""), str(row["session_id"] or ""),
+                                    str(row["created_at"] or ""),
+                                    _json_value(row["metadata_json"], {})))
+        return output
 
     @staticmethod
     def _heuristic(candidate: Candidate) -> List[Dict[str, Any]]:
@@ -245,13 +261,19 @@ class DistillEngine:
             if previous is None or float(item.get("confidence", 0)) > float(previous.get("confidence", 0)):
                 deduped[key] = item
         claims = list(deduped.values())
-        values = [str(item.get("value", "")) for item in claims]
+        values = ["%s %s=%s" % (item.get("subject", ""), item.get("predicate", ""),
+                                item.get("value", "")) for item in claims]
+        source_text = _clean(candidate.content, 700)
         summary = "；".join(value for value in values if value)[:1_200]
+        content = ("提炼（%s）：%s" % (candidate.kind, source_text)) + chr(10) + summary
         record = {
-            "content": "提炼：" + summary,
+            "content": content[:2_000],
             "kind": "semantic",
             "source_agent": "hippomind-distill",
             "scope": "shared",
+            "task_id": candidate.task_id,
+            "project": candidate.project,
+            "session_id": candidate.session_id,
             "evidence": ["memory:" + candidate.memory_id],
             "timestamp": utc_now(),
             "confidence": round(sum(float(item.get("confidence", 0.55)) for item in claims) / max(1, len(claims)), 3),

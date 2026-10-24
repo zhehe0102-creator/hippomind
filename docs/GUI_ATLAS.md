@@ -662,6 +662,13 @@ error, info, menu。
 - 新增 `hippomind/transcripts.py`：增量读取 Claude Code（`~/.claude/projects/**/*.jsonl`）
   与 Codex（`~/.codex/sessions/**/*.jsonl`）原生会话；只取 user/assistant 文本，
   忽略 system/developer/tool/attachment；游标存于 `source_cursors`，断线可补采。
+- 新增 `hippomind/gemini_capture.py`：读取 Antigravity / antigravity-cli 的
+  `conversation_summaries.db`（title/preview/project/agent）。
+- 新增 `hippomind/pi_capture.py`：增量读取 `~/.pi/agent/sessions/**/*.jsonl`，
+  采集 user/assistant text 与 compaction 摘要；真实库 136 文件 / 342MB，实测
+  3 轮 117 messages / 115 inserted / 0 errors。
+- Cursor 本机未安装、无持久会话存储，见 `docs/AGENT_CAPTURE_COVERAGE.md`；
+  不发布猜测式 adapter。
 - daemon 启动 `start_capture_loop`（60s 周期），每轮最多 100 条消息；
   `/stats.health.capture` 暴露 files/messages/inserted/errors。
 - 现有 Agent-Chat-Archive watcher 与 DSH 原生插件继续保留；Claude/Codex 的空白由此补齐。
@@ -671,6 +678,8 @@ error, info, menu。
 - 新增 `hippomind/distill.py`：每 5 分钟取最多 16 条未提炼记忆，调用本机
   `claude -p` 做 JSON claims 抽取（subject/predicate/slot_key/value/confidence/
   source），失败回退到确定性抽取；每条提炼记录必须带 `memory:<source_id>` 证据。
+- 候选采用双队列（结构化 50% + 最新 raw 50%），避免 25 万 raw 饿死结构化记忆，
+  也避免旧结构化积压让新会话迟迟不被提炼。
 - 提炼结果写入现有 `memories` + `memory_claims`（无 schema 迁移），
   以 `distill:<memory_id>` 游标保证幂等。
 - 同一 subject 的连续提炼通过 `causal_parents(related_to)` 连接，图谱开始出现边；
@@ -684,6 +693,10 @@ error, info, menu。
 - Codex 托管 Hook 命令增加 `--trigger-mode always`；DSH 插件 patch 写入
   `triggerMode: always`；各 MCP Agent 规则改为默认每轮 `auto-context
   --trigger-mode always`。`记忆：` 保留为强制查询入口。
+- `ContextPackOptions.min_score` 提供相关性门控；自动路径默认 0.20，
+  DSH 请求体也带 0.20；显式 API/MCP 调用保持 0。
+- `hippomind/injection_trace.py` 记录每次注入的 agent、query hash、items、
+  chars、injected，不保存 query/记忆正文；GUI 体检页显示最近注入。
 - 注入仍受 Context Pack 预算/证据/不可信包裹约束；空结果不注入。
 - `hippomind/health` 新增 `capture` / `distill` 检查项，GUI 体检页可见。
 
@@ -697,7 +710,7 @@ error, info, menu。
 
 ### 11.5 实测（2026-10-23）
 
-- 全量单测 **654 项 OK**；lint gate 90/90。
+- 全量单测 **689 项 OK**；lint gate 90/90。
 - 生产 daemon 重启后自动采集：JSONL 首轮 100 条消息（已有内容多为 duplicate，
   说明 watcher 已覆盖大部分）；自动提炼首轮 **16 候选 → 15 条提炼 → 28 claims**。
 - 截至 2026-10-23 晚：生产库 **260,401 条记忆**（其中 raw 254,479）、
@@ -708,17 +721,19 @@ error, info, menu。
 - 新增 `hippomind/gemini_capture.py`：增量读取 Antigravity /
   antigravity-cli 的 `conversation_summaries.db`，把 title/preview/project/agent
   作为 `task` 记忆写入共享账本；daemon 采集循环已接入。
-- 新增 `scripts/eval_memory.py`：10 条真实查询的检索冒烟基准，输出
-  term_recall / MRR / duplicate_rate / p50 / p95；当前基线
-  **term_recall 0.700、MRR 0.900、duplicate 0.025、p50 15.5ms、p95 34.2ms**。
-  它是回归门，不是 95 分证明。
+- 新增 `scripts/eval_memory.py`：46 条标注查询（5 类）的检索回归门，
+  输出 recall@k / MRR / duplicate_rate / p50 / p95；当前基线
+  **recall@8 1.000、MRR 0.913、duplicate 0.0163、p50 7.1ms、p95 15.9ms，
+  gate PASS**（阈值 min_recall 0.90 / min_mrr 0.75 / max_dup 0.10 /
+  max_p95 250ms / min_queries 30）。详见 `docs/EVAL.md`。
+  它仍是关键词导向的回归门，不是完整 95 分证明。
 
 ### 11.6 仍未达到 95 的部分（如实）
 
 1. 真语义 embedding 尚未接入：当前仍是 FTS/LIKE + 字符 n-gram；要上 95 需要
    bge/mxbai/nomic 等本地 embedding + reranker。
-2. 采集覆盖仍以 Claude/Codex/DSH 为主；Gemini/Cursor/Pi 依赖 MCP/规则，需补原生
-   transcript adapter。
+2. 采集已覆盖 Claude/Codex/DSH/Gemini/Pi；Cursor 本机未安装且无持久存储，
+   需真实安装后再补 adapter（见 `docs/AGENT_CAPTURE_COVERAGE.md`）。
 3. 提炼吞吐约 16 条/5 分钟；242k raw 历史全量回填需要更长的批处理/会话级摘要。
 4. 自动注入尚未做 relevance gate 的分数阈值；可能出现无关上下文，需要
    injection trace + 阈值调优。

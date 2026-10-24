@@ -206,7 +206,8 @@ class PiCaptureTests(unittest.TestCase):
     def test_resync_flag_survives_a_multi_cycle_oversized_skip(self):
         self._write_session()
         self.scanner.sync(max_messages=20)
-        compact = lambda payload: json.dumps(payload, separators=(",", ":")) + "\n"
+        def compact(payload):
+            return json.dumps(payload, separators=(",", ":")) + "\n"
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(compact({"type": "custom", "customType": "huge",
                                   "data": "y" * 500}))
@@ -214,7 +215,8 @@ class PiCaptureTests(unittest.TestCase):
                                   "message": {"role": "user",
                                               "content": [{"type": "text", "text": "ok"}]}}))
         # Force several cycles of skip-then-resync on the oversized record.
-        with mock.patch.object(pi_capture, "MAX_LINE_BYTES", 100),                 mock.patch.object(pi_capture, "MAX_SKIP_BYTES", 100):
+        with mock.patch.object(pi_capture, "MAX_LINE_BYTES", 100), \
+                mock.patch.object(pi_capture, "MAX_SKIP_BYTES", 100):
             for _ in range(12):
                 self.scanner.sync(max_messages=20)
                 if "ok" in {row["content"] for row in self._memories()}:
