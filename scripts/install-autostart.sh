@@ -49,7 +49,10 @@ cat > "$PLIST" <<PLIST_EOF
     <key>PATH</key><string>/Users/zps/.local/bin:/Users/zps/.local/share/pi-node/node-v22.23.2-darwin-arm64/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
   </dict>
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><false/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key><false/>
+  </dict>
   <key>ProcessType</key><string>Background</string>
   <key>StandardOutPath</key><string>$SUPPORT/hippomindd.log</string>
   <key>StandardErrorPath</key><string>$SUPPORT/hippomindd.log</string>

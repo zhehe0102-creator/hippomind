@@ -452,7 +452,28 @@ class LifecycleMixin:
                 "UPDATE memory_claims SET state='conflict' WHERE state='active' "
                 "AND memory_id IN (SELECT memory_id FROM memories WHERE quality_state='conflict')"
             ).rowcount
-            return {"superseded": int(superseded or 0), "conflict": int(conflicted or 0)}
+            # A conflict is only meaningful while a competing claim exists.  When
+            # the other side was superseded by a later ruling the surviving claim
+            # stayed in 'conflict' forever, which is how 73 claims sat in the
+            # review queue with no counterpart.  Reactivate the last one standing
+            # if its memory is still accepted+active.
+            orphaned = conn.execute("""
+                UPDATE memory_claims SET state='active'
+                WHERE state='conflict'
+                  AND memory_id IN (SELECT memory_id FROM memories
+                                    WHERE " + fts_indexed_predicate() + ")
+                  AND NOT EXISTS (
+                      SELECT 1 FROM memory_claims other
+                      WHERE other.scope = memory_claims.scope
+                        AND other.subject = memory_claims.subject
+                        AND other.predicate = memory_claims.predicate
+                        AND other.slot_key = memory_claims.slot_key
+                        AND other.claim_id != memory_claims.claim_id
+                        AND other.state IN ('active','conflict')
+                  )
+            """).rowcount
+            return {"superseded": int(superseded or 0), "conflict": int(conflicted or 0),
+                    "reactivated": int(orphaned or 0)}
 
         return self._transaction(write)
 
