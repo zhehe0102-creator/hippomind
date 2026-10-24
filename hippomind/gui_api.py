@@ -753,6 +753,16 @@ class GuiApi:
         subject = _text_param(params, "subject", "", 256)
         limit = _clamp_int(params, "limit", 200, 1, 500)
         items = self.ledger.list_facts(scope=scope, subject=subject, limit=limit)
+        # The daemon has a 512 KiB response budget.  Long values used to push
+        # a 500-row page over it and the whole view failed with 413; trim the
+        # values here so a bounded page always fits.
+        for item in items:
+            value = item.get("value")
+            if isinstance(value, str) and len(value) > 240:
+                item["value"] = value[:240] + "…"
+            content = item.get("content")
+            if isinstance(content, str) and len(content) > 400:
+                item["content"] = content[:400] + "…"
         return {"scope": scope, "items": items}
 
     def skills(self, params: Mapping[str, List[str]]) -> Dict[str, Any]:
