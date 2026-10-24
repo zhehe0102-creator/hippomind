@@ -320,6 +320,26 @@ def _source_time(item: Mapping[str, Any]) -> str:
     return str(item.get("created_at") or item.get("occurred_at") or item.get("updated_at") or "")
 
 
+def _passes_relevance_gate(candidate: Mapping[str, Any], min_score: float) -> bool:
+    """Reject candidates that only look good because they are recent.
+
+    The blended score includes time/touch terms, so an unrelated question can
+    surface a recent memory with score ~0.37 and zero lexical overlap.  For
+    automatic injection we additionally require some lexical evidence: either
+    a real FTS hit, or strong query coverage.  Explicit API/MCP callers keep
+    min_score=0 and are unaffected.
+    """
+    if float(candidate.get("score", 0.0)) < min_score:
+        return False
+    parts = candidate.get("score_parts") or {}
+    try:
+        fts = float(parts.get("fts", 0.0) or 0.0)
+        coverage = float(parts.get("coverage", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return True
+    return fts > 0.0 or coverage >= 0.6
+
+
 def _record_rank(item: Mapping[str, Any]) -> Tuple[str, float, str]:
     return (_source_time(item), float(item.get("score", 0.0)), str(item.get("memory_id", "")))
 
@@ -1053,7 +1073,7 @@ class ContextPackBuilder:
             candidates = self._associative_candidates(candidates, options)
         if options.min_score > 0 and candidates:
             candidates = [candidate for candidate in candidates
-                          if float(candidate.get("score", 0.0)) >= options.min_score]
+                          if _passes_relevance_gate(candidate, options.min_score)]
         candidate_debug = [{
             "memory_id": str(candidate.get("memory_id", "")),
             "kind": str(candidate.get("kind", "")),
