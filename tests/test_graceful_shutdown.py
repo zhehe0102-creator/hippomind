@@ -8,6 +8,15 @@ import subprocess
 import sys
 import tempfile
 import time
+import os as _os
+import tempfile as _tempfile
+
+# 隔离 HIPPOMIND_HOME：daemon 启动时会对检测到的 agent 执行 auto_install，
+# 不隔离就会把测试用的临时 ledger 路径写进用户真实的 ~/.claude/CLAUDE.md、
+# ~/.gemini/settings.json 等文件里（本机实测污染过 6 个测试）。
+_HIPPO_HOME = _tempfile.mkdtemp(prefix="hippomind-test-home-")
+_os.environ["HIPPOMIND_HOME"] = _HIPPO_HOME
+
 import unittest
 import urllib.request
 from pathlib import Path

@@ -352,7 +352,11 @@ class MemoryHubService:
                         # A fresh scan (or the first cached one after startup)
                         # is the only trigger for the controlled auto-install.
                         last_scanned = scanned_at
-                        self._auto_install_detected(report)
+                        # 尊重 HIPPOMIND_HOME：测试与沙箱用它把接入安装
+                        # 限制在临时目录里，避免写进用户真实的 ~/.claude 等
+                        # 配置（本机实测：跑测试会污染 6 个真实配置文件）。
+                        self._auto_install_detected(
+                            report, home=os.environ.get("HIPPOMIND_HOME") or None)
                 except Exception:
                     # Discovery must never take the hub down; the cached
                     # report stays valid until the next successful scan.
@@ -654,7 +658,10 @@ class MemoryHubService:
         try:
             report = self.discovery.maybe_discover(force=True)
             outcome["discovery"] = self.discovery.summary()
-            outcome["auto_install"] = self._auto_install_detected(report)
+            # 同样尊重 HIPPOMIND_HOME：reload 是 HTTP 端点，测试与沙箱会调用它，
+            # 不传 home 就会写进用户真实配置（本机实测：跑测试污染 6 个真实文件）。
+            outcome["auto_install"] = self._auto_install_detected(
+                report, home=os.environ.get("HIPPOMIND_HOME") or None)
         except Exception as exc:
             outcome["error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
         return outcome
