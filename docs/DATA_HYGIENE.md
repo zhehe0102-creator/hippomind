@@ -1,231 +1,248 @@
-# 数据卫生：无意义记忆的检出、处置与防再产生
+# 数据卫生（DATA HYGIENE）：identity key 稳定性与重复入库
 
-> 首次执行：2026-10-24 · 账本 `~/Library/Application Support/HippoMind/hippomind.sqlite`
-> 工具：`python3 scripts/data_hygiene.py`（默认 dry-run）
+Status: **active**。本文记录 2026-10-24 修复的一次**数据污染根因**：
+ledger 的 identity key 含了会漂移的观测时间，导致采集侧每跑一轮就
+把同一条消息重新入库一次。
 
-本文记录三类污染、它们对指标的**真实**影响、处置方式，以及为什么用降级而不是删除。
+Owned files：`hippomind/ledger/identity.py`、`tests/test_identity_stable.py`、本文件。
 
----
+## 结论先说
 
-## 一、两类污染，作用机制完全不同
-
-### 1.1 噪音空壳（noise）
-
-| reason | 条数 | 例子 |
+| 指标 | 修复前（v1） | 修复后（v2） |
 | --- | --- | --- |
-| `self_prompt` | 332 | `你是 HippoMind 的记忆提炼器。只输出 JSON...` |
-| `empty_payload` | 46 | `{"claims":[]}` |
-| `noise` | 24 | `Run:` |
+| 同一条 Gemini 会话摘要 | **141 行** | **1 行** |
+| 生产副本连跑两轮采集，新增行 | 每轮 +1 | **0** |
+| 历史行（v1 id）是否被识别为重复 | — | **是**（向后兼容） |
+| 显式 `valid_from` 的双时态语义 | 保留 | **保留** |
 
-这些是采集/提炼把**自己的中间产物**当成会话内容存了下来。它们永远没用，
-但它们**不是** duplicate_rate 失败的原因——原因见下一节。
+## 一、先诊断：到底哪个字段在变
 
-### 1.2 重复冗余（duplicates）—— 真正的元凶
+### 1.1 事故形态（生产账本实测）
 
-```
-可召回行（accepted + active）   7,474
-其中不同内容                    3,216
-内容重复率                      57.0%
-```
-
-最极端的一行内容被存了 **141 份**，`evidence_json` 完全相同，
-但 `metadata_json` 有 141 个不同版本。
-
-`eval_memory.py` 的 `duplicate_rate` 度量的是**同一个查询的 top-k 里有多少重复内容**。
-当一条记忆存在 N 份副本时，top-8 里可能挤进 5 条一模一样的文本，
-重复率飙升，同时真正不同的结果被挤出榜单——所以 recall 也会被拖累。
-
----
-
-## 二、一个必须记录的反直觉结论
-
-最初的假设是「清掉那 476 条空壳，duplicate_rate 就会降下来」。**实测证伪：**
-
-```
-baseline                      recall=0.9348 mrr=0.8232 dup=0.1087
-清理 380 条空壳（降级 cold）  recall=0.9348 mrr=0.8232 dup=0.1087   ← 完全没变
+```sql
+SELECT evidence_json, COUNT(*) n, COUNT(DISTINCT content) nc,
+       COUNT(DISTINCT metadata_json) nm
+FROM memories WHERE evidence_json LIKE '%gemini%'
+GROUP BY evidence_json HAVING n > 1 ORDER BY n DESC LIMIT 1;
 ```
 
-两个独立原因叠加：
+结果：
 
-1. **评测根本看不见大部分空壳。** `eval_memory.py` 调用 `search()` 时传
-   `include_raw_chat=False`；而 308 条 prompt 污染里 286 条是 `raw_chat=1`。
-   评测能看到的空壳只有 48 条（22 prompt + 24 `Run:`）。
-2. **降级到 `cold` 不生效。** `search.py` 的 `include_cold` **默认 True**，
-   `cold` 行照样被召回。要真正移出检索，必须用 `quality_state='quarantine'`
-   或 `lifecycle='superseded'`。
+```
+n=141  content=1  metadata=141
+evidence_json = ["gemini:1922574a-8409-405c-9ee8-0a81c9df6402"]
+created_at    2026-10-24T04:52:22 .. 2026-10-24T16:01:14
+```
 
-这两个坑都很容易再踩一次，所以写进本文而不是只写在提交信息里。
+**141 行，内容完全相同，evidence 完全相同，metadata 有 141 个版本。**
 
----
+### 1.2 逐字段取证
 
-## 三、处置方式：降级，不删除
+把这 141 行的每一个 identity 输入逐列统计不同值个数：
 
-### 3.1 为什么是 `quarantine` 而不是 `cold`
-
-| 降级方式 | 是否移出检索 | 依据 |
+| 字段 | 不同值数 | 判定 |
 | --- | --- | --- |
-| `lifecycle='cold'` | **否** | `search.py` 的 `include_cold` 默认 True |
-| `quality_state='quarantine'` | 是 | `search.py` 恒加 `quality_state='accepted'` |
-| `lifecycle='superseded'` | 是 | 同上，且需要 `superseded_by` |
+| `kind` | 1（`task`） | 内容固有 |
+| `source_agent` | 1（`gemini`） | 内容固有 |
+| `session_id` | 1（空） | — |
+| `role` | 1（空） | — |
+| `scope` | 1（`shared`） | 内容固有 |
+| `task_id` | 1（会话 id） | 内容固有 |
+| `project` | 1 | 内容固有 |
+| `content` | 1 | 内容固有 |
+| `valid_until` | 1（空） | — |
+| **`valid_from`** | **141** | **← 唯一变量** |
+| `memory_id` | 141 | 由上面推出 |
 
-本工具用 `quarantine`：它不需要指定"被谁取代"（重复项之间没有语义胜负，
-只是同一句话的多份拷贝），语义最贴切。
+metadata 内部同样在变，但**它不是 identity 的输入**：
 
-### 3.2 为什么绝不物理 DELETE
+| metadata 键 | 不同值数 |
+| --- | --- |
+| `source_modified_time` | **141** |
+| `step_count` | **141** |
+| `status` | 2 |
+| 其余 6 个键 | 1 |
 
-每一行都是 evidence-linked 的。物理删除会：
-- 破坏 append-only 审计链（`ledger_events` 与 `memories` 脱节）；
-- 让判断**不可撤销**——而"哪些是重复"本身是一个可能判错的启发式。
+### 1.3 用公式复算，确认是 `valid_from`（不是 metadata）
 
-降级保留全部可审计性，且回滚只需一条 UPDATE。
-
-### 3.3 回滚
-
-`--apply` 会在**修改之前**先写两份文件到账本同目录：
+拿这 141 行各自的字段重建 v1 identity payload 并重算 sha256：
 
 ```
-data-hygiene-rollback-<UTC时间戳>.json          # 结构化清单（memory_id + 分类 + 原因 + 预览）
-data-hygiene-rollback-<UTC时间戳>.rollback.sql  # 可直接执行的还原 SQL
+141 行重建校验：v1(含 valid_from) 命中 141/141
+v2(剔除 valid_from) 产生的唯一 hash 数：1
 ```
 
-回滚：
+**141/141 命中**说明公式被完全解释；剔除 `valid_from` 后塌缩成 **1** 个 hash。
+
+再用实验直接排除 metadata：
+
+```python
+# 只变 metadata，不变 timestamp
+a = led.ingest({**base, "metadata": {"step_count": 1,   "build": "x"}})  # inserted=True
+b = led.ingest({**base, "metadata": {"step_count": 999, "build": "y"}})  # inserted=False
+# 只变 timestamp
+c = led.ingest({**base, "timestamp": "2026-10-24T04:52:22Z"})           # inserted=True
+d = led.ingest({**base, "timestamp": "2026-10-24T04:53:18Z"})           # inserted=True  ← 重复入库
+```
+
+**结论（与最初假设不同，必须写清楚）**：metadata 从来没有进过 identity hash；
+真正漂移的是 `valid_from`。这个区别很重要——如果按"把 metadata 从 hash 里拿掉"
+去改，改动会**完全无效**。
+
+### 1.4 为什么 `valid_from` 会漂移
+
+`gemini_capture.py` 的记录里：
+
+```python
+source_modified = str(item.get("last_modified_time") or "")[:64]   # 源文件 mtime
+timestamp = _iso_timestamp(source_modified)
+# ...
+"timestamp": timestamp,        # ← 采集侧只传 timestamp，从不传 valid_from
+```
+
+而 v1 的 identity 判定是：
+
+```python
+"valid_from": (valid_from if (explicit_valid_from or explicit_observed_at) else "")
+```
+
+`explicit_observed_at` 在**只要带了 timestamp** 时就为真。于是：
+
+```
+源文件 mtime 变 → timestamp 变 → valid_from 变 → identity hash 变 → 新记忆
+```
+
+Gemini 的 `last_modified_time` 在会话活跃期间几乎每次读取都变，
+所以每一轮采集都产出一个新 hash。141 轮 ≈ 141 行。
+
+## 二、修复
+
+### 2.1 identity v2 规则
+
+identity 只由**内容固有**字段决定。结构化记录：
+
+```
+class=structured | kind | source_agent | session_id | external_id
+| task_id | project | scope | valid_from* | valid_until | content(规范化)
+| identity_version=2
+```
+
+`valid_from*` 的星号是本次修复的核心：**只有显式提供的 `valid_from` 才参与**。
+
+### 2.2 那条分界线：有没有"稳定来源锚点"
+
+只把 `explicit_observed_at` 从 hash 里删掉会破坏一个既有契约：
+`tests/test_ingest_idempotency.py::test_new_observation_time_creates_new_memory`
+要求"同一句话在不同时刻断言 = 两个事件"。
+
+两者都对，区别在于**记录有没有声明一个稳定的来源对象**：
+
+| 记录形态 | 语义 | 派生时间是否进 identity |
+| --- | --- | --- |
+| 带 `task_id` / `session_id` / `external_id` | "关于该对象的一条陈述" | **否**（重读同一对象仍是同一条） |
+| 不带任何锚点 | "某时刻的一次独立断言" | **是**（时间就是唯一区分） |
+| 带显式 `valid_from` | 调用方明确声明的生效时间 | **是**（真实双时态） |
+
+采集侧全部落在第一类：`gemini_capture` 用 `task_id=conversation_id`，
+`pi_capture` / `transcripts` / `cursor_capture` 用 `session_id`。
+所以修复精确命中污染源，而手工 `ingest` 的 append-only 语义不变。
+
+### 2.3 向后兼容：旧 identity 仍被识别
+
+升级不能让历史行被重新入库。`_find_existing_event()` 做三层探测：
+
+1. **当前 identity（v2）**——`content_hash` 是 UNIQUE 索引，一次索引查找。
+2. **legacy identity（v1）重算**——覆盖"同一 timestamp 的幂等重放"。
+3. **有界语义探测**——关键的一层。v1 行 hash 的是**派生时间**，重观测时
+   timestamp 变了，重算的 v1 hash 匹配不到任何历史行；只有按
+   `(task_id|session_id, source_agent, scope)` 走索引取出候选、比较
+   **规范化内容**、再**重算该候选自己的 v1 hash 确认它确实是 v1 行**，
+   才能找到它。
+
+第 3 层的两个安全阀：
+
+* **必须有索引可用的收窄条件**（`task_id` 或 `session_id`），否则直接返回
+  None——绝不允许退化成全表扫描。实测两条路径都 < 1ms。
+* **必须重算 v1 hash 与库里存的 `content_hash` 相等**才合并。v2 行把
+  `identity_version` 放进 payload，永远重建不出自己的 v1 hash，因此
+  **两条真实不同的 v2 观测不可能被误合并**（有测试锁定）。
+
+### 2.4 版本标记
+
+```python
+IDENTITY_VERSION = 2          # hippomind/ledger/identity.py
+IDENTITY_VERSION_KEY = "identity_version"
+IDENTITY_VERSION_LEGACY = 1   # 无标记的历史行
+```
+
+版本进 payload，所以 v2 hash 与 v1 hash 必然不同——这既是版本隔离，
+也是上面第 3 层探测能安全判定的依据。
+
+## 三、验证
+
+### 3.1 生产副本连跑两轮采集
+
+只读打开生产库 → SQLite backup API 做副本 → 在副本上采集（不碰生产）。
+每轮都改变 `timestamp` 与 `step_count`，模拟真实采集：
+
+```
+副本: .../copy.sqlite
+初始行数: 267852
+第 1 轮采集: inserted=[False]  新增行=0
+第 2 轮采集: inserted=[False]  新增行=0
+最终行数: 267852  相对初始新增: 0
+```
+
+**第二轮新增重复行 = 0**（验收口径）。
+
+### 3.2 反事实对照：同一副本用 v1 公式
+
+```
+第 1 轮 v1 hash=5af15fd0fe89e08c77bb  已存在=False  -> 新增 1 行
+第 2 轮 v1 hash=e766692650e89148ef37  已存在=False  -> 新增 1 行
+```
+
+同样是两轮采集，v1 各插一行、v2 插 0 行。这就是 141 的来源与它的终止。
+
+### 3.3 141 次采集塌缩成 1 行
+
+`tests/test_identity_stable.py::test_141_observations_collapse_to_one_row`
+在干净账本上复刻事故：141 次采集、每次 timestamp 与 step_count 都不同 →
+断言最终只有 **1** 行。
+
+## 四、测试
+
+`tests/test_identity_stable.py`（30 条）：
+
+| 组 | 覆盖 |
+| --- | --- |
+| `VolatileTimestampTests` | timestamp 漂移不产生新行；metadata 漂移不产生新行；显式 valid_from 保留双时态；raw chat 稳定 |
+| `IdentityDiscriminatorTests` | 不同 content / task / session / role / scope 必须不同 |
+| `AnchorDisambiguationTests` | 无锚点 → append-only 不变；有 task/session 锚点 → 时间不进 identity；显式 valid_from 优先 |
+| `BackwardCompatibilityTests` | v1 行重建命中；重采集识别为重复；多轮幂等；不误合并不同内容；不误合并两条 v2 行 |
+| `IdentityVersionTests` | 版本常量钉住；版本进 payload |
+| `ProductionShapeTests` | 141→1；第二轮 0 新增；批量路径一致 |
+
+## 五、复跑
 
 ```bash
-sqlite3 ~/Library/Application\ Support/HippoMind/hippomind.sqlite \
-  < ~/Library/Application\ Support/HippoMind/data-hygiene-rollback-20261024T164806Z.rollback.sql
+# 针对性测试
+python3 -m unittest tests.test_identity_stable tests.test_ingest_idempotency -v
+
+# 全量
+python3 -m unittest discover -s tests -p "test_*.py"
+PATH="/Users/zps/Code/artemis/.venv/bin:$PATH" scripts/lint.sh
 ```
 
-顺序是刻意的：**先写清单再改库**。如果进程在 apply 中途被杀，磁盘上的清单仍然
-描述了所有可能被改动的行。
+## 六、遗留与注意
 
----
-
-## 四、扫描范围：只看 `active`，绝不碰 `cold`
-
-这是本工具最危险的一个参数，值得单独说明。
-
-```
-accepted + cold   253,522 行   ← 归档证据，天然高度重复，但不是积压
-accepted + active   7,474 行   ← 真正在检索池里的
-```
-
-第一版扫描用的是 `quality_state='accepted'` 不加 lifecycle 过滤，dry-run 报了
-**163,622 条待处理**——其中 162,662 条是归档行。如果直接 `--apply`，
-会把 25 万条归档证据全部隔离掉。
-
-> 是"数字大得离谱"救了它。所以 `--dry-run` 是默认值，且报告第一屏必须打印
-> `live_rows` 和 `distinct_contents`，让口径可核对。
-
-当前扫描谓词：`quality_state='accepted' AND lifecycle='active'`，
-与 `DistillEngine._candidates`、`scripts/distill_status.py` 保持一致。
-
----
-
-## 五、防再产生：入库质量门
-
-存量清理是一次性的，**入库门才是长期解**。实现在 `hippomind/distill.py`：
-
-```python
-classify_unusable(content) -> str   # "" = 可用；否则返回原因码
-```
-
-`run()` 在去重之前先过这道门，并把结果计入 `summary["rejected"]`（按 reason 分组）。
-**不做静默丢弃**——这正是当初 476 条能悄悄积累的原因：没人能区分
-"我们过滤了" 和 "我们没采到"。
-
-### 5.1 特征匹配：字面标记，不用宽泛词
-
-`PROMPT_SELF_MARKERS` 是 11 条**提炼器 prompt 的原文片段**，例如：
-
-```
-"你是 HippoMind 的记忆提炼器"
-"从下面的会话片段中提取稳定、可复核的事实"
-"subject（实体/项目/主题）"
-"slot_key（槽位，稳定小写）"
-```
-
-刻意**不用**「记忆」「JSON」「claims」这类词：真实的记忆完全可能讨论记忆系统和 JSON。
-测试里有专门的"不误杀"用例：
-
-```python
-"这个 JSON 配置需要 slot_key 字段才能通过校验。"   # 保留
-"记忆系统必须支持按时间回溯的查询。"               # 保留
-"subject/predicate/value 三元组是 claims 的基本结构。"  # 保留
-```
-
-`noise` 一类复用已有的 `hippomind.textutil.is_noise_text`（banner / 裸命令回显），
-不新造规则。
-
-### 5.2 入库去重
-
-`run()` 在写入前查一次指纹索引，同规范化内容已存在则**跳过写入但推进游标**
-（否则同一行会被反复重试）。索引**每轮 run() 快照一次**，轮内用
-`_remember_written` 自维护，**不用 ledger generation 做缓存键**——generation
-每次写事务都自增，用它做键会让缓存被它要防的那些写入本身打掉。
-
-验证（临时库，6 条相同内容）：
-
-```
-pass1 distilled=1 skipped_dup=5   → distill 行数 1
-pass2 distilled=1 skipped_dup=3   → distill 行数 2
-duplicate content groups: 0
-cursors: 10 | still pending: 0
-```
-
----
-
-## 六、本次执行结果（2026-10-24）
-
-```
-检出：noise 402（self_prompt 332 / empty_payload 46 / noise 24）
-      duplicates 4,141
-      合计 4,543 → 全部 quality_state=quarantine
-
-keyword 评测（生产账本实测）：
-              recall@8     mrr      duplicate_rate
-  清理前      0.9348     0.8269        0.1313
-  清理后      0.9565     0.8504        0.0145
-  变化        +0.0217    +0.0235       -0.1168
-
-gate: PASS（阈值 max_duplicate_rate=0.10）
-```
-
-recall 和 MRR 上升是因为重复项不再挤占 top-8 名额，让真正不同的结果进来了。
-
----
-
-## 七、遗留问题（超出本次写范围，未修）
-
-### 7.1 根因：ledger identity key 含可变 metadata
-
-这是**设计缺陷**，不只是数据问题。`hippomind/ledger/identity.py` 的结构化记录
-identity 里包含 `valid_from`，而 raw 记录包含 `session_id`。同一句话在不同会话
-被重新观察到，就会得到不同 `content_hash` → 新行。
-
-```
-141 份副本：evidence_json 完全相同（gemini:1922...）
-            metadata_json 有 141 个不同版本
-```
-
-修它需要动 identity 逻辑（schema 级风险，会影响所有采集路径的去重语义），
-**不在本任务写范围内**。本次用入库去重兜住，但这是止血不是根治：
-
-- 入库去重只覆盖 `hippomind-distill` 自己的产物；
-- 采集侧（gemini / pi / transcripts）仍会写出重复行，需要单独处理。
-
-建议后续任务：把 identity key 收敛为「class + agent + 规范化内容」
-（对结构化记录额外保留显式 `valid_from`，但不保留采集时的默认时间戳），
-并在采集侧加一层同内容检测。
-
-### 7.2 `distill_status.py` 与 `data_hygiene.py` 的口径必须保持同步
-
-两者都用 `quality_state='accepted' AND lifecycle='active'`。
-如果将来有人改了其中一个，另一个会静默给出不同的 backlog 数字。
-目前靠测试和注释约束，没有共享常量。
-
-### 7.3 清理是一次性快照
-
-daemon 一直在跑，`--apply` 之后新产生的重复不会被自动清理。
-建议把 `data_hygiene.py --apply` 挂进维护周期（例如每周一次），
-或在 `lifecycle.maintain()` 里加一个同类检测。**本次未接线**。
+* **存量重复行没有删除**。本次只止住增量；生产库里那 141 行（以及其他
+  重复组）仍在。物理删除需要单独决策与备份，本次刻意不做。
+* **`_legacy_semantic_probe` 只在有 `task_id` 或 `session_id` 时生效**。
+  既无锚点又是 v1 写入的极老行，仍只能靠第 2 层（精确 timestamp 重放）
+  命中；这是有意的取舍——宁可漏合并也不做全表扫描。
+* **`archive:*` 来源**（`n=293` 的重复组）不走本路径：它们带稳定
+  `event_id`，由第 1 层精确命中，且 `distinct_content` 接近 `n`（约 250/293），
+  属于真实不同内容而非同一条重复。
+* **`identity_version` 目前只进 hash，未落库为列**。需要审计时可从
+  `_legacy_identity_hash(row) == content_hash` 判定该行是否为 v1。

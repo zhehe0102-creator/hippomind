@@ -39,6 +39,30 @@ from ._helpers import (
     utc_now,
 )
 
+#: Identity key format version.
+#:
+#: v1 hashed ``valid_from`` whenever the record carried *any* timestamp, so a
+#: collector that re-observes the same message with a refreshed timestamp minted
+#: a brand-new identity every pass.  Measured on the production ledger
+#: (2026-10-24): one Gemini conversation summary existed 141 times -- identical
+#: ``content`` and identical ``evidence_json``, 141 distinct ``valid_from``
+#: values, 141 distinct ``content_hash``.  Re-deriving each row identity with the
+#: v1 formula reproduced all 141/141 stored ids, and excluding ``valid_from``
+#: collapsed them to exactly 1.
+#:
+#: v2 only lets an *explicitly supplied* ``valid_from`` participate, so genuine
+#: bitemporal history (a caller asserting the same sentence as valid from two
+#: different dates) is still two observations, while capture-time drift is not.
+IDENTITY_VERSION = 2
+
+#: Version stamped into every prepared record (and persisted in metadata) so a
+#: future format change can tell which rows were minted under which rule.
+IDENTITY_VERSION_KEY = "identity_version"
+
+#: Records written before v2 carry no version marker; they were all v1.
+IDENTITY_VERSION_LEGACY = 1
+
+
 class IdentityMixin:
     """Record validation, stable identity keys and event/projection insertion."""
 
@@ -110,28 +134,39 @@ class IdentityMixin:
         quality_score = _quality_score(kind, content, evidence, metadata, raw_chat)
         quality_state = "accepted" if quality_score >= QUALITY_ACCEPT_THRESHOLD else "quarantine"
         # ------------------------------------------------------------------
-        # Stable identity key
+        # Stable identity key (see IDENTITY_VERSION for the full history)
         # ------------------------------------------------------------------
-        # The previous canonical form hashed ``occurred_at``, ``valid_from`` and
-        # the whole metadata blob.  For raw chat that meant the *same* message
-        # re-captured on a later watcher pass produced a different hash every
-        # time, so de-duplication never fired: the live ledger held 1,475,584 raw
-        # rows whose content_hash were all distinct, while a single session's
-        # 70,508 rows contained only 3,573 unique messages.
+        # Two independent bugs have been fixed here, in order:
         #
-        # Identity is now split by record class:
+        # (1) The original canonical form hashed ``occurred_at``, ``valid_from``
+        #     *and the whole metadata blob*.  For raw chat that meant the same
+        #     message re-captured on a later watcher pass produced a different
+        #     hash every time: the live ledger held 1,475,584 raw rows whose
+        #     content_hash were all distinct while a single session's 70,508
+        #     rows contained only 3,573 unique messages.  Raw identity is now
+        #     *what it says*, not when it was captured.
         #
-        #   * Raw evidence (chat / tool output / system message) is identified by
-        #     *what it says*, not when it was captured:
-        #         source_agent | session_id | role | normalised content
+        # (2) Structured records still hashed ``valid_from`` whenever the record
+        #     carried any timestamp -- including a timestamp the *collector*
+        #     derived from a file mtime.  A collector that refreshes its source
+        #     file on every pass therefore minted a new identity on every pass.
+        #     Measured on the production ledger (2026-10-24): one Gemini
+        #     conversation summary stored 141 times, identical content and
+        #     evidence, 141 distinct ``valid_from``.  The collector
+        #     (``gemini_capture``) passes ``timestamp=source_modified_time``,
+        #     never ``valid_from``, so ``explicit_valid_from`` was always False
+        #     and only ``explicit_observed_at`` kept the drifting value in the
+        #     hash.  v2 drops that path: a *derived* observation time is capture
+        #     drift, not a distinct assertion.
         #
-        #   * Structured records (fact/decision/progress/...) keep a semantic key
-        #     that still includes the observation time, because the same sentence
-        #     asserted at two different times is legitimately two observations
-        #     (bi-temporal history).  Only volatile capture metadata is excluded.
+        # Note the metadata blob is NOT part of either key -- ``step_count`` and
+        # ``source_modified_time`` varied across all 141 rows but the row
+        # identities were fully explained by ``valid_from`` alone.  Metadata is
+        # projection data, so a later enrichment pass cannot fork identity.
         #
-        # ``content_hash`` remains the dedup key; ``canonical`` is retained as
-        # the human-auditable description of what was ingested.
+        # Backward compatibility: v2 mints the new id, but ``_insert_prepared``
+        # also probes the v1 id so rows written before this change are still
+        # recognised as duplicates instead of being re-ingested wholesale.
         if raw_chat:
             identity = {
                 "class": "raw",
@@ -143,8 +178,25 @@ class IdentityMixin:
         else:
             # ``role`` and ``evidence`` are deliberately absent: an agent that
             # re-reports the same decision with a fresh evidence id is repeating
-            # itself, not making a new observation.  Keeping ``valid_from``
-            # preserves genuine bitemporal history (same sentence, new time).
+            # itself, not making a new observation.
+            #
+            # When does a *derived* observation time still belong in the key?
+            #
+            # A record that names a stable source object (``task_id`` for a
+            # conversation summary, ``session_id`` for a transcript) is a
+            # *statement about that object*.  Re-reading the object -- even with
+            # a refreshed mtime -- says the same thing, so the time must not
+            # fork identity.  That is the 141-duplicate case: gemini_capture
+            # always sets ``task_id=conversation_id``.
+            #
+            # A record with no such anchor is a *standalone assertion*; the
+            # observation time is then the only thing that distinguishes one
+            # assertion from the next, and the append-only contract keeps both
+            # (``tests/test_ingest_idempotency`` pins this).
+            has_stable_anchor = bool(task_id or session_id or external_id)
+            keep_derived_valid_from = (not explicit_valid_from
+                                       and not has_stable_anchor
+                                       and explicit_observed_at)
             identity = {
                 "class": "structured",
                 "kind": kind,
@@ -154,14 +206,21 @@ class IdentityMixin:
                 "task_id": task_id,
                 "project": project,
                 "scope": scope,
-                # Only an explicitly supplied observation time identifies a
-                # distinct bitemporal observation. When it is derived from "now"
-                # it is capture drift: hashing it made every re-report a new row.
-                "valid_from": (valid_from if (explicit_valid_from or explicit_observed_at) else ""),
+                "valid_from": (valid_from if (explicit_valid_from
+                                                or keep_derived_valid_from) else ""),
                 "valid_until": valid_until,
                 "content": normalise_for_dedup(content),
             }
-        content_hash = _hash(_json(identity, "ingest identity", MAX_CONTENT_CHARS + 8_000))
+        identity_payload = dict(identity, **{IDENTITY_VERSION_KEY: IDENTITY_VERSION})
+        content_hash = _hash(_json(identity_payload, "ingest identity", MAX_CONTENT_CHARS + 8_000))
+        # v1 key for the same record, used only to recognise pre-v2 rows.
+        legacy_payload = dict(identity)
+        if not raw_chat and explicit_observed_at and not explicit_valid_from:
+            # v1 kept the derived observation time unconditionally; that is what
+            # the historical rows were minted with, so the compatibility probe
+            # must reproduce it exactly.
+            legacy_payload["valid_from"] = valid_from
+        legacy_hash = _hash(_json(legacy_payload, "ingest identity", MAX_CONTENT_CHARS + 8_000))
         event_id = "evt_" + content_hash[:32]
         memory_id = "mem_" + content_hash[:32]
         evidence_json = _json(evidence, "evidence")
@@ -178,6 +237,16 @@ class IdentityMixin:
             "session_id": session_id, "task_id": task_id, "project": project,
             "role": role, "scope": scope, "evidence_json": evidence_json,
             "tags_json": tags_json, "content": content, "content_hash": content_hash,
+            # Pre-v2 identity for the same record: ``_insert_prepared`` probes it
+            # so a row written before this change is recognised as a duplicate
+            # instead of being re-ingested under its new id.
+            "legacy_hash": legacy_hash,
+            "identity_version": IDENTITY_VERSION,
+            # Fields the backward-compatibility probe needs.  Kept on the prepared
+            # record so _insert_prepared never has to re-derive them from the raw
+            # input (which would drift from what identity actually used).
+            "identity_content": normalise_for_dedup(content),
+            "identity_explicit_valid_from": explicit_valid_from,
             "metadata_json": metadata_json, "fts_content": fts_content, "valid_until": valid_until,
             "raw_chat": int(raw_chat), "weight": weight, "importance": importance,
             "utility": utility, "confidence": confidence, "valid_from": valid_from,
@@ -277,17 +346,163 @@ class IdentityMixin:
             """, (relation_id, parent_id, prepared["memory_id"], parent.get("relation_type", "caused_by"),
                   _clamp_float(parent.get("confidence", 0.5), 0.5, 0.0, 1.0), prepared["asserted_at"]))
 
+    @staticmethod
+    def _legacy_identity_hash(row: Any) -> str:
+        """Recompute the **v1** identity hash for an already-stored row.
+
+        Used to recognise rows written before :data:`IDENTITY_VERSION` 2 without
+        a schema change: a v2 row can never reproduce its own v1 hash (v2 adds
+        ``identity_version`` to the payload), so an exact match proves the row
+        was minted under the old rule.
+        """
+        # The two v1 branches are structurally different and must be rebuilt
+        # exactly: ``_json`` sorts keys, but an extra or missing field changes the
+        # digest.  Structured rows never hashed ``role`` (v1 deliberately dropped
+        # it so a re-reported decision was not a new observation); raw rows never
+        # hashed ``kind``/``task_id``/``project``/``scope``/``valid_*``.
+        try:
+            raw = int(row["raw_chat"] or 0)
+            if raw:
+                payload = {
+                    "class": "raw",
+                    "source_agent": row["source_agent"],
+                    "session_id": row["session_id"],
+                    "role": row["role"],
+                    "content": normalise_for_dedup(row["content"]),
+                }
+            else:
+                payload = {
+                    "class": "structured",
+                    "kind": row["kind"],
+                    "source_agent": row["source_agent"],
+                    "session_id": row["session_id"],
+                    "external_id": "",
+                    "task_id": row["task_id"],
+                    "project": row["project"],
+                    "scope": row["scope"],
+                    "valid_from": row["valid_from"],
+                    "valid_until": row["valid_until"],
+                    "content": normalise_for_dedup(row["content"]),
+                }
+        except (KeyError, IndexError, TypeError, ValueError):
+            return ""
+        return _hash(_json(payload, "legacy identity", MAX_CONTENT_CHARS + 8_000))
+
+    @staticmethod
+    def _find_existing_event(conn: sqlite3.Connection,
+                             prepared: Mapping[str, Any]) -> Any:
+        """Return the already-stored event for this record, if any.
+
+        Three probes, cheapest first:
+
+        1. **current identity (v2)** -- an indexed UNIQUE lookup, the steady
+           state for every write after the upgrade.
+        2. **legacy identity (v1) recomputed for this record** -- catches an
+           idempotent replay of exactly the same observation (same timestamp),
+           which is what the watcher does when nothing changed.
+        3. **bounded semantic probe** -- the important one for backward
+           compatibility.  A v1 row hashed the *derived* observation time, so a
+           re-observation with a refreshed timestamp produces a v1 hash that
+           matches nothing.  Probe 2 therefore cannot find it; only comparing
+           normalised content within the same (task|session, agent, scope)
+           bucket can.  Candidates are confirmed to be v1 rows by recomputing
+           their own v1 hash, so a genuine v2 row is never silently merged.
+
+        Without probe 3 the first capture pass after the upgrade would
+        re-ingest every historical row under its new id: measured on the
+        production ledger, 141 rows share one v2 identity, so each pass would
+        have added another duplicate on top of them.
+
+        Probe 3 is skipped when the record carries an **explicit** ``valid_from``:
+        that is a deliberate bitemporal assertion, and two different dates must
+        stay two observations.
+        """
+        current = str(prepared.get("content_hash") or "")
+        existing = conn.execute(
+            "SELECT event_id, content_hash FROM ledger_events WHERE content_hash=?",
+            (current,)).fetchone()
+        if existing is not None:
+            return existing
+        legacy = str(prepared.get("legacy_hash") or "")
+        if legacy and legacy != current:
+            existing = conn.execute(
+                "SELECT event_id, content_hash FROM ledger_events WHERE content_hash=?",
+                (legacy,)).fetchone()
+            if existing is not None:
+                return existing
+        if bool(prepared.get("identity_explicit_valid_from")):
+            return None
+        return IdentityMixin._legacy_semantic_probe(conn, prepared)
+
+    #: Candidate cap for the legacy semantic probe.  Bounded so an ingest can
+    #: never degrade into a table scan; 64 covers every observed duplicate group
+    #: (the largest in the production ledger is 293 rows for archive sources, but
+    #: those carry a stable ``event_id`` and never reach this path).
+    LEGACY_PROBE_LIMIT = 64
+
+    @staticmethod
+    def _legacy_semantic_probe(conn: sqlite3.Connection,
+                               prepared: Mapping[str, Any]) -> Any:
+        """Find a pre-v2 row describing the same observation (bounded, indexed).
+
+        Narrowing uses the two existing indexes -- ``idx_memories_task``
+        (task_id) or ``idx_memories_source`` (source_agent, session_id) -- so the
+        probe costs a sub-millisecond index seek rather than a scan.  Content is
+        then compared in its normalised form, which is the same canonicalisation
+        the identity key uses.
+        """
+        agent = str(prepared.get("source_agent") or "")
+        scope = str(prepared.get("scope") or "")
+        task_id = str(prepared.get("task_id") or "")
+        session_id = str(prepared.get("session_id") or "")
+        if not agent:
+            return None
+        if task_id:
+            sql = ("SELECT * FROM memories WHERE task_id=? AND source_agent=? "
+                   "AND scope=? AND lifecycle!='superseded' LIMIT ?")
+            params: Any = (task_id, agent, scope, IdentityMixin.LEGACY_PROBE_LIMIT)
+        elif session_id:
+            sql = ("SELECT * FROM memories WHERE source_agent=? AND session_id=? "
+                   "AND scope=? AND lifecycle!='superseded' LIMIT ?")
+            params = (agent, session_id, scope, IdentityMixin.LEGACY_PROBE_LIMIT)
+        else:
+            # No indexed narrowing available: refuse to scan.  Probe 2 still
+            # covers the exact-replay case for these rows.
+            return None
+        target = str(prepared.get("identity_content") or "")
+        if not target:
+            return None
+        try:
+            candidates = conn.execute(sql, params).fetchall()
+        except sqlite3.DatabaseError:
+            return None
+        for row in candidates:
+            if normalise_for_dedup(row["content"]) != target:
+                continue
+            # Only merge onto a row that really was minted under v1: recompute its
+            # own v1 hash and compare with the hash actually stored on its event.
+            # A v2 row can never reproduce its own v1 hash (v2 adds
+            # ``identity_version`` to the payload), so this cannot merge two
+            # genuinely distinct v2 observations.
+            event = conn.execute(
+                "SELECT event_id, content_hash FROM ledger_events WHERE event_id=?",
+                (row["origin_event_id"],)).fetchone()
+            if event is None:
+                continue
+            if IdentityMixin._legacy_identity_hash(row) != str(event["content_hash"] or ""):
+                continue
+            return event
+        return None
+
     @classmethod
     def _insert_prepared(cls, conn: sqlite3.Connection, prepared: Mapping[str, Any]) -> IngestResult:
-        existing = conn.execute(
-            "SELECT event_id FROM ledger_events WHERE content_hash=?", (prepared["content_hash"],)
-        ).fetchone()
+        existing = cls._find_existing_event(conn, prepared)
         if existing is not None:
             row = conn.execute(
                 "SELECT memory_id FROM memories WHERE origin_event_id=?", (existing["event_id"],)
             ).fetchone()
             return IngestResult(existing["event_id"], row["memory_id"] if row else prepared["memory_id"],
-                                False, prepared["content_hash"])
+                                False, existing["content_hash"])
         source_trust = cls._agent_trust_for(conn, str(prepared["source_agent"]))
         effective_confidence = _clamp_float(
             0.7 * float(prepared["confidence"]) + 0.3 * source_trust, 0.5, 0.0, 1.0)

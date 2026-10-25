@@ -406,3 +406,167 @@ python3 scripts/conflict_review.py --decider llm --limit 5
    需要看服务端，而不是继续加重试次数。
 5. **`claude` CLI 仍然不可用**，它现在只是第二顺位回退。在它修好之前，
    `--provider claude` 的实际含义是"用 API"。
+
+---
+
+## 八、claim 质量门：先量化，再决定拦什么
+
+### 8.1 起因：round 9 的"6% 退化值"
+
+round 9 抽查 34 条 claims，判定 2 条是退化值（`"3"`、`"可用"`），推断短句上模型会说废话。
+本节的第一个结论是：**这个判定是错的**。
+
+把这两条按 claim 读一遍：
+
+```
+subject=当前任务   slot=pending_new_requirements   value="3"
+  -> "当前任务有 3 条待处理的新需求"   —— 这是一个计数
+subject=Bing      slot=availability              value="可用"
+  -> "Bing 可用"                     —— 这是一个状态
+```
+
+两条都**信息完整**，只是**简短**。它们恰恰是任务书警告过的那种"短但有意义"的值。
+如果照 round 9 的判断去建门，建出来的就是会误杀 `6000` / `SQLite` / `mac-mini` 的那道门。
+
+### 8.2 先量化：三个样本，共 5,147 条真实 claim
+
+没有凭感觉定阈值。样本全部来自**生产账本只读副本**（`sqlite3 .backup`）：
+
+| 样本 | 来源 | 条数 |
+| --- | --- | --- |
+| PRODUCTION | 账本里全部 `state=active` 的 claim | 4,464 |
+| FRESH-API | 用当前 API 提取器跑 400 条真实 `raw_chat`（40–1500 字） | 374 |
+| SHORT-SRC | 同上，但只取 **10–120 字的短行**（round 9 说的问题区） | 309 |
+
+**长度分布（PRODUCTION）**：
+
+| 长度 | 条数 | 占比 |
+| --- | --- | --- |
+| 1–2 | 71 | 1.6% |
+| 3–4 | 108 | 2.4% |
+| 5–8 | 167 | 3.7% |
+| 9–20 | 971 | 21.8% |
+| 21+ | 3,147 | 70.5% |
+
+**字符类别（PRODUCTION）**：`has_cjk` 82.2%，`mixed` 8.6%，`ascii_token` 8.0%，
+`pure_number` **0.9%**（42 条），`number_unit` 0.2%，`single_char` **0.1%**（5 条）。
+
+**关键交叉表**（槽位语义 × 值类别，PRODUCTION）：
+
+| 槽位类型 | 裸布尔 | 裸状态词 | 纯数字 | 其它 | n |
+| --- | --- | --- | --- | --- | --- |
+| generic（statement/note…） | 0 | 0 | 0 | 377 | 377 |
+| boolish（`*_match`/`is_*`） | 26 | 0 | 0 | 55 | 81 |
+| statusish（`*_status`） | 0 | 14 | 0 | 350 | 364 |
+| numeric（`*_count`/`*_budget`） | 0 | 0 | 42 | 321 | 363 |
+| ident（`*_name`/`host`） | 5 | 0 | 0 | 367 | 372 |
+| neutral | 0 | 10 | 0 | 2,897 | 2,907 |
+
+这张表是整个设计的依据：**裸值只出现在"槽位名已经说明了答案类型"的地方**
+（`requires_root=true`、`*_count=42`、`*_status=正常`），而 377 条 generic 槽位里
+**一条裸值都没有** —— 它们在 generic 槽位里才是异常的。
+
+### 8.3 判据：看槽位语义，不看长度
+
+`classify_claim_value(slot_key, predicate, value)`，返回稳定 reason code（与
+`classify_unusable` 同一套可观测契约），`""` 表示放行：
+
+| reason | 条件 | 作用于 |
+| --- | --- | --- |
+| `empty_value` | 只有空白 | 所有槽位 |
+| `punct_only` | 只有标点/下划线（`-`、`--`、`...`） | 所有槽位 |
+| `tautology` | 值只是重复了 **slot 名** | 所有槽位 |
+| `generic_single_char` | 单字符 | **仅 generic 槽位** |
+| `generic_bare_state` | 裸布尔/裸状态词 | **仅 generic 槽位** |
+| `generic_bare_number` | 纯数字 | **仅 generic 槽位** |
+
+**为什么不用长度**：长度分不开 `"6000"`（该记住的 token 预算）和 `"3"`（说不清是什么的计数）。
+两者都是短数字。分开它们的唯一信息是**槽位名有没有告诉你这个数字是什么**。
+实测代价：374 条 FRESH-API 里有 **82 条（21.9%）长度 ≤ 8**，几乎全部合法
+（`SQLite`、`pa3q`、`v2.2`、`6h`、`5s`、`ebpf`、`/dev/tmp`）。任何长度阈值都会先杀掉这些。
+
+### 8.4 实测结果：这道门在真实数据上拦下了 0 条
+
+| 样本 | 条数 | 放行 | 拦下 | 比例 |
+| --- | --- | --- | --- | --- |
+| PRODUCTION | 4,464 | 4,464 | **0** | 0.00% |
+| FRESH-API | 374 | 374 | **0** | 0.00% |
+| SHORT-SRC | 309 | 309 | **0** | 0.00% |
+
+**这是必须如实报告的结果：门建好了，但在现有数据上它一条也没拦到。**
+原因不是门写错了，是 round 9 那个"6% 退化值"的前提不成立 ——
+那些值经复查都是合法 claim。
+
+进一步验证门确实会触发（用构造数据，见 `tests/test_claim_quality.py`）：
+
+```
+classify_claim_value("statement", "p", "3")        -> "generic_single_char"   (拦)
+classify_claim_value("note",      "p", "可用")      -> "generic_bare_state"     (拦)
+classify_claim_value("statement", "p", "-")        -> "punct_only"            (拦)
+classify_claim_value("default_token_budget", "p", "6000") -> ""                (放行)
+classify_claim_value("task_status", "p", "正常")     -> ""                       (放行)
+```
+
+门在 14.63% 的生产 claim 上真的进入了 generic 分支（653 条），只是那些值都有内容。
+
+### 8.5 哪些短值被保留、为什么
+
+这是本任务的核心交付。以下全部来自生产账本实测，**一条都没被杀**：
+
+| 值 | 槽位 | 为什么保留 |
+| --- | --- | --- |
+| `6000` | `default_token_budget` | 纯数字，但槽位说明了它是 token 预算 |
+| `259` | `third_party_app_count` | 计数，槽位说明了计什么 |
+| `1` | `wake_lock_count` | 同上；`1` 在这里是事实不是噪音 |
+| `120` | `default_timeout_seconds` | 超时预算 |
+| `86400` | `update_interval` | 间隔秒数 |
+| `37` / `17` | `compile_sdk_version` / `platform_build_version_name` | 版本号 |
+| `pa3q` | `device_codename` | 设备代号，短但唯一标识一台机器 |
+| `SQLite` / `ebpf` / `walt` | `tech.database` / `active_backend` / `cpu_governor` | 技术选型 |
+| `mac-mini` | `host` | 主机名 |
+| `v1.5.2` / `v2.2` / `v0.8.3` | `version` / `installed_version` | 版本 |
+| `/dev/tmp` / `/bin/zsh` | `worker_tmpdir_value` / `shell` | 路径 |
+| `true` / `false` | `bash_requires_approval`、`*_match`、`is_git_repo` | 槽位本身就是一个谓词，布尔就是答案 |
+| `正常` / `成功` / `通过` / `无` | `*_status`、`recent_errors` | 状态槽位，状态词就是答案 |
+| `6h` / `5s` / `15m` | `worker_permanent_retry_max` / `runtime_verify_timeout` | 时长 |
+
+SHORT-SRC 样本里有 **27 条（8.7%）是裸状态词/布尔**，全部落在 typed 槽位，全部保留。
+如果按"裸状态词就杀"的规则，这 27 条会全部丢失 —— 这就是为什么判据必须挂在槽位上。
+
+### 8.6 一个被数据否掉的规则：`value == predicate`
+
+我最初把"值等于 predicate"也算 tautology。实测否掉了它：
+
+| 样本 | `value==predicate` | 实际情况 |
+| --- | --- | --- |
+| FRESH-API | 1 | `subject=module_scripts_test predicate=passed value=passed` |
+| SHORT-SRC | 2 | `subject=审计脚本 predicate=未运行 value=未运行`；`subject=NeoZygisk predicate=未尝试注入 value=未尝试注入` |
+
+3 条里 **3 条都是真实事实**，只是 predicate 写得多余了一点。
+"审计脚本未运行"是有效信息，删掉它是拿信息换整洁。
+所以规则收窄到**只判 slot 名重复**（`value == slot_tail`），这一条在 5,147 条真实数据上命中 0 次、
+误杀 0 次。
+
+### 8.7 可观测性
+
+`run()` 的 summary 新增两个字段，与 `rejected`（整行级）并列但语义不同
+（`claims_dropped` 是"模型答了但没说有用的话"）：
+
+```python
+{"claims_dropped": {"generic_bare_state": 2}, "claims_dropped_total": 2}
+```
+
+某行的 claim 被全部过滤时，该行按"空提炼"处理：打游标、计入 `skipped`，
+**不会永远重试**（有测试钉住）。
+
+### 8.8 诚实的边界
+
+1. **这道门目前拦下 0 条真实 claim。** 不要把它当成质量提升来汇报。
+   它的价值是"下次真的出现裸值时会拦"，而不是"已经清理了 6%"。
+2. **round 9 的 6% 是误判**，已在 8.1 说明。后续如果有人再引用那个数字，请引用本节。
+3. **判据依赖槽位名**。如果模型产出一个不在 `GENERIC_SLOT_NAMES` 里、但语义泛化的
+   新槽位名（比如 `misc_note`），门会放过它。这是有意的取舍：漏放 > 误杀。
+4. **`generic` 名单是硬编码的**。加新槽位名要改代码，不是配置项 —— 因为它需要人判断，
+   不能靠猜。
+5. 样本 5,147 条覆盖了生产全量 active claim + 683 条新提取结果，但没有覆盖
+   未来 API 输出分布的变化。门的行为靠 23 个单测钉住，不靠这批样本钉住。

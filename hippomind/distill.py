@@ -105,6 +105,8 @@ def default_transport() -> str:
     """Transport policy for new extractors (HIPPOMIND_DISTILL_TRANSPORT)."""
     raw = os.environ.get("HIPPOMIND_DISTILL_TRANSPORT", "").strip().lower()
     return raw if raw in TRANSPORTS else "auto"
+
+
 DEFAULT_CONFIDENCE = 0.55
 #: How many candidates one run() pass may claim.  The daemon calls run() on a
 #: timer, so this only bounds one tick's work, not the whole backlog.
@@ -199,6 +201,111 @@ def classify_unusable(content: str) -> str:
 def is_usable_memory(content: str) -> bool:
     """Convenience predicate for callers that only need a yes/no answer."""
     return not classify_unusable(content)
+
+
+# ---------------------------------------------------------------------------
+# Claim-value gate: is this *value* worth occupying a slot?
+# ---------------------------------------------------------------------------
+#: Slots whose name carries no meaning of its own, so a short value there is
+#: almost certainly the model failing to say anything.  Measured on the
+#: 2026-10-24 production ledger: 377 of 377 claims in these slots had a long
+#: free-text value and none was a bare state word -- i.e. a short value in one
+#: of these slots is anomalous by construction.
+#:
+#: The inverse is the important half of the rule.  In a *typed* slot
+#: (default_token_budget, tech.database, device_codename) a short value is the
+#: correct answer, and killing it would destroy real knowledge: production holds
+#: "6000" (token budget), "pa3q" (device codename), "SQLite", "ebpf",
+#: "/dev/tmp", "259", "v2.2" -- every one of them short and every one of them
+#: load-bearing.  So the gate only ever looks at values in generalized slots.
+GENERIC_SLOT_NAMES = frozenset({
+    "statement", "note", "notes", "misc", "summary", "description", "detail",
+    "details", "info", "information", "content", "text", "body", "remark",
+    "comment", "other", "general", "memo", "observation", "fact", "insight",
+    "takeaway", "finding", "point", "message", "msg", "value", "data",
+})
+#: Slot names distill itself synthesizes for heuristic claims: <memid>:s_ab12.
+#: They are generalized by construction -- the heuristic has no stable global
+#: slot -- so they belong in the same bucket as "statement".
+GENERIC_SLOT_RE = re.compile(r"^s_[0-9a-f]{6,}$", re.IGNORECASE)
+#: Values that carry no information on their own.  These are only ever rejected
+#: in a generalized slot; in a typed slot "true" is a perfectly good answer to
+#: bash_requires_approval and a state word is a good answer to "status".
+BARE_VALUE_RE = re.compile(
+    r"^(?:true|false|yes|no|on|off|none|null|nil|tbd|n/?a|"
+    r"可用|不可用|是|否|有|无|成功|失败|正常|异常|完成|未完成|"
+    r"已修复|未修复|通过|未通过|一致|不一致|存在|不存在)$",
+    re.IGNORECASE)
+PUNCT_ONLY_RE = re.compile(r"^[\W_]+$")
+
+
+def slot_tail(slot_key: str) -> str:
+    """The meaningful part of a slot key.
+
+    Distill emits two shapes: a plain key (task_status) and a memory-scoped one
+    (mem_ab12...:s_9f8e7d).  Only the tail carries meaning, so classification
+    looks at that and nothing else.
+    """
+    return str(slot_key or "").split(":")[-1].strip()
+
+
+def is_generic_slot(slot_key: str) -> bool:
+    """True when the slot name itself says nothing about the expected value."""
+    tail = slot_tail(slot_key).lower()
+    return tail in GENERIC_SLOT_NAMES or bool(GENERIC_SLOT_RE.match(tail))
+
+
+def classify_claim_value(slot_key: str, predicate: str, value: str) -> str:
+    """Return a reason code when a claim value must not occupy a slot.
+
+    Returns "" when the value is acceptable.  Codes are stable so the caller can
+    count them (same contract as classify_unusable):
+
+    empty_value
+        Nothing but whitespace.
+    punct_only
+        Punctuation or underscores only ("-", "--", "...").
+    tautology
+        The value merely restates the subject or the slot name, so the claim
+        asserts nothing: slot=project_name value=relayomni-work on subject
+        relayomni-work.  Measured at 0.07% of production claims (3/4,464), all
+        three genuinely empty, so the rule is safe at that rate.
+    generic_single_char / generic_bare_state / generic_bare_number
+        A one-character value, a bare boolean/state word, or a bare number in a
+        *generalized* slot -- the "3" and short-state-word cases.
+
+    Why slot semantics and not just length: length alone cannot separate "6000"
+    (a token budget worth remembering) from "3" (a count the model could not
+    name).  Both are short numbers.  What separates them is whether the slot
+    already tells you what the number means.  In default_token_budget it does;
+    in statement it does not.  A pure length rule would have deleted the first
+    to catch the second -- measured cost: 82 of 374 fresh claims are 8
+    characters or shorter and nearly all are legitimate (SQLite, pa3q, v2.2).
+    """
+    text = str(value or "").strip()
+    if not text:
+        return "empty_value"
+    if PUNCT_ONLY_RE.match(text):
+        return "punct_only"
+    lowered = text.lower()
+    # A value that only restates the slot name asserts nothing.  Deliberately
+    # NOT extended to "value equals the predicate": measured on 683 fresh claims,
+    # all 3 such cases were real facts whose predicate merely repeated the value
+    # (subject=审计脚本 predicate=未运行 value=未运行 says the script is not
+    # running).  Dropping those would lose information to tidy up wording.
+    if lowered == slot_tail(slot_key).lower():
+        return "tautology"
+    # Everything below is conditional on a generalized slot.  A typed slot is
+    # allowed to hold a short value; that is the whole point of the split.
+    if not is_generic_slot(slot_key):
+        return ""
+    if len(text) == 1:
+        return "generic_single_char"
+    if BARE_VALUE_RE.match(text):
+        return "generic_bare_state"
+    if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", text):
+        return "generic_bare_number"
+    return ""
 
 DECISION_MARKERS = ("决定", "采用", "结论", "必须", "不能", "不要", "偏好",
                     "选择", "修复", "原因", "部署", "配置", "使用")
@@ -553,7 +660,24 @@ class DistillEngine:
         return claims, "heuristic"
 
     def _record(self, candidate: Candidate, claims: Sequence[Mapping[str, Any]],
-                extractor_name: str, parent_memory_id: str = "") -> Dict[str, Any]:
+                extractor_name: str, parent_memory_id: str = "",
+                dropped: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
+        # Claim-value gate: a claim whose value says nothing must not take a
+        # slot.  It would manufacture conflicts against a real fact and put a
+        # meaningless row in front of retrieval.  See classify_claim_value for
+        # why this keys on slot semantics rather than value length.
+        if dropped is None:
+            dropped = {}
+        gated: List[Mapping[str, Any]] = []
+        for item in claims:
+            reason = classify_claim_value(str(item.get("slot_key", "")),
+                                         str(item.get("predicate", "")),
+                                         str(item.get("value", "")))
+            if reason:
+                dropped[reason] = dropped.get(reason, 0) + 1
+                continue
+            gated.append(item)
+        claims = gated
         # The ledger has a unique (memory_id, subject, predicate, slot_key)
         # constraint.  LLM output may repeat a slot; keep the strongest one
         # instead of failing the whole batch.
@@ -867,6 +991,11 @@ class DistillEngine:
                    # operator can tell "we filtered noise" from "we lost data".
                    "rejected": dict(rejected),
                    "rejected_total": sum(rejected.values()),
+                   # Claim values refused by the value gate, by reason.
+                   # Separate from "rejected" (which is about whole source
+                   # rows) so an operator can see that the model answered
+                   # but said nothing worth storing.
+                   "claims_dropped": {}, "claims_dropped_total": 0,
                    "extractor": "none", "extractors": {},
                    "conflicts_resolved": 0, "elapsed_ms": 0.0}
         last_by_subject: Dict[str, str] = {}
@@ -909,7 +1038,23 @@ class DistillEngine:
                 try:
                     subject = str(source_claims[0].get("subject", "")).strip().lower()
                     parent = last_by_subject.get(subject, "")
-                    record = self._record(candidate, source_claims, extractor_name, parent)
+                    dropped: Dict[str, int] = {}
+                    record = self._record(candidate, source_claims,
+                                          extractor_name, parent, dropped)
+                    if dropped:
+                        bucket = summary["claims_dropped"]
+                        for reason, n in dropped.items():
+                            bucket[reason] = bucket.get(reason, 0) + n
+                        summary["claims_dropped_total"] += sum(dropped.values())
+                    if not record.get("claims"):
+                        # Every claim this source produced was filtered, so
+                        # there is nothing to store.  Retire the row like an
+                        # empty extraction -- otherwise it is retried forever.
+                        summary["skipped"] += 1 + len(repeats)
+                        self._mark(candidate, 0)
+                        for repeat in repeats:
+                            self._mark_duplicate(repeat, candidate.memory_id)
+                        continue
                     # Ingest-side dedupe: an identical live memory means this
                     # observation adds nothing but a duplicate row.  Skip the
                     # write, but still mark the cursor -- otherwise the same

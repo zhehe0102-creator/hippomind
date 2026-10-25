@@ -28,7 +28,13 @@ from .ledger import AGENT_PERMISSIONS, AgentCredential, LedgerError, SQLiteLedge
 from .mcp_register import mcp_registration_path, mcp_registration_status, register_mcp_server
 
 
-SUPPORTED_AGENTS: Tuple[str, ...] = ("codex", "pi", "claude", "cursor", "gemini", "deepseek", "local")
+SUPPORTED_AGENTS: Tuple[str, ...] = (
+    "codex", "pi", "claude", "cursor", "gemini", "deepseek", "local",
+    # 2026-10-24 扩展：本机实际安装且各有独立配置目录的运行时。
+    # 每一个都必须有可验证的注入面（规则文件 / MCP profile / 原生 hook），
+    # 没有实测证据的不进这个列表——"看起来支持"比"不支持"更有害。
+    "opencode", "qoder", "zcode", "workbuddy", "antigravity", "dsh",
+)
 # Shared collaboration is the default installed workflow.  The separate
 # capabilities remain enforceable for deliberately restricted credentials.
 DEFAULT_PERMISSIONS: Tuple[str, ...] = tuple(sorted(AGENT_PERMISSIONS))
@@ -390,6 +396,13 @@ def agent_rule_path(agent_id: str, *, home: Optional[Path] = None) -> Path:
         "gemini": home / ".gemini" / "GEMINI.md",
         "deepseek": home / ".deepseek" / "AGENTS.md",
         "local": home / ".local-agent" / "AGENTS.md",
+        # 以下路径都来自本机实测存在的配置目录，不是猜测。
+        "opencode": home / ".config" / "opencode" / "AGENTS.md",
+        "qoder": home / ".qoder" / "AGENTS.md",
+        "zcode": home / ".zcode" / "AGENTS.md",
+        "workbuddy": home / ".workbuddy" / "AGENTS.md",
+        "antigravity": home / ".gemini" / "antigravity" / "AGENTS.md",
+        "dsh": home / ".dsh" / "AGENTS.md",
     }
     try:
         return locations[agent]
@@ -440,6 +453,28 @@ def _prepare_cursor_rule(path: Path) -> None:
 
 def _mcp_profile_path(config_path: Path) -> Path:
     return config_path.with_name(config_path.stem + "-mcp.json")
+
+
+#: 每个 agent 的 MCP 配置文件位置（本机实测存在才写进来）。
+#: 没有 MCP 配置文件的运行时只装规则文件，不假装支持 MCP。
+AGENT_MCP_PATHS: Dict[str, Tuple[str, ...]] = {
+    "claude": (".claude.json",),
+    "cursor": (".cursor", "mcp.json"),
+    "gemini": (".gemini", "settings.json"),
+    "opencode": (".config", "opencode", "opencode.json"),
+    "qoder": (".qoder", "mcp.json"),
+    "zcode": (".zcode", "mcp.json"),
+    "workbuddy": (".workbuddy", "mcp.json"),
+    "antigravity": (".gemini", "antigravity", "mcp.json"),
+    "dsh": (".dsh", "mcp.json"),
+}
+
+
+def agent_mcp_path(agent_id: str, *, home: Optional[Path] = None) -> Optional[Path]:
+    """Return the MCP config file for an agent, or None when it has none."""
+    root = Path(home).expanduser() if home else Path.home()
+    parts = AGENT_MCP_PATHS.get(safe_agent_name(agent_id))
+    return root.joinpath(*parts) if parts else None
 
 
 def _write_mcp_profile(path: Path, *, package_root: Path, ledger_path: Path,
