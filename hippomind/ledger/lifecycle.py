@@ -443,10 +443,23 @@ class LifecycleMixin:
         to run repeatedly and never changes accepted winners.
         """
         def write(conn):
+            # 不变式：claim 的 state 必须与它所属记忆的**可召回性**一致。
+            # 记忆一旦离开 accepted+active（被 superseded / expired / **quarantine**
+            # / cold 归档），它的 claim 就不可能再被召回；继续标 active 只会
+            # 占着 slot，让新记忆的 claim 被误判成"与它冲突"。
+            #
+            # 2026-10-24 实测：data_hygiene 把 4,543 条重复记忆降级为
+            # quarantine 后，它们的 1,535 条 claim 仍是 active，health 报
+            # "活跃 claim 4486 条，悬空 1535 条"。旧条件只覆盖 superseded/
+            # expired，恰好漏掉 quarantine —— 而 quarantine 正是清理用的状态。
+            #
+            # 注意 `WHERE NOT (<predicate>)` 的括号不能省：predicate 是
+            # "a AND b" 两个条件，写成 "a AND b IS 0" 时 IS 0 只作用于 b，
+            # 整个条件退化成 a AND (NOT b)，会漏掉一大批行（实测只修掉 136/1671）。
             superseded = conn.execute(
                 "UPDATE memory_claims SET state='superseded' WHERE state='active' "
                 "AND memory_id IN (SELECT memory_id FROM memories "
-                "WHERE quality_state IN ('superseded','expired') OR lifecycle IN ('superseded','expired'))"
+                "WHERE NOT (" + fts_indexed_predicate() + "))"
             ).rowcount
             conflicted = conn.execute(
                 "UPDATE memory_claims SET state='conflict' WHERE state='active' "
