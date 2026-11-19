@@ -1,0 +1,2044 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HippoMind — 给 AI 装一个海马体</title>
+<meta name="description" content="HippoMind 是本机多 Agent 记忆中枢：自动采集会话、提炼带证据的事实、按相关性门控注入最小上下文。单文件 SQLite 账本，事件溯源，全本地。">
+<meta name="theme-color" content="#04060B">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='13' fill='none' stroke='%2363E6CF' stroke-width='2'/><circle cx='16' cy='16' r='4' fill='%2363E6CF'/></svg>">
+<style>
+/* ============================================================
+   0. Tokens
+   ============================================================ */
+:root{
+  --void:#04060b;
+  --deep:#070a12;
+  --surface:rgba(255,255,255,.038);
+  --surface-2:rgba(255,255,255,.06);
+  --line:rgba(255,255,255,.085);
+  --line-2:rgba(255,255,255,.16);
+  --text:#e9edf5;
+  --muted:#98a5bc;
+  --dim:#63718b;
+  --teal:#63e6cf;
+  --teal-dim:rgba(99,230,207,.14);
+  --violet:#a78bfa;
+  --violet-dim:rgba(167,139,250,.14);
+  --amber:#f3b96b;
+  --rose:#f0796f;
+  --paper:#efeade;
+  --ink:#15171c;
+  --ink-2:#4b4f58;
+  --maxw:1180px;
+  --ease:cubic-bezier(.22,.61,.36,1);
+  --sans:-apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Segoe UI",sans-serif;
+  --mono:"SF Mono",ui-monospace,Menlo,Consolas,"Liberation Mono",monospace;
+  --serif:"Songti SC","Noto Serif CJK SC","Source Han Serif SC",Georgia,serif;
+}
+*,*::before,*::after{box-sizing:border-box}
+html{scroll-behavior:smooth;-webkit-text-size-adjust:100%}
+body{
+  margin:0;background:var(--void);color:var(--text);
+  font-family:var(--sans);font-size:16px;line-height:1.7;
+  -webkit-font-smoothing:antialiased;overflow-x:hidden;
+}
+body::before{
+  content:"";position:fixed;inset:0;z-index:0;pointer-events:none;
+  background:
+    radial-gradient(900px 620px at 78% -8%, rgba(99,230,207,.10), transparent 62%),
+    radial-gradient(820px 560px at 12% 4%, rgba(167,139,250,.10), transparent 60%),
+    radial-gradient(1100px 700px at 50% 108%, rgba(70,110,180,.10), transparent 65%);
+}
+body::after{
+  content:"";position:fixed;inset:0;z-index:1;pointer-events:none;opacity:.035;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+::selection{background:rgba(99,230,207,.26);color:#fff}
+a{color:inherit;text-decoration:none}
+button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
+img{max-width:100%;display:block}
+h1,h2,h3,h4{margin:0;font-weight:600;letter-spacing:-.025em;line-height:1.16}
+p{margin:0}
+ul{margin:0;padding:0;list-style:none}
+hr{border:0;border-top:1px solid var(--line);margin:0}
+.wrap{width:min(var(--maxw),calc(100% - 48px));margin:0 auto;position:relative;z-index:2}
+.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.muted{color:var(--muted)}
+.dim{color:var(--dim)}
+
+/* ============================================================
+   1. Chrome: progress, nav, rail
+   ============================================================ */
+#progress{
+  position:fixed;top:0;left:0;height:2px;width:0;z-index:80;
+  background:linear-gradient(90deg,var(--teal),var(--violet));
+  box-shadow:0 0 14px rgba(99,230,207,.6);
+}
+.nav{
+  position:fixed;top:0;left:0;right:0;z-index:70;height:66px;
+  display:flex;align-items:center;
+  transition:background .3s var(--ease),border-color .3s var(--ease);
+  border-bottom:1px solid transparent;
+}
+.nav.solid{background:rgba(4,6,11,.74);backdrop-filter:blur(16px) saturate(140%);-webkit-backdrop-filter:blur(16px) saturate(140%);border-bottom-color:var(--line)}
+.nav.on-light{background:rgba(239,234,222,.86);border-bottom-color:rgba(21,23,28,.14)}
+.nav.on-light .brand b,.nav.on-light .nav-links a{color:#15171c}
+.nav.on-light .brand span{color:rgba(21,23,28,.42)}
+.nav.on-light .brand svg circle{stroke:rgba(21,23,28,.35)}
+.nav.on-light .brand svg circle:nth-child(2){stroke:rgba(21,23,28,.22)}
+.nav.on-light .brand svg circle:nth-child(3){fill:#0f766e}
+.nav.on-light .brand svg circle:nth-child(4){fill:#7c5cf0}
+.nav.on-light .nav-links a:hover{background:rgba(21,23,28,.06)}
+.nav.on-light .nav-links a.on::after{background:linear-gradient(90deg,#0f766e,transparent)}
+.nav.on-light .nav-cta{border-color:rgba(21,23,28,.26);color:#15171c}
+.nav.on-light .nav-cta:hover{background:rgba(21,23,28,.05);border-color:rgba(21,23,28,.45)}
+.nav.on-light .burger{border-color:rgba(21,23,28,.2)}
+.nav.on-light .burger span,.nav.on-light .burger span::before,.nav.on-light .burger span::after{background:#15171c}
+.nav-inner{width:min(var(--maxw),calc(100% - 48px));margin:0 auto;display:flex;align-items:center;justify-content:space-between;gap:24px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:600;letter-spacing:-.01em}
+.brand svg{width:26px;height:26px;flex:none}
+.brand b{font-weight:600}
+.brand span{font-family:var(--mono);font-size:.62rem;letter-spacing:.16em;color:var(--dim);text-transform:uppercase;margin-left:2px}
+.nav-links{display:flex;align-items:center;gap:4px}
+.nav-links a{
+  position:relative;padding:8px 12px;border-radius:9px;font-size:.86rem;color:var(--muted);
+  transition:color .2s var(--ease),background .2s var(--ease)
+}
+.nav-links a:hover{color:var(--text);background:rgba(255,255,255,.05)}
+.nav-links a.on{color:var(--text)}
+.nav-links a.on::after{
+  content:"";position:absolute;left:12px;right:12px;bottom:2px;height:1px;
+  background:linear-gradient(90deg,var(--teal),transparent)
+}
+.nav-cta{
+  display:inline-flex;align-items:center;gap:8px;padding:9px 16px;border-radius:999px;
+  border:1px solid var(--line-2);font-size:.82rem;color:var(--text);
+  transition:border-color .2s,background .2s
+}
+.nav-cta:hover{border-color:rgba(99,230,207,.5);background:rgba(99,230,207,.08)}
+.nav-cta svg{width:14px;height:14px}
+.burger{display:none;width:40px;height:40px;border:1px solid var(--line);border-radius:10px;align-items:center;justify-content:center}
+.burger span{display:block;width:16px;height:1.5px;background:var(--text);position:relative}
+.burger span::before,.burger span::after{content:"";position:absolute;left:0;width:16px;height:1.5px;background:var(--text)}
+.burger span::before{top:-5px}.burger span::after{top:5px}
+
+.rail{position:fixed;right:26px;top:50%;transform:translateY(-50%);z-index:60;display:flex;flex-direction:column;gap:2px}
+.rail a{
+  display:flex;align-items:center;justify-content:flex-end;gap:10px;height:26px;
+  font-family:var(--mono);font-size:.6rem;letter-spacing:.08em;color:var(--dim);
+  opacity:.55;transition:opacity .2s,color .2s
+}
+.rail a i{display:block;width:14px;height:1px;background:currentColor;transition:width .25s var(--ease)}
+.rail a:hover,.rail a.on{opacity:1;color:var(--teal)}
+.rail a.on i{width:26px}
+.rail a span{opacity:0;transform:translateX(4px);transition:.25s var(--ease);white-space:nowrap}
+.rail:hover a span,.rail a.on span{opacity:1;transform:none}
+
+.mobile-menu{
+  position:fixed;inset:0;z-index:65;visibility:hidden;background:rgba(4,6,11,.97);backdrop-filter:blur(18px);
+  display:flex;flex-direction:column;justify-content:center;padding:0 32px;
+  opacity:0;pointer-events:none;transition:opacity .28s var(--ease)
+}
+.mobile-menu.open{opacity:1;pointer-events:auto;visibility:visible}
+.mobile-menu a{
+  display:flex;align-items:baseline;gap:16px;padding:18px 0;border-bottom:1px solid var(--line);
+  font-size:1.5rem;letter-spacing:-.02em
+}
+.mobile-menu a em{font-family:var(--mono);font-style:normal;font-size:.62rem;color:var(--teal);letter-spacing:.14em}
+
+/* ============================================================
+   2. Hero
+   ============================================================ */
+.hero{position:relative;padding:132px 0 0;min-height:100svh;display:flex;flex-direction:column;justify-content:center}
+.hero-grid{display:grid;grid-template-columns:1.02fr .98fr;gap:56px;align-items:center}
+.eyebrow{display:inline-flex;align-items:center;gap:10px;font-family:var(--mono);font-size:.66rem;letter-spacing:.18em;text-transform:uppercase;color:var(--muted)}
+.eyebrow::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--teal);box-shadow:0 0 12px var(--teal)}
+.hero h1{margin-top:26px;font-size:clamp(2.5rem,4.7vw,4.35rem);line-height:1.06;letter-spacing:-.045em}
+.hero h1 .line{display:block}
+.hero h1 em{
+  font-style:normal;
+  color:#6ceada;
+  text-shadow:0 0 44px rgba(99,230,207,.30);
+  position:relative
+}
+.hero h1 em::after{
+  content:"";position:absolute;left:0;right:0;bottom:.06em;height:1px;
+  background:linear-gradient(90deg,var(--teal),transparent);opacity:.5
+}
+.hero .lede{margin-top:26px;max-width:508px;color:var(--muted);font-size:1.01rem;line-height:1.9}
+.hero-cta{display:flex;flex-wrap:wrap;gap:12px;margin-top:34px}
+.btn{
+  display:inline-flex;align-items:center;gap:9px;padding:12px 22px;border-radius:999px;
+  font-size:.9rem;font-weight:500;transition:transform .2s var(--ease),box-shadow .2s var(--ease),background .2s;
+  border:1px solid transparent
+}
+.btn svg{width:15px;height:15px;transition:transform .2s var(--ease)}
+.btn:hover svg{transform:translateX(2px)}
+.btn-primary{background:linear-gradient(100deg,var(--teal),#8fe9dd);color:#04120f;box-shadow:0 10px 34px -12px rgba(99,230,207,.7)}
+.btn-primary:hover{transform:translateY(-1px);box-shadow:0 16px 40px -14px rgba(99,230,207,.85)}
+.btn-ghost{border-color:var(--line-2);color:var(--text)}
+.btn-ghost:hover{background:rgba(255,255,255,.05);border-color:rgba(255,255,255,.26)}
+.hero-meta{display:flex;flex-wrap:wrap;gap:18px;margin-top:38px;font-family:var(--mono);font-size:.66rem;letter-spacing:.06em;color:var(--dim)}
+.hero-meta span{display:inline-flex;align-items:center;gap:7px}
+.hero-meta span::before{content:"";width:3px;height:3px;border-radius:50%;background:var(--dim)}
+
+/* hero flow panel */
+.flow{
+  position:relative;border:1px solid var(--line);border-radius:22px;overflow:hidden;
+  background:
+    radial-gradient(120% 90% at 88% 10%, rgba(99,230,207,.10), transparent 55%),
+    radial-gradient(100% 80% at 10% 90%, rgba(167,139,250,.10), transparent 60%),
+    linear-gradient(165deg,rgba(255,255,255,.05),rgba(255,255,255,.012));
+  height:clamp(400px,52vh,560px);
+  box-shadow:0 40px 90px -50px rgba(0,0,0,.9),inset 0 1px 0 rgba(255,255,255,.06)
+}
+.flow canvas{position:absolute;inset:0;width:100%;height:100%}
+.flow{min-width:0}
+.flow-label{position:absolute;font-family:var(--mono);font-size:.56rem;letter-spacing:.1em;color:var(--dim);white-space:nowrap;pointer-events:none;text-transform:uppercase}
+.flow-label.gate{left:56%;top:8%;transform:translateX(-50%);color:var(--teal);opacity:.9}
+.flow-label.pack{left:76%;top:8%;transform:translateX(-50%);color:var(--text);opacity:.85}
+.flow-foot{
+  position:absolute;left:0;right:0;bottom:0;padding:14px 18px;border-top:1px solid var(--line);
+  display:flex;justify-content:space-between;gap:12px;font-family:var(--mono);font-size:.56rem;
+  letter-spacing:.08em;color:var(--dim);background:rgba(4,6,11,.45)
+}
+.flow-foot b{color:var(--teal);font-weight:500}
+.hero-scroll{display:flex;align-items:center;gap:10px;margin:54px 0 30px;font-family:var(--mono);font-size:.6rem;letter-spacing:.16em;color:var(--dim)}
+.hero-scroll i{display:block;width:1px;height:26px;background:linear-gradient(var(--teal),transparent);animation:drop 2.4s var(--ease) infinite}
+@keyframes drop{0%{transform:scaleY(.2);transform-origin:top;opacity:0}40%{opacity:1}100%{transform:scaleY(1);transform-origin:top;opacity:0}}
+
+/* stat band */
+.band{border-top:1px solid var(--line);border-bottom:1px solid var(--line);background:rgba(255,255,255,.018)}
+.band-grid{display:grid;grid-template-columns:repeat(4,1fr)}
+.band-cell{padding:26px 28px;border-right:1px solid var(--line);display:flex;flex-direction:column;gap:4px}
+.band-cell:last-child{border-right:0}
+.band-cell b{font-family:var(--mono);font-size:1.5rem;font-weight:500;letter-spacing:-.02em;color:var(--text)}
+.band-cell b span{font-size:.78rem;color:var(--muted);margin-left:3px}
+.band-cell small{font-family:var(--mono);font-size:.6rem;letter-spacing:.12em;color:var(--dim);text-transform:uppercase}
+
+/* ============================================================
+   3. Section primitives
+   ============================================================ */
+.sec{padding:112px 0;position:relative}
+.sec-head{display:grid;grid-template-columns:76px 1fr;gap:26px;margin-bottom:56px}
+.sec-idx{font-family:var(--mono);font-size:.66rem;letter-spacing:.16em;color:var(--teal);padding-top:12px;border-top:1px solid var(--line-2);height:fit-content}
+.sec-idx em{display:block;font-style:normal;color:var(--dim);margin-top:6px;font-size:.58rem;letter-spacing:.14em}
+.sec h2{font-size:clamp(1.72rem,3.1vw,2.75rem);max-width:820px}
+.sec .lede{margin-top:20px;max-width:660px;color:var(--muted);font-size:.99rem;line-height:1.9}
+.sec-note{margin-top:14px;font-family:var(--mono);font-size:.64rem;letter-spacing:.04em;color:var(--dim)}
+
+.card{
+  position:relative;border:1px solid var(--line);border-radius:16px;
+  background:linear-gradient(180deg,rgba(255,255,255,.048),rgba(255,255,255,.015));
+  padding:26px;transition:border-color .25s var(--ease),transform .25s var(--ease),background .25s
+}
+.card:hover{border-color:var(--line-2);transform:translateY(-2px)}
+.card h3{font-size:1.06rem;letter-spacing:-.01em;display:flex;align-items:center;gap:9px}
+.card p{margin-top:10px;color:var(--muted);font-size:.9rem;line-height:1.85}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:16px}
+.chip{
+  font-family:var(--mono);font-size:.6rem;letter-spacing:.04em;padding:4px 8px;border-radius:5px;
+  border:1px solid var(--line);color:var(--muted);background:rgba(255,255,255,.02)
+}
+.chip.teal{color:var(--teal);border-color:rgba(99,230,207,.26);background:rgba(99,230,207,.06)}
+.chip.violet{color:var(--violet);border-color:rgba(167,139,250,.26);background:rgba(167,139,250,.06)}
+.chip.amber{color:var(--amber);border-color:rgba(243,185,107,.26);background:rgba(243,185,107,.06)}
+
+/* reveal */
+.rv{opacity:0;transform:translateY(18px);transition:opacity .7s var(--ease),transform .7s var(--ease)}
+.rv.in{opacity:1;transform:none}
+.rv[data-d="1"]{transition-delay:.08s}.rv[data-d="2"]{transition-delay:.16s}
+.rv[data-d="3"]{transition-delay:.24s}.rv[data-d="4"]{transition-delay:.32s}
+
+/* ============================================================
+   4. Symptom
+   ============================================================ */
+.sym-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}
+.sym{padding:30px 26px 28px}
+.sym .glyph{width:34px;height:34px;margin-bottom:20px;color:var(--teal);opacity:.9}
+.sym .glyph.v{color:var(--violet)}
+.sym .glyph.a{color:var(--amber)}
+.sym h3{font-size:1.02rem}
+.sym p{font-size:.88rem;line-height:1.85}
+.pull{
+  margin-top:64px;padding:38px 0 0;border-top:1px solid var(--line);
+  display:grid;grid-template-columns:76px 1fr;gap:26px;align-items:start
+}
+.pull q{
+  font-family:var(--serif);font-size:clamp(1.3rem,2.4vw,1.95rem);line-height:1.6;
+  quotes:none;color:#dfe6f2;letter-spacing:.01em
+}
+.pull q b{color:var(--teal);font-weight:400}
+.pull small{display:block;margin-top:14px;font-family:var(--mono);font-size:.6rem;letter-spacing:.14em;color:var(--dim)}
+
+/* ============================================================
+   5. Journey
+   ============================================================ */
+.journey{display:grid;grid-template-columns:286px 1fr;gap:64px;align-items:start}
+.journey>*,.j-body,.step,.panel>*,.start>*,.term,.big-term,.code,.layer-inner>*{min-width:0}
+.j-side{position:sticky;top:104px}
+.j-side .kicker{font-family:var(--mono);font-size:.6rem;letter-spacing:.16em;color:var(--dim);margin-bottom:18px}
+.j-list li{border-top:1px solid var(--line)}
+.j-list li:last-child{border-bottom:1px solid var(--line)}
+.j-list button{display:grid;grid-template-columns:32px 1fr;gap:12px;width:100%;text-align:left;padding:13px 0;color:var(--dim);transition:color .2s}
+.j-list button i{font-family:var(--mono);font-style:normal;font-size:.6rem;letter-spacing:.1em;padding-top:3px}
+.j-list button span{font-size:.9rem;letter-spacing:-.01em}
+.j-list button:hover{color:var(--muted)}
+.j-list button.on{color:var(--text)}
+.j-list button.on i{color:var(--teal)}
+.j-meter{margin-top:22px;height:2px;background:var(--line);position:relative;overflow:hidden}
+.j-meter i{position:absolute;inset:0 auto 0 0;width:14%;background:linear-gradient(90deg,var(--teal),var(--violet));transition:width .4s var(--ease)}
+.j-body .step{padding:30px 0 38px;border-top:1px solid var(--line);opacity:.5;transition:opacity .4s var(--ease)}
+.j-body .step:first-child{border-top:0;padding-top:0}
+.j-body .step.on{opacity:1}
+.step-top{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap}
+.step-top .num{font-family:var(--mono);font-size:.62rem;letter-spacing:.14em;color:var(--teal)}
+.step h3{font-size:1.28rem;letter-spacing:-.02em;margin-top:8px}
+.step p{margin-top:12px;color:var(--muted);font-size:.92rem;line-height:1.9;max-width:640px}
+.step p b{color:#dbe3f0;font-weight:500}
+.step .ev{
+  margin-top:18px;border:1px solid var(--line);border-radius:10px;padding:12px 14px;
+  font-family:var(--mono);font-size:.68rem;line-height:1.9;color:var(--muted);
+  background:rgba(0,0,0,.22);overflow-x:auto;white-space:pre
+}
+.step .ev b{color:var(--teal);font-weight:400}
+.step .ev .off{color:var(--rose)}
+.step .chips{margin-top:16px}
+
+/* ============================================================
+   6. Anatomy
+   ============================================================ */
+.layers{margin-top:8px;border-top:1px solid var(--line-2)}
+.layer{border-bottom:1px solid var(--line)}
+.layer-btn{display:grid;grid-template-columns:54px 1fr auto;gap:18px;align-items:center;width:100%;text-align:left;padding:24px 4px;transition:padding .25s var(--ease)}
+.layer-btn:hover{padding-left:10px}
+.layer-btn .ln{font-family:var(--mono);font-size:.62rem;color:var(--dim);letter-spacing:.1em}
+.layer-btn .lt b{display:block;font-size:1.16rem;letter-spacing:-.015em;font-weight:600}
+.layer-btn .lt em{display:block;font-style:normal;font-size:.82rem;color:var(--dim);margin-top:2px}
+.layer-btn .arrow{width:26px;height:26px;border:1px solid var(--line);border-radius:50%;display:grid;place-items:center;transition:.3s var(--ease);color:var(--muted)}
+.layer-btn .arrow svg{width:12px;height:12px;transition:transform .3s var(--ease)}
+.layer.open .arrow{border-color:rgba(99,230,207,.5);color:var(--teal)}
+.layer.open .arrow svg{transform:rotate(180deg)}
+.layer-body{display:grid;grid-template-rows:0fr;transition:grid-template-rows .38s var(--ease)}
+.layer.open .layer-body{grid-template-rows:1fr}
+.layer-body>div{overflow:hidden}
+.layer-inner{display:grid;grid-template-columns:1.25fr 1fr;gap:36px;padding:0 4px 34px 72px}
+.mods{display:flex;flex-wrap:wrap;align-items:flex-start;gap:6px}
+.guarantees li{position:relative;font-size:.82rem;color:var(--muted);padding:5px 0 5px 15px;line-height:1.75}
+.guarantees li::before{content:"";position:absolute;left:0;top:14px;width:5px;height:5px;border-radius:50%;background:var(--teal);opacity:.8}
+.anatomy-foot{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;margin-top:38px;background:var(--line);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+.af{background:#070b13;padding:14px 16px;font-family:var(--mono);font-size:.62rem;letter-spacing:.04em;color:var(--dim)}
+.af b{display:block;color:var(--text);font-weight:500;font-size:.78rem;margin-bottom:2px;letter-spacing:0}
+
+/* ============================================================
+   7. Physics
+   ============================================================ */
+.physics{display:grid;grid-template-columns:1.06fr .94fr;gap:40px;align-items:start}
+.lab{border:1px solid var(--line);border-radius:18px;padding:22px 22px 18px;background:linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,.012))}
+.lab-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px}
+.lab-head .t{font-family:var(--mono);font-size:.6rem;letter-spacing:.14em;color:var(--dim)}
+.lab-head .v{font-family:var(--mono);font-size:1.7rem;line-height:1.1;color:var(--teal);letter-spacing:-.02em}
+.lab-head .v small{font-size:.72rem;color:var(--muted);letter-spacing:0;margin-left:2px}
+.lab svg{width:100%;height:auto;margin-top:10px;display:block}
+.lab input[type=range]{
+  width:100%;margin:8px 0 0;accent-color:var(--teal);height:2px;cursor:pointer;
+  -webkit-appearance:none;appearance:none;background:var(--line-2);border-radius:2px
+}
+.lab input[type=range]::-webkit-slider-thumb{
+  -webkit-appearance:none;width:14px;height:14px;border-radius:50%;background:var(--teal);
+  box-shadow:0 0 0 4px rgba(99,230,207,.16),0 0 16px rgba(99,230,207,.7);cursor:grab
+}
+.lab-scale{display:flex;justify-content:space-between;font-family:var(--mono);font-size:.58rem;color:var(--dim);margin-top:8px}
+.mems{margin-top:18px;border-top:1px solid var(--line);padding-top:6px}
+.mem-row{display:grid;grid-template-columns:1fr 78px;gap:12px;align-items:center;padding:7px 0;font-size:.78rem;color:var(--muted)}
+.mem-row .track{grid-column:1/-1;height:3px;background:rgba(255,255,255,.06);border-radius:3px;overflow:hidden;margin-top:-4px}
+.mem-row .track i{display:block;height:100%;background:linear-gradient(90deg,var(--violet),var(--teal));border-radius:3px;transition:width .18s linear}
+.mem-row b{font-family:var(--mono);font-weight:400;color:var(--text);text-align:right;font-size:.72rem}
+.formula{
+  font-family:var(--mono);font-size:.76rem;line-height:2;color:#cfd8e8;
+  border:1px solid var(--line);border-radius:12px;padding:15px 16px;background:rgba(0,0,0,.24);
+  overflow-x:auto;white-space:pre-wrap;word-break:break-word
+}
+.formula em{font-style:normal;color:var(--teal)}
+.f-note{margin-top:10px;font-family:var(--mono);font-size:.6rem;color:var(--dim);letter-spacing:.03em}
+.weights{margin-top:22px}
+.w-row{display:grid;grid-template-columns:88px 1fr 40px;gap:12px;align-items:center;padding:6px 0;font-size:.8rem;color:var(--muted)}
+.w-row .bar{height:4px;background:rgba(255,255,255,.06);border-radius:4px;overflow:hidden}
+.w-row .bar i{display:block;height:100%;border-radius:4px}
+.w-row b{font-family:var(--mono);font-weight:400;font-size:.7rem;color:var(--text);text-align:right}
+.rules{display:grid;gap:10px;margin-top:26px}
+.rule{display:grid;grid-template-columns:18px 1fr;gap:10px;font-size:.83rem;color:var(--muted);line-height:1.8}
+.rule::before{content:"↳";color:var(--dim);font-family:var(--mono);font-size:.8rem;line-height:1.9}
+.rule b{color:var(--text);font-weight:500}
+
+/* ============================================================
+   8. Loop
+   ============================================================ */
+.loop{display:grid;grid-template-columns:1fr 1fr;gap:48px;align-items:center}
+.ring-wrap{position:relative;max-width:520px;margin:0 auto;width:100%}
+.ring-wrap svg{width:100%;height:auto;display:block}
+.ring-node text{font-family:var(--sans)}
+.ring-node .n-idx{font-family:var(--mono);font-size:7px;letter-spacing:.12em;fill:#63718b}
+.ring-node .n-t{font-size:14px;fill:#dfe6f2;font-weight:500}
+.ring-node .n-s{font-family:var(--mono);font-size:8.5px;fill:#7f8da6;letter-spacing:.06em}
+.ring-dash{animation:spin 60s linear infinite;transform-origin:240px 240px}
+@keyframes spin{to{transform:rotate(360deg)}}
+.loop-list li{display:grid;grid-template-columns:74px 1fr;gap:16px;padding:16px 0;border-top:1px solid var(--line)}
+.loop-list li:last-child{border-bottom:1px solid var(--line)}
+.loop-list .t{font-family:var(--mono);font-size:.66rem;color:var(--teal);letter-spacing:.04em;padding-top:2px}
+.loop-list h3{font-size:.96rem}
+.loop-list p{font-size:.82rem;color:var(--muted);line-height:1.8;margin-top:4px}
+.code{
+  margin-top:20px;border:1px solid var(--line);border-radius:12px;overflow:hidden;background:rgba(0,0,0,.3)
+}
+.code-bar{display:flex;align-items:center;gap:8px;padding:9px 13px;border-bottom:1px solid var(--line);font-family:var(--mono);font-size:.58rem;color:var(--dim);letter-spacing:.08em}
+.code-bar i{width:6px;height:6px;border-radius:50%;background:#2a3444;display:block}
+.code pre{margin:0;padding:14px;overflow-x:auto;font-family:var(--mono);font-size:.66rem;line-height:1.95;color:#b9c6da}
+.code pre b{color:var(--teal);font-weight:400}
+.code pre .c{color:#5d6b82}
+
+/* ============================================================
+   9. Modules
+   ============================================================ */
+.mod-sum{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);border:1px solid var(--line);border-radius:12px;overflow:hidden;margin-bottom:34px}
+.ms{background:#070b13;padding:18px 18px}
+.ms b{display:block;font-family:var(--mono);font-size:1.35rem;font-weight:500;letter-spacing:-.02em}
+.ms small{display:block;font-family:var(--mono);font-size:.58rem;letter-spacing:.1em;color:var(--dim);margin-top:3px;text-transform:uppercase}
+.mod-table{border-top:1px solid var(--line-2)}
+.mod-row{display:grid;grid-template-columns:150px 1fr;gap:24px;padding:22px 6px;border-bottom:1px solid var(--line);transition:background .2s,padding .2s var(--ease)}
+.mod-row:hover{background:rgba(255,255,255,.02);padding-left:12px}
+.mod-row h3{font-size:.92rem;letter-spacing:0}
+.mod-row .cnt{font-family:var(--mono);font-size:.56rem;color:var(--dim);letter-spacing:.1em;margin-top:5px}
+.mod-row .duty{font-size:.8rem;color:var(--muted);margin-top:9px;line-height:1.8}
+.mod-row .mods .chip{background:transparent}
+
+/* ============================================================
+   10. Entry tabs
+   ============================================================ */
+.tabs{display:flex;gap:6px;border-bottom:1px solid var(--line);margin-bottom:28px;overflow-x:auto}
+.tabs button{
+  position:relative;padding:12px 16px;font-size:.86rem;color:var(--dim);white-space:nowrap;
+  transition:color .2s;border-bottom:1px solid transparent;margin-bottom:-1px
+}
+.tabs button:hover{color:var(--muted)}
+.tabs button.on{color:var(--text);border-bottom-color:var(--teal)}
+.tabs button em{font-family:var(--mono);font-style:normal;font-size:.56rem;color:var(--dim);margin-right:7px;letter-spacing:.08em}
+.panel{display:none}
+.panel.on{display:grid;grid-template-columns:1.1fr .9fr;gap:36px;animation:fade .35s var(--ease)}
+#tab-atlas.on{grid-template-columns:1fr;gap:24px}
+#tab-atlas ul.pts{display:grid;grid-template-columns:1fr 1fr;gap:0 30px}
+#tab-atlas .chips{margin-top:10px}
+@keyframes fade{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.panel .term{
+  border:1px solid var(--line);border-radius:14px;overflow:hidden;background:rgba(0,0,0,.34);align-self:start
+}
+.term-bar{display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid var(--line);font-family:var(--mono);font-size:.58rem;letter-spacing:.08em;color:var(--dim)}
+.term-bar i{width:7px;height:7px;border-radius:50%;background:#26303f}
+.term-bar .copy{margin-left:auto;color:var(--dim);font-family:var(--mono);font-size:.56rem;letter-spacing:.08em;padding:2px 6px;border:1px solid transparent;border-radius:4px}
+.term-bar .copy:hover{color:var(--teal);border-color:rgba(99,230,207,.3)}
+.term pre{margin:0;padding:16px;overflow-x:auto;font-family:var(--mono);font-size:.7rem;line-height:2;color:#c3d0e2}
+.term pre .p{color:var(--teal)}
+.term pre .c{color:#5d6b82}
+.term pre .s{color:#e5c68b}
+.panel ul.pts li{position:relative;padding:7px 0 7px 17px;font-size:.84rem;color:var(--muted);line-height:1.85}
+.panel ul.pts li::before{content:"·";position:absolute;left:2px;top:6px;color:var(--teal);font-size:1.15rem;line-height:1.3}
+.panel ul.pts b{color:var(--text);font-weight:500}
+.aside-note{margin-top:26px;padding-top:16px;border-top:1px solid var(--line);font-size:.8rem;color:var(--dim);line-height:1.9}
+.aside-note b{display:block;font-family:var(--mono);font-size:.56rem;letter-spacing:.14em;color:var(--teal);font-weight:400;margin-bottom:6px}
+.shot{margin:0;border:1px solid var(--line);border-radius:12px;overflow:hidden;background:#05080e}
+.shot img{width:100%;display:block;opacity:.92}
+.shot figcaption{position:static;padding:11px 14px;border-top:1px solid var(--line);font-family:var(--mono);font-size:.58rem;line-height:1.8;letter-spacing:.03em;color:var(--dim);background:rgba(255,255,255,.025)}
+
+/* ============================================================
+   11. Scenes
+   ============================================================ */
+.scene-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+.scene{padding:24px;min-height:210px;display:flex;flex-direction:column}
+.scene .tag{font-family:var(--mono);font-size:.56rem;letter-spacing:.14em;color:var(--dim)}
+.scene h3{font-size:1rem;margin-top:14px;line-height:1.5}
+.scene p{font-size:.82rem;color:var(--muted);line-height:1.85;margin-top:9px}
+.scene .q{margin-top:auto;padding-top:16px;font-family:var(--mono);font-size:.64rem;color:var(--teal);line-height:1.8;border-top:1px dashed var(--line)}
+.scene .q span{color:var(--dim)}
+
+/* ============================================================
+   12. Inverted bounds
+   ============================================================ */
+.invert{
+  background:var(--paper);color:var(--ink);padding:96px 0;position:relative;z-index:2;
+  box-shadow:0 -1px 0 rgba(0,0,0,.06)
+}
+.invert::before{
+  content:"";position:absolute;inset:0;opacity:.5;pointer-events:none;
+  background-image:radial-gradient(rgba(21,23,28,.11) 1px,transparent 1px);background-size:22px 22px;
+  -webkit-mask-image:linear-gradient(transparent,#000 20%,#000 80%,transparent);
+  mask-image:linear-gradient(transparent,#000 20%,#000 80%,transparent)
+}
+.invert .sec-idx{color:#7a6a4a;border-top-color:rgba(21,23,28,.2)}
+.invert .sec-idx em{color:rgba(21,23,28,.45)}
+.invert h2{color:var(--ink)}
+.invert .lede{color:var(--ink-2)}
+.spec{border-top:1px solid rgba(21,23,28,.24);margin-top:8px}
+.spec-row{display:grid;grid-template-columns:1.1fr 1.1fr .9fr;gap:24px;padding:18px 0;border-bottom:1px solid rgba(21,23,28,.14);align-items:start}
+.spec-row.head{font-family:var(--mono);font-size:.56rem;letter-spacing:.14em;color:rgba(21,23,28,.5);padding:10px 0}
+.spec-row h3{font-size:.94rem;font-weight:600;line-height:1.6}
+.spec-row p{font-size:.86rem;line-height:1.85;color:var(--ink-2)}
+.spec-row .risk{font-family:var(--mono);font-size:.72rem;line-height:1.8;color:#7c3f2a}
+.gaps{margin-top:52px;display:grid;grid-template-columns:repeat(2,1fr);gap:12px 40px}
+.gap{display:grid;grid-template-columns:auto 1fr;gap:10px;font-size:.82rem;color:var(--ink-2);line-height:1.8;padding-top:10px;border-top:1px solid rgba(21,23,28,.14)}
+.gap b{font-family:var(--mono);font-weight:400;font-size:.62rem;color:#8a4a2f;letter-spacing:.08em;padding-top:3px}
+.gap strong{color:var(--ink);font-weight:600}
+
+/* ============================================================
+   13. Numbers
+   ============================================================ */
+.num-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);border:1px solid var(--line);border-radius:14px;overflow:hidden}
+.nc{background:#060911;padding:24px 20px;min-height:132px;display:flex;flex-direction:column;justify-content:space-between;transition:background .25s}
+.nc:hover{background:#080d17}
+.nc .k{font-family:var(--mono);font-size:.56rem;letter-spacing:.12em;color:var(--dim);text-transform:uppercase}
+.nc .v{font-family:var(--mono);font-size:clamp(1.5rem,2.4vw,2.05rem);letter-spacing:-.03em;line-height:1.1;margin-top:12px}
+.nc .v small{font-size:.7rem;color:var(--muted);letter-spacing:0;margin-left:2px}
+.nc .note{font-size:.7rem;color:var(--dim);margin-top:8px;line-height:1.6}
+.nc.hl .v{color:var(--teal)}
+.recall-bars{margin-top:28px;border:1px solid var(--line);border-radius:14px;padding:22px 24px;background:rgba(255,255,255,.02)}
+.rb{display:grid;grid-template-columns:170px 1fr 62px;gap:14px;align-items:center;padding:8px 0}
+.rb span{font-size:.78rem;color:var(--muted)}
+.rb .t{grid-column:2;height:6px;background:rgba(255,255,255,.06);border-radius:6px;overflow:hidden}
+.rb .t i{display:block;height:100%;border-radius:6px;width:0;transition:width 1.2s var(--ease)}
+.rb b{font-family:var(--mono);font-size:.72rem;text-align:right;font-weight:400}
+.rb-caption{font-family:var(--mono);font-size:.62rem;color:var(--dim);margin-top:14px;letter-spacing:.04em;line-height:1.8}
+
+/* ============================================================
+   14. Start
+   ============================================================ */
+.start{display:grid;grid-template-columns:.86fr 1.14fr;gap:48px;align-items:start}
+.start-steps li{display:grid;grid-template-columns:26px 1fr;gap:14px;padding:16px 0;border-top:1px solid var(--line)}
+.start-steps li:last-child{border-bottom:1px solid var(--line)}
+.start-steps .n{font-family:var(--mono);font-size:.62rem;color:var(--teal);padding-top:3px}
+.start-steps h3{font-size:.94rem}
+.start-steps p{font-size:.8rem;color:var(--muted);line-height:1.8;margin-top:3px}
+.req{margin-top:18px;font-family:var(--mono);font-size:.6rem;color:var(--dim);line-height:1.9;letter-spacing:.03em}
+.big-term{border:1px solid var(--line-2);border-radius:16px;overflow:hidden;background:rgba(0,0,0,.4);position:sticky;top:100px}
+.big-term pre{padding:22px;font-size:.76rem;line-height:2.15}
+.big-term .term-bar{padding:12px 16px}
+
+/* ============================================================
+   15. Timeline + footer
+   ============================================================ */
+.tl{position:relative;margin-top:10px;padding-left:22px}
+.tl::before{content:"";position:absolute;left:3px;top:8px;bottom:8px;width:1px;background:linear-gradient(var(--teal),var(--line) 40%,transparent)}
+.tl-item{position:relative;padding:0 0 30px 26px}
+.tl-item::before{content:"";position:absolute;left:-22px;top:8px;width:7px;height:7px;border-radius:50%;background:var(--void);border:1px solid var(--teal);box-shadow:0 0 12px rgba(99,230,207,.5)}
+.tl-item .d{font-family:var(--mono);font-size:.6rem;letter-spacing:.1em;color:var(--teal)}
+.tl-item h3{font-size:1rem;margin-top:5px}
+.tl-item p{font-size:.82rem;color:var(--muted);line-height:1.85;margin-top:5px;max-width:720px}
+
+.foot{border-top:1px solid var(--line);padding:64px 0 34px;position:relative;z-index:2}
+.foot-top{display:grid;grid-template-columns:1.4fr .6fr .6fr;gap:40px;padding-bottom:44px;border-bottom:1px solid var(--line)}
+.foot h4{font-family:var(--mono);font-size:.56rem;letter-spacing:.16em;color:var(--dim);text-transform:uppercase;margin-bottom:14px}
+.foot-links li{padding:5px 0}
+.foot-links a{font-size:.84rem;color:var(--muted);transition:color .2s}
+.foot-links a:hover{color:var(--teal)}
+.foot-brand p{margin-top:14px;color:var(--dim);font-size:.8rem;line-height:1.9;max-width:340px}
+.foot-word{
+  font-size:clamp(2.6rem,9vw,7rem);line-height:.95;letter-spacing:-.06em;font-weight:600;
+  background:linear-gradient(180deg,rgba(255,255,255,.22),rgba(255,255,255,.035));
+  -webkit-background-clip:text;background-clip:text;color:transparent;margin-top:40px;user-select:none
+}
+.foot-bot{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-top:18px;font-family:var(--mono);font-size:.58rem;letter-spacing:.08em;color:var(--dim)}
+
+/* ============================================================
+   16. Responsive
+   ============================================================ */
+@media (max-width:1120px){
+  .rail{display:none}
+  .hero-grid{grid-template-columns:1fr;gap:40px}
+  .flow{height:400px;max-width:620px}
+  .hero{min-height:auto;padding-top:118px}
+  .journey{grid-template-columns:240px 1fr;gap:44px}
+  .physics{grid-template-columns:1fr;gap:34px}
+  .mod-row{grid-template-columns:130px 1fr}
+}
+@media (max-width:900px){
+  .nav-links{display:none}
+  .nav-cta{display:none}
+  .burger{display:flex}
+  .sym-grid{grid-template-columns:1fr}
+  .scene-grid{grid-template-columns:1fr 1fr}
+  .num-grid{grid-template-columns:1fr 1fr}
+  .panel.on{grid-template-columns:1fr}
+  .start{grid-template-columns:1fr}
+  .big-term{position:static}
+  .loop{grid-template-columns:1fr}
+  .ring-wrap{max-width:420px}
+  .mod-sum{grid-template-columns:1fr 1fr}
+  .anatomy-foot{grid-template-columns:1fr 1fr}
+  .invert .spec-row{grid-template-columns:1fr 1fr}
+  .spec-row.head{display:none}
+  .spec-row .risk{grid-column:1/-1}
+  .gaps{grid-template-columns:1fr}
+  .journey{grid-template-columns:1fr}
+  .j-side{position:static;margin-bottom:8px}
+  .j-list{display:none}
+  .j-meter{display:none}
+  .j-side .kicker{margin-bottom:0}
+  .foot-top{grid-template-columns:1fr 1fr}
+  .foot-brand{grid-column:1/-1}
+}
+@media (max-width:620px){
+  .wrap{width:calc(100% - 36px)}
+  .sec{padding:76px 0}
+  .sec-head{grid-template-columns:1fr;gap:10px;margin-bottom:36px}
+  .sec-idx{border-top:0;padding-top:0}
+  .sec-idx em{display:inline;margin-left:8px}
+  .band-grid{grid-template-columns:1fr 1fr}
+  .band-cell:nth-child(2){border-right:0}
+  .band-cell:nth-child(1),.band-cell:nth-child(2){border-bottom:1px solid var(--line)}
+  .scene-grid{grid-template-columns:1fr}
+  .layer-inner{grid-template-columns:1fr;padding-left:0;gap:18px}
+  .layer-btn{grid-template-columns:36px 1fr auto;gap:10px}
+  .mod-row{grid-template-columns:1fr;gap:8px}
+  .invert{padding:70px 0}
+  .pull{grid-template-columns:1fr;gap:14px}
+  .rb{grid-template-columns:1fr 60px}
+  .rb .t{grid-column:1/-1;order:3}
+  .num-grid{grid-template-columns:1fr}
+  .foot-word{font-size:16vw}
+  .hero h1{font-size:clamp(2.1rem,9vw,2.8rem)}
+  .flow{height:330px}
+  .step .ev,.term pre,.big-term pre,.code pre{white-space:pre-wrap;word-break:break-word;font-size:.64rem;line-height:1.95}
+  .spec-row .risk::before{content:"残余风险 · ";opacity:.65}
+  .flow-label.pack{display:none}
+  .flow-label.gate{left:50%;font-size:.5rem}
+  .loop-list li{grid-template-columns:64px 1fr}
+}
+@media (prefers-reduced-motion:reduce){
+  html{scroll-behavior:auto}
+  *,*::before,*::after{animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important}
+  .rv{opacity:1;transform:none}
+}
+</style>
+</head>
+<body>
+<div id="progress"></div>
+
+<header class="nav" id="nav">
+  <div class="nav-inner">
+    <a class="brand" href="#top" aria-label="HippoMind 首页">
+      <svg viewBox="0 0 32 32" fill="none" aria-hidden="true">
+        <circle cx="16" cy="16" r="13.2" stroke="rgba(99,230,207,.55)" stroke-width="1"/>
+        <circle cx="16" cy="16" r="8.4" stroke="rgba(167,139,250,.6)" stroke-width="1"/>
+        <circle cx="16" cy="16" r="3.2" fill="#63e6cf"/>
+        <circle cx="26" cy="10" r="1.5" fill="#a78bfa"/>
+      </svg>
+      <b>HippoMind</b><span>memory hub</span>
+    </a>
+    <nav class="nav-links" aria-label="主导航">
+      <a href="#journey" data-spy="journey">旅程</a>
+      <a href="#anatomy" data-spy="anatomy">解剖</a>
+      <a href="#physics" data-spy="physics">物理</a>
+      <a href="#loop" data-spy="loop">环路</a>
+      <a href="#entry" data-spy="entry">入口</a>
+      <a href="#scenes" data-spy="scenes">现场</a>
+      <a href="#bounds" data-spy="bounds">边界</a>
+      <a href="#start" data-spy="start">上手</a>
+    </nav>
+    <a class="nav-cta" href="#start">
+      三分钟跑起来
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+    </a>
+    <button class="burger" id="burger" aria-label="打开菜单" aria-expanded="false"><span></span></button>
+  </div>
+</header>
+
+<div class="mobile-menu" id="mobileMenu">
+  <a href="#journey"><em>01</em>一次请求的旅程</a>
+  <a href="#anatomy"><em>02</em>四层解剖</a>
+  <a href="#physics"><em>03</em>记忆的物理</a>
+  <a href="#loop"><em>04</em>自动环路</a>
+  <a href="#entry"><em>05</em>四种入口</a>
+  <a href="#scenes"><em>06</em>现场</a>
+  <a href="#bounds"><em>07</em>边界</a>
+  <a href="#start"><em>08</em>上手</a>
+</div>
+
+<nav class="rail" aria-label="章节索引">
+  <a href="#journey" data-spy="journey"><span>旅程</span><i></i></a>
+  <a href="#anatomy" data-spy="anatomy"><span>解剖</span><i></i></a>
+  <a href="#physics" data-spy="physics"><span>物理</span><i></i></a>
+  <a href="#loop" data-spy="loop"><span>环路</span><i></i></a>
+  <a href="#modules" data-spy="modules"><span>模块</span><i></i></a>
+  <a href="#entry" data-spy="entry"><span>入口</span><i></i></a>
+  <a href="#scenes" data-spy="scenes"><span>现场</span><i></i></a>
+  <a href="#bounds" data-spy="bounds"><span>边界</span><i></i></a>
+  <a href="#numbers" data-spy="numbers"><span>读数</span><i></i></a>
+  <a href="#start" data-spy="start"><span>上手</span><i></i></a>
+</nav>
+
+<main id="top">
+
+<!-- ============ HERO ============ -->
+<section class="hero">
+  <div class="wrap">
+    <div class="hero-grid">
+      <div>
+        <div class="eyebrow">本机多 Agent 记忆中枢 · v2 自动环路</div>
+        <h1>
+          <span class="line">记忆不是</span>
+          <span class="line">上下文窗口，</span>
+          <span class="line">是<em>器官</em>。</span>
+        </h1>
+        <p class="lede">
+          大模型有皮层，却没有海马体——它读得懂一切，却学不会经验。
+          HippoMind 在你的机器上外接一套会升权、会遗忘、会自我修正的记忆系统，
+          让十几个 Agent 共享同一本会生长的账本。
+        </p>
+        <div class="hero-cta">
+          <a class="btn btn-primary" href="#journey">
+            看一次请求的旅程
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+          </a>
+          <a class="btn btn-ghost" href="#start">
+            三分钟跑起来
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 4l14 8-14 8V4z"/></svg>
+          </a>
+        </div>
+        <div class="hero-meta">
+          <span>单文件 SQLite</span><span>事件溯源</span><span>零外呼</span><span>MIT</span>
+        </div>
+      </div>
+
+      <figure class="flow" aria-label="记忆漏斗示意：大量原始证据经过门控，只有极少条目进入上下文">
+        <canvas id="flowCanvas"></canvas>
+        <span class="flow-label gate">门控 · GATE</span>
+        <span class="flow-label pack">上下文包</span>
+        <div class="flow-foot">
+          <span>RAW EVIDENCE → <b>8 ITEMS</b></span>
+          <span class="mono">6,000 TOKENS / 16,000 CHARS</span>
+        </div>
+      </figure>
+    </div>
+
+    <div class="hero-scroll"><i></i>向下 · 看它如何想起</div>
+  </div>
+</section>
+
+<div class="band">
+  <div class="wrap">
+    <div class="band-grid">
+      <div class="band-cell"><b>26.7<span>万</span></b><small>生产账本证据行</small></div>
+      <div class="band-cell"><b>8<span>条</span></b><small>单次注入硬上限</small></div>
+      <div class="band-cell"><b>13<span>个</span></b><small>已端到端接入 Agent</small></div>
+      <div class="band-cell"><b>0<span>次</span></b><small>对外网络请求</small></div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ SYMPTOM ============ -->
+<section class="sec" id="symptom">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="sec-idx">01<em>SYMPTOM</em></div>
+      <div>
+        <h2 class="rv">失忆不是记性差，<br>是记忆没有形状。</h2>
+        <p class="lede rv" data-d="1">三个真实的失效现场。它们都不缺「存储」，缺的是「在该想起的时候，想起对的那一条」。</p>
+      </div>
+    </div>
+
+    <div class="sym-grid">
+      <article class="card sym rv">
+        <svg class="glyph" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="1.2" aria-hidden="true">
+          <rect x="3" y="5" width="11" height="10" rx="1.5"/><rect x="18" y="5" width="11" height="10" rx="1.5"/>
+          <rect x="3" y="19" width="11" height="8" rx="1.5"/><rect x="18" y="19" width="11" height="8" rx="1.5"/>
+          <path d="M14 10h4M14 23h4" stroke-dasharray="2 2"/>
+        </svg>
+        <h3>换班即归零</h3>
+        <p>同一个仓库，Claude 记得部署端口，Codex 不知道。每个 Agent 各有一本写不进去的日记，经验随会话结束蒸发。</p>
+      </article>
+
+      <article class="card sym rv" data-d="1">
+        <svg class="glyph v" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="1.2" aria-hidden="true">
+          <path d="M4 26V6M4 26h24"/><path d="M8 22c4 0 3-9 7-9s3 6 7 6 4-8 4-8"/>
+          <circle cx="15" cy="13" r="1.4" fill="currentColor" stroke="none"/>
+        </svg>
+        <h3>上下文不是记忆</h3>
+        <p>把三个月的历史一股脑塞进 prompt：token 花在重复上，真正的结论被埋在四百行日志里，模型照样错过。</p>
+      </article>
+
+      <article class="card sym rv" data-d="2">
+        <svg class="glyph a" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="1.2" aria-hidden="true">
+          <path d="M6 9h9M6 16h13M6 23h7"/><path d="M22 12l6 6M28 12l-6 6" stroke-linecap="round"/>
+          <circle cx="22" cy="23" r="4"/>
+        </svg>
+        <h3>说错了没人对账</h3>
+        <p>两条互相矛盾的结论同时躺在记录里；半年后没人说得清哪条先成立、被谁推翻、当时依据什么。</p>
+      </article>
+    </div>
+
+    <div class="pull rv">
+      <div class="sec-idx" style="border:0">所以</div>
+      <div>
+        <q>「存下来」早就不是难题。<b>「取用」</b>才是——<br>而取用的前提，是先学会<b>遗忘</b>。</q>
+        <small>HIPPOMIND / DESIGN PREMISE</small>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ JOURNEY ============ -->
+<section class="sec" id="journey">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="sec-idx">02<em>JOURNEY</em></div>
+      <div>
+        <h2 class="rv">一次请求的一生</h2>
+        <p class="lede rv" data-d="1">从你在编辑器里敲下第一行字，到一段带证据的记忆被塞进模型上下文，中间只有 200 毫秒——但要走完七道工序。每道工序都有明确的拒绝权。</p>
+      </div>
+    </div>
+
+    <div class="journey">
+      <aside class="j-side">
+        <div class="kicker">REQUEST LIFECYCLE / 07 STEPS</div>
+        <ul class="j-list" id="jList">
+          <li><button class="on" data-step="0"><i>01</i><span>捕获 · 不用写标记</span></button></li>
+          <li><button data-step="1"><i>02</i><span>提炼 · 流水账变断言</span></button></li>
+          <li><button data-step="2"><i>03</i><span>取候选 · 先缩小再排序</span></button></li>
+          <li><button data-step="3"><i>04</i><span>过门 · 无关就不注入</span></button></li>
+          <li><button data-step="4"><i>05</i><span>组装 · 预算是硬边界</span></button></li>
+          <li><button data-step="5"><i>06</i><span>注入 · 带着镣铐说话</span></button></li>
+          <li><button data-step="6"><i>07</i><span>反馈 · 结果才算数</span></button></li>
+        </ul>
+        <div class="j-meter"><i id="jMeter"></i></div>
+      </aside>
+
+      <div class="j-body" id="jBody">
+        <article class="step on">
+          <div class="step-top"><span class="num">STEP 01 / CAPTURE</span></div>
+          <h3>不需要在提问里写「记忆：」</h3>
+          <p>daemon 每 <b>60 秒</b>增量读取 Claude Code、Codex、Gemini / Antigravity、Pi 的原生会话文件；DSH 由 Cordis 插件在会话结束时按 <b>seq_span</b> 写回。每个来源一条独立游标，只消费以换行结尾的完整行——写者写到一半，游标就不前进。</p>
+          <div class="ev">source_cursors · claude   offset 4,182,503   +12 msgs
+source_cursors · codex    offset 1,204,881   +3 msgs
+source_cursors · pi       offset   318,442   +0 msgs
+<span class="c"># 单文件损坏只影响该文件，绝不拖垮整轮采集</span></div>
+          <div class="chips"><span class="chip teal">6 个来源</span><span class="chip">单条 ≤ 4000 字符</span><span class="chip">工具/系统文本不入账</span></div>
+        </article>
+
+        <article class="step">
+          <div class="step-top"><span class="num">STEP 02 / DISTILL</span></div>
+          <h3>把流水账，压成可对账的断言</h3>
+          <p>每 <b>5 分钟</b>取 16 条未提炼记忆：一半来自结构化投影，一半来自最新原始会话。本机 <b>claude -p</b> 抽出 <span class="mono">subject / predicate / slot_key / value / confidence</span>；解析失败回退确定性抽取，连续两次失败熔断 10 分钟，成功后立即复位。</p>
+          <div class="ev">claim  <b>hippomind.daemon.port</b> = 8765   conf 0.94
+       evidence  memory:mem_8f31c2
+       source    hippomind-distill
+<span class="c"># 同一 subject 的连续提炼自动建 related_to 因果边</span></div>
+          <div class="chips"><span class="chip violet">双队列</span><span class="chip">distill:&lt;id&gt; 幂等游标</span><span class="chip amber">熔断器</span></div>
+        </article>
+
+        <article class="step">
+          <div class="step-top"><span class="num">STEP 03 / RETRIEVE</span></div>
+          <h3>先缩小，再排序——而不是先算相似度</h3>
+          <p>作用域、项目、来源、生命周期、有效期先做硬过滤，把候选压到可控规模。然后 FTS5 trigram 与 LIKE 双通道召回，实体索引作为第三路信号，按相关、新鲜、重要、效用、触碰融合排序。</p>
+          <div class="ev">filter  scope=shared · task=… · valid_until=null
+fts     "数据库 端口"  → 12 hits
+like    "数据库 端口"  → 31 hits
+rrf     fused 28 candidates
+rank    score 0.71 / 0.64 / 0.58 …</div>
+          <div class="chips"><span class="chip teal">FTS5 trigram</span><span class="chip">LIKE 兜底</span><span class="chip">实体扩展</span></div>
+        </article>
+
+        <article class="step">
+          <div class="step-top"><span class="num">STEP 04 / GATE</span></div>
+          <h3>无关的问题，一条都不许注入</h3>
+          <p>自动路径固定 <b>min_score = 0.20</b>，并且候选必须真有 FTS 命中，或查询覆盖率 ≥ 0.6。没有这道门，「最近发生过」的无关记忆会凭时间与触碰分混进来——这是记忆系统最典型的污染方式。</p>
+          <div class="ev">query  "今天天气怎么样"
+score  0.31   fts 0   coverage 0.20
+gate   <span class="off">✕ skip</span>
+
+query  "HippoMind 数据库选型"
+score  0.68   fts 4   coverage 0.75
+gate   <b>✓ inject</b>   1 item / 629 chars</div>
+          <div class="chips"><span class="chip teal">两道门</span><span class="chip">无关 → 空包</span><span class="chip">空包也带原因</span></div>
+        </article>
+
+        <article class="step">
+          <div class="step-top"><span class="num">STEP 05 / COMPOSE</span></div>
+          <h3>预算，是一道物理边界</h3>
+          <p>最多 <b>8 项</b>、<b>6,000 token</b>、<b>16,000 字符</b>。候选先按内容折叠，把同一句话的多次抓取压成一条；再用 MMR 排序，在相关性与多样性之间留出位置，而不是让同一结论占满整个包。</p>
+          <div class="ev">mmr = <b>0.74 × relevance</b>
+      − 0.18 × similarity
+      + 0.08 × new_coverage
+
+select 8 / 28   tokens 2,914 / 6,000   chars 9,732 / 16,000</div>
+          <div class="chips"><span class="chip">内容折叠</span><span class="chip">MMR + 覆盖度奖励</span><span class="chip">硬上限</span></div>
+        </article>
+
+        <article class="step">
+          <div class="step-top"><span class="num">STEP 06 / INJECT</span></div>
+          <h3>它只是参考数据，不是新的命令</h3>
+          <p>整包用动态 nonce 包裹、做 XML 实体转义，并明确标注为<b>不可信参考数据</b>。原始聊天默认不进包。每次注入只写一行 trace：agent、查询哈希、条目数、字符数——不存原文，但每一次都能复盘。</p>
+          <div class="ev">{"at":"2026-10-24T00:16:24-0700","agent":"codex",
+ "source":"codex-hook","query_hash":"9e1364431c24c7d5",
+ "query_chars":13,"items":1,"chars":629,"injected":true}</div>
+          <div class="chips"><span class="chip teal">nonce 包裹</span><span class="chip">untrusted 标注</span><span class="chip">留痕不留原文</span></div>
+        </article>
+
+        <article class="step">
+          <div class="step-top"><span class="num">STEP 07 / FEEDBACK</span></div>
+          <h3>只有真实结果，才能加固一条记忆</h3>
+          <p>被召回只做小幅饱和升权：<b>+0.018 × (1 − w)</b>。真正的强化来自环境、用户或评测器的反馈；utility 与 weight 一起进入下一次排序。模型自己说「这次干得不错」不算证据。</p>
+          <div class="ev">recall     weight 0.62 → 0.625   <span class="c">（小幅）</span>
+feedback   signal +0.8              <span class="c">（线上验证通过）</span>
+utility    0.00 → 0.64
+next rank  ↑ 3 positions</div>
+          <div class="chips"><span class="chip teal">两阶段反馈</span><span class="chip">召回 ≠ 信用</span><span class="chip">可审计</span></div>
+        </article>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ ANATOMY ============ -->
+<section class="sec" id="anatomy">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="sec-idx">03<em>ANATOMY</em></div>
+      <div>
+        <h2 class="rv">四层解剖</h2>
+        <p class="lede rv" data-d="1">它不是又一个向量库。整套系统只有四层，层与层之间靠一份不可变的事件账本连接——所以任何一层坏了，都能被重建，而不是被猜。</p>
+      </div>
+    </div>
+
+    <div class="layers" id="layers">
+      <div class="layer open">
+        <button class="layer-btn" aria-expanded="true">
+          <span class="ln">L1</span>
+          <span class="lt"><b>采集层</b><em>把散落在各处的会话，变成可追溯的证据</em></span>
+          <span class="arrow"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M6 9l6 6 6-6"/></svg></span>
+        </button>
+        <div class="layer-body"><div><div class="layer-inner">
+          <div class="mods">
+            <span class="chip">watcher.py</span><span class="chip">transcripts.py</span><span class="chip">gemini_capture.py</span>
+            <span class="chip">pi_capture.py</span><span class="chip">cursor_capture.py</span><span class="chip">dsh-plugin/</span>
+            <span class="chip">provider_manifest.py</span>
+          </div>
+          <ul class="guarantees">
+            <li>只采 user / assistant；工具、system、developer 转录不进入共享账本</li>
+            <li>写入前过滤环境变量、命令输出与审批文本，单条上限 4,000 字符</li>
+            <li>符号链接与非普通文件忽略；文件被截断时从头重扫</li>
+            <li>未知 Agent 只报告、不修改——不往看不懂的配置里写东西</li>
+          </ul>
+        </div></div></div>
+      </div>
+
+      <div class="layer">
+        <button class="layer-btn" aria-expanded="false">
+          <span class="ln">L2</span>
+          <span class="lt"><b>存储层</b><em>一个文件，一本不可篡改的账</em></span>
+          <span class="arrow"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M6 9l6 6 6-6"/></svg></span>
+        </button>
+        <div class="layer-body"><div><div class="layer-inner">
+          <div class="mods">
+            <span class="chip">ledger/</span><span class="chip">schema.py v8</span><span class="chip">identity.py</span>
+            <span class="chip">lifecycle.py</span><span class="chip">forgetting.py</span><span class="chip">crypto_stream.py</span>
+          </div>
+          <ul class="guarantees">
+            <li><b style="color:#e9edf5">ledger_events 只追加</b>：每次写入先落不可变审计流</li>
+            <li>memories 是可重建的检索投影，改错能回滚，历史不能篡改</li>
+            <li>SQLite / WAL：备份就是复制文件，恢复先核 sha256</li>
+            <li>身份键剥离时间戳与 harness 包裹，同一条消息不会被重复入库</li>
+          </ul>
+        </div></div></div>
+      </div>
+
+      <div class="layer">
+        <button class="layer-btn" aria-expanded="false">
+          <span class="ln">L3</span>
+          <span class="lt"><b>服务层</b><em>只对本机说话，只交付最小必要</em></span>
+          <span class="arrow"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M6 9l6 6 6-6"/></svg></span>
+        </button>
+        <div class="layer-body"><div><div class="layer-inner">
+          <div class="mods">
+            <span class="chip">daemon.py</span><span class="chip">context_pack.py</span><span class="chip">mcp.py</span>
+            <span class="chip">cli/</span><span class="chip">gui_api.py</span><span class="chip">injection_*.py</span>
+          </div>
+          <ul class="guarantees">
+            <li>只绑定 127.0.0.1；拒绝绑定任何非回环地址</li>
+            <li>token 以 0600 存放，每请求校验；token 绑定账本指纹</li>
+            <li>scope 隔离：受限凭据跨作用域读取直接 403</li>
+            <li>--read-only 让镜像机在物理上不可能误写主库</li>
+          </ul>
+        </div></div></div>
+      </div>
+
+      <div class="layer">
+        <button class="layer-btn" aria-expanded="false">
+          <span class="ln">L4</span>
+          <span class="lt"><b>消费层</b><em>十几种用法，同一份事实</em></span>
+          <span class="arrow"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M6 9l6 6 6-6"/></svg></span>
+        </button>
+        <div class="layer-body"><div><div class="layer-inner">
+          <div class="mods">
+            <span class="chip">Codex Hook</span><span class="chip">DSH Plugin</span><span class="chip">MCP stdio</span>
+            <span class="chip">托管规则</span><span class="chip">Atlas /ui</span><span class="chip">CLI</span>
+            <span class="chip">HTTP API</span>
+          </div>
+          <ul class="guarantees">
+            <li>接入分级：原生 Hook &gt; 原生插件 &gt; MCP profile &gt; 托管规则</li>
+            <li>同一个 on / off / toggle / status 注入开关，作用于所有 Agent</li>
+            <li>规则文件只改托管段，段外用户内容一个字节都不动</li>
+            <li>安装后做真实 stdio initialize + tools/list 握手验证，而不是看配置里有没有关键字</li>
+          </ul>
+        </div></div></div>
+      </div>
+    </div>
+
+    <div class="anatomy-foot rv">
+      <div class="af"><b>EVENTS → MEMORIES</b>追加 → 投影</div>
+      <div class="af"><b>SCHEMA v8</b>迁移链可演练</div>
+      <div class="af"><b>127.0.0.1</b>默认不外露</div>
+      <div class="af"><b>SINGLE FILE</b>备份 = 复制</div>
+    </div>
+    <p class="sec-note rv">数据层不反向依赖演示模块：`import hippomind.ledger` 不会加载 matplotlib，边界由测试锁死。</p>
+  </div>
+</section>
+
+<!-- ============ PHYSICS ============ -->
+<section class="sec" id="physics">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="sec-idx">04<em>PHYSICS</em></div>
+      <div>
+        <h2 class="rv">记忆的物理</h2>
+        <p class="lede rv" data-d="1">升权很轻，遗忘很慢，而回忆不会让时间倒流。下面这条曲线不是示意——它就是账本里每天都在跑的公式。</p>
+      </div>
+    </div>
+
+    <div class="physics">
+      <div class="lab rv">
+        <div class="lab-head">
+          <div>
+            <div class="t">DECAY · 样本 A 初始权重 0.92</div>
+            <div class="v" id="decayVal">0.723<small>w</small></div>
+          </div>
+          <div class="t" style="text-align:right">经过 <b id="decayDays" class="mono" style="color:#e9edf5">30</b> 天<br><span style="color:#63718b">λ = 0.008 / 天</span></div>
+        </div>
+
+        <svg id="decayChart" viewBox="0 0 520 236" role="img" aria-label="记忆权重随时间指数衰减曲线">
+          <defs>
+            <linearGradient id="areaG" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="#63e6cf" stop-opacity=".24"/>
+              <stop offset="100%" stop-color="#63e6cf" stop-opacity="0"/>
+            </linearGradient>
+          </defs>
+          <g stroke="rgba(255,255,255,.07)" stroke-width="1">
+            <line x1="36" y1="18" x2="508" y2="18"/>
+            <line x1="36" y1="66" x2="508" y2="66"/>
+            <line x1="36" y1="114" x2="508" y2="114"/>
+            <line x1="36" y1="162" x2="508" y2="162"/>
+            <line x1="36" y1="210" x2="508" y2="210"/>
+          </g>
+          <g fill="#7d8aa2" font-family="SF Mono,monospace" font-size="9">
+            <text x="30" y="21" text-anchor="end">1.0</text>
+            <text x="30" y="117" text-anchor="end">0.5</text>
+            <text x="30" y="213" text-anchor="end">0</text>
+            <text x="36" y="228">0d</text>
+            <text x="272" y="228" text-anchor="middle">180d</text>
+            <text x="508" y="228" text-anchor="end">365d</text>
+          </g>
+          <path id="decayArea" fill="url(#areaG)" d=""/>
+          <path id="decayPath" fill="none" stroke="#63e6cf" stroke-width="1.8" stroke-linecap="round" d=""/>
+          <line id="halfLine" x1="0" y1="18" x2="0" y2="210" stroke="rgba(167,139,250,.45)" stroke-width="1" stroke-dasharray="3 4"/>
+          <text id="halfText" fill="#a78bfa" font-family="SF Mono,monospace" font-size="8">半衰期 86.6d</text>
+          <line id="nowLine" x1="0" y1="18" x2="0" y2="210" stroke="rgba(255,255,255,.35)" stroke-width="1" stroke-dasharray="2 3"/>
+          <circle id="nowDot" r="3.6" fill="#63e6cf"/>
+          <circle id="nowHalo" r="7" fill="none" stroke="rgba(99,230,207,.35)" stroke-width="1"/>
+          <line id="floorLine" x1="36" y1="0" x2="508" y2="0" stroke="rgba(240,121,111,.4)" stroke-width="1" stroke-dasharray="3 4"/>
+          <text id="floorText" fill="#f0796f" font-family="SF Mono,monospace" font-size="8.5" text-anchor="start">底线 0.02</text>
+        </svg>
+
+        <input id="decayRange" type="range" min="0" max="365" step="1" value="30" aria-label="选择经过的天数">
+        <div class="lab-scale"><span>今天</span><span>+90 天</span><span>+180 天</span><span>+365 天</span></div>
+
+        <div class="mems">
+          <div class="mem-row" data-w0="0.92"><span>上线验证过的端口</span><b>0.92</b><div class="track"><i></i></div></div>
+          <div class="mem-row" data-w0="0.55"><span>一次失败的重试</span><b>0.55</b><div class="track"><i></i></div></div>
+          <div class="mem-row" data-w0="0.31"><span>三个月前的偏好</span><b>0.31</b><div class="track"><i></i></div></div>
+        </div>
+      </div>
+
+      <div class="rv" data-d="1">
+        <div class="formula">
+w(t) = max( 0.02 , <em>w₀</em> · e<sup>−0.008·t</sup> )
+半衰期 = ln2 / 0.008 ≈ <em>86.6</em> 天
+        </div>
+        <p class="f-note">参数取自 lifecycle.py 默认配置；到期先降为 cold，不立即删除。</p>
+
+        <div class="weights">
+          <div class="w-row"><span>文本相关</span><div class="bar"><i style="width:100%;background:#63e6cf"></i></div><b>.50</b></div>
+          <div class="w-row"><span>情感共鸣</span><div class="bar"><i style="width:50%;background:#a78bfa"></i></div><b>.25</b></div>
+          <div class="w-row"><span>时间亲近</span><div class="bar"><i style="width:30%;background:#f3b96b"></i></div><b>.15</b></div>
+          <div class="w-row"><span>触碰频率</span><div class="bar"><i style="width:20%;background:#7f8da6"></i></div><b>.10</b></div>
+        </div>
+        <div class="formula" style="margin-top:16px">
+score = (四维加权) × 可靠度 × 重要性 × (1 + 驱力偏置)
+        </div>
+
+        <div class="rules">
+          <div class="rule"><span><b>回忆不重置计时器。</b>被想起只增加 touch，last_active 不动——旧记忆不会因为被想起就变新。</span></div>
+          <div class="rule"><span><b>强化必须来自结果。</b>召回只做 +0.018×(1−w) 的饱和升权；utility 由外部反馈写入。</span></div>
+          <div class="rule"><span><b>遗忘是可解释的。</b>每条降权都带原因、幅度与输入参数，进入 <span class="mono">decay</span> 审计事件。</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ LOOP ============ -->
+<section class="sec" id="loop">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="sec-idx">05<em>AUTOMATION</em></div>
+      <div>
+        <h2 class="rv">装完就忘的生产线</h2>
+        <p class="lede rv" data-d="1">v2 的核心不是多了一个功能，而是取消了「标记」这个动作。采集、提炼、门控、裁决、巩固，五道工序在后台自己转，留下可审计的痕迹。</p>
+      </div>
+    </div>
+
+    <div class="loop">
+      <div class="ring-wrap rv">
+        <svg viewBox="0 0 480 480" role="img" aria-label="自动记忆环路：采集、提炼、门控、裁决、巩固">
+          <defs>
+            <radialGradient id="coreG" cx="50%" cy="50%" r="50%">
+              <stop offset="0%" stop-color="#63e6cf" stop-opacity=".22"/>
+              <stop offset="100%" stop-color="#63e6cf" stop-opacity="0"/>
+            </radialGradient>
+            <filter id="glow"><feGaussianBlur stdDeviation="3" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+          </defs>
+          <circle cx="240" cy="240" r="130" fill="url(#coreG)"/>
+          <circle cx="240" cy="240" r="150" fill="none" stroke="rgba(255,255,255,.14)" stroke-width="1"/>
+          <circle class="ring-dash" cx="240" cy="240" r="150" fill="none" stroke="rgba(99,230,207,.5)" stroke-width="1.2" stroke-dasharray="3 9"/>
+          <circle cx="240" cy="240" r="108" fill="none" stroke="rgba(255,255,255,.07)" stroke-width="1" stroke-dasharray="1 6"/>
+
+          <g class="ring-node">
+            <circle cx="240" cy="90" r="17" fill="#081018" stroke="#63e6cf" stroke-width="1.2" filter="url(#glow)"/>
+            <text x="240" y="93" text-anchor="middle" fill="#63e6cf" font-family="SF Mono,monospace" font-size="8">60s</text>
+            <text x="240" y="58" text-anchor="middle" class="n-t">采集</text>
+            <text x="240" y="71" text-anchor="middle" class="n-s">CAPTURE</text>
+          </g>
+
+          <g class="ring-node">
+            <circle cx="382.7" cy="193.6" r="17" fill="#081018" stroke="#a78bfa" stroke-width="1.2" filter="url(#glow)"/>
+            <text x="382.7" y="196.6" text-anchor="middle" fill="#a78bfa" font-family="SF Mono,monospace" font-size="8">5m</text>
+            <text x="404" y="188" class="n-t">提炼</text>
+            <text x="404" y="201" class="n-s">DISTILL</text>
+          </g>
+
+          <g class="ring-node">
+            <circle cx="328.2" cy="361.4" r="17" fill="#081018" stroke="#63e6cf" stroke-width="1.2" filter="url(#glow)"/>
+            <text x="328.2" y="364.4" text-anchor="middle" fill="#63e6cf" font-family="SF Mono,monospace" font-size="8">gate</text>
+            <text x="350" y="376" class="n-t">门控</text>
+            <text x="350" y="389" class="n-s">RELEVANCE</text>
+          </g>
+
+          <g class="ring-node">
+            <circle cx="151.8" cy="361.4" r="17" fill="#081018" stroke="#f3b96b" stroke-width="1.2" filter="url(#glow)"/>
+            <text x="151.8" y="364.4" text-anchor="middle" fill="#f3b96b" font-family="SF Mono,monospace" font-size="8">±</text>
+            <text x="130" y="376" text-anchor="end" class="n-t">裁决</text>
+            <text x="130" y="389" text-anchor="end" class="n-s">CONFLICT</text>
+          </g>
+
+          <g class="ring-node">
+            <circle cx="97.3" cy="193.6" r="17" fill="#081018" stroke="#7f8da6" stroke-width="1.2"/>
+            <text x="97.3" y="196.6" text-anchor="middle" fill="#9aa8c0" font-family="SF Mono,monospace" font-size="8">10m</text>
+            <text x="76" y="188" text-anchor="end" class="n-t">巩固</text>
+            <text x="76" y="201" text-anchor="end" class="n-s">CONSOLIDATE</text>
+          </g>
+
+          <text x="240" y="232" text-anchor="middle" fill="#e9edf5" font-family="SF Mono,monospace" font-size="18" letter-spacing="1">24 / 7</text>
+          <text x="240" y="251" text-anchor="middle" fill="#63e6cf" font-family="PingFang SC,sans-serif" font-size="10" opacity=".8">无需标记 · 自动运行</text>
+          <text x="240" y="266" text-anchor="middle" fill="#4d5a72" font-family="SF Mono,monospace" font-size="7.5" letter-spacing="2">AUTONOMOUS</text>
+        </svg>
+      </div>
+
+      <div class="rv" data-d="1">
+        <ul class="loop-list">
+          <li><span class="t">每 60 秒</span><div><h3>采集</h3><p>六个来源各自增量读取；任何一路失败只写进 health，不阻塞其它来源。</p></div></li>
+          <li><span class="t">每 5 分钟</span><div><h3>提炼</h3><p>16 条 / 轮，结构化与 raw 各半。幂等游标保证重复轮次不重复写。</p></div></li>
+          <li><span class="t">每一轮请求</span><div><h3>门控注入</h3><p>分数门 + 词法证据门；无关请求直接跳过，并记录跳过原因。</p></div></li>
+          <li><span class="t">写入与提炼后</span><div><h3>冲突裁决</h3><p>领先 &gt;0.05 直接裁决；模糊时 newest-wins；两条 ≥0.9 的强断言留人工。</p></div></li>
+          <li><span class="t">空闲 &gt; 10 分钟</span><div><h3>睡眠巩固</h3><p>深维护一轮：巩固 + raw 归档 + WAL 检查点。同一空闲期只跑一次。</p></div></li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="code rv">
+      <div class="code-bar"><i></i><i></i><i></i><span style="margin-left:6px">GET /stats · 本轮形状</span></div>
+      <pre>{
+  <b>"capture"</b>:  { "files": 212, "inserted": 38, "errors": 0, "elapsed_ms": 184 },
+  <b>"distill"</b>:  { "candidates": 16, "claims": 21, "extractor": "claude",
+                "conflicts_resolved": 2 },
+  <b>"injection"</b>:{ "injected": 6, "skipped": 11, "chars": 4821 },
+  <span class="c">"health"</span>:   { "status": "READY", "dangling_claims": 0 }
+}</pre>
+    </div>
+  </div>
+</section>
+
+<!-- ============ MODULES ============ -->
+<section class="sec" id="modules">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="sec-idx">06<em>ORGANS</em></div>
+      <div>
+        <h2 class="rv">器官清单</h2>
+        <p class="lede rv" data-d="1">不讲概念，直接摊开代码。七个功能区、三十多个模块，每个都有单一职责——这也是它能在 3.7 万行核心代码上维持 144 个测试文件的原因。</p>
+      </div>
+    </div>
+
+    <div class="mod-sum rv">
+      <div class="ms"><b>37,104</b><small>核心代码行</small></div>
+      <div class="ms"><b>144</b><small>测试文件</small></div>
+      <div class="ms"><b>11</b><small>Atlas 视图</small></div>
+      <div class="ms"><b>v8</b><small>Schema 版本</small></div>
+    </div>
+
+    <div class="mod-table">
+      <div class="mod-row rv">
+        <div><h3>采集</h3><div class="cnt">CAPTURE · 7</div></div>
+        <div>
+          <div class="mods"><span class="chip">watcher.py</span><span class="chip">transcripts.py</span><span class="chip">gemini_capture.py</span><span class="chip">pi_capture.py</span><span class="chip">cursor_capture.py</span><span class="chip">dsh_install.py</span><span class="chip">provider_manifest.py</span></div>
+          <p class="duty">按来源维护增量游标；原生 Hook、Cordis 插件、MCP profile 与托管规则四种接入方式，全部走同一份清单声明。</p>
+        </div>
+      </div>
+
+      <div class="mod-row rv">
+        <div><h3>提炼</h3><div class="cnt">DISTILL · 4</div></div>
+        <div>
+          <div class="mods"><span class="chip">distill.py</span><span class="chip">session_digest.py</span><span class="chip">textutil.py</span><span class="chip">sanitize.py</span></div>
+          <p class="duty">双队列取样 → 抽 claim → 建因果边 → 幂等落账；脱敏与长度钳制在写入前完成，不把风险留到检索侧。</p>
+        </div>
+      </div>
+
+      <div class="mod-row rv">
+        <div><h3>账本</h3><div class="cnt">LEDGER · 7</div></div>
+        <div>
+          <div class="mods"><span class="chip">ledger/</span><span class="chip">schema.py</span><span class="chip">identity.py</span><span class="chip">lifecycle.py</span><span class="chip">forgetting.py</span><span class="chip">raw_extract.py</span><span class="chip">crypto_stream.py</span></div>
+          <p class="duty">事件只追加、投影可重建；双时态事实、Slot-Value 冲突下线、衰减与冷归档、加密导出都在这一层。</p>
+        </div>
+      </div>
+
+      <div class="mod-row rv">
+        <div><h3>检索</h3><div class="cnt">RETRIEVE · 7</div></div>
+        <div>
+          <div class="mods"><span class="chip">context_pack.py</span><span class="chip">entity_index.py</span><span class="chip">vector_index.py</span><span class="chip">semantic_space.py</span><span class="chip">semantic_onnx.py</span><span class="chip">query_expansion.py</span><span class="chip">time_parse.py</span></div>
+          <p class="duty">FTS + LIKE + 实体三路候选，RRF 融合后按四维与 MMR 排序；时间短语自动转 from/to 过滤。</p>
+        </div>
+      </div>
+
+      <div class="mod-row rv">
+        <div><h3>服务</h3><div class="cnt">SERVICE · 7</div></div>
+        <div>
+          <div class="mods"><span class="chip">daemon.py</span><span class="chip">mcp.py</span><span class="chip">cli/</span><span class="chip">gui_api.py</span><span class="chip">access.py</span><span class="chip">agent_config.py</span><span class="chip">hub_client.py</span></div>
+          <p class="duty">localhost HTTP + MCP stdio + 完整 CLI；token、scope、账本指纹三重校验，只读模式可整机降级。</p>
+        </div>
+      </div>
+
+      <div class="mod-row rv">
+        <div><h3>自动环路</h3><div class="cnt">LOOP · 6</div></div>
+        <div>
+          <div class="mods"><span class="chip">auto_context.py</span><span class="chip">injection.py</span><span class="chip">injection_trace.py</span><span class="chip">injection_audit.py</span><span class="chip">injection_repair.py</span><span class="chip">rule_repair.py</span></div>
+          <p class="duty">门控预取、注入留痕、注入面审计与自愈。判据是「这条路径现在能不能读到生产账本」，不是「配置里有没有关键字」。</p>
+        </div>
+      </div>
+
+      <div class="mod-row rv">
+        <div><h3>实验与呈现</h3><div class="cnt">LAB · 8</div></div>
+        <div>
+          <div class="mods"><span class="chip">hippocampus.py</span><span class="chip">drives.py</span><span class="chip">mind.py</span><span class="chip">grid_world.py</span><span class="chip">network_visualizer.py</span><span class="chip">visualizer.py</span><span class="chip">web/</span><span class="chip">llm_agent.py</span></div>
+          <p class="duty">海马体算法本体、心潮驱力、网格世界实验场，以及零构建的 Atlas 控制台。演示模块与生产账本严格解耦。</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ ENTRY ============ -->
+<section class="sec" id="entry">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="sec-idx">07<em>INTERFACES</em></div>
+      <div>
+        <h2 class="rv">四种入口，同一份事实</h2>
+        <p class="lede rv" data-d="1">你可以把它当成命令行工具、一个 MCP 服务器、一个本地 HTTP 服务，或者一个能翻账的控制台。写进去的东西，四个入口看到的是同一份。</p>
+      </div>
+    </div>
+
+    <div class="tabs" role="tablist" aria-label="接入方式">
+      <button class="on" role="tab" aria-selected="true" data-tab="cli"><em>01</em>CLI</button>
+      <button role="tab" aria-selected="false" data-tab="mcp"><em>02</em>MCP</button>
+      <button role="tab" aria-selected="false" data-tab="http"><em>03</em>HTTP</button>
+      <button role="tab" aria-selected="false" data-tab="atlas"><em>04</em>ATLAS</button>
+    </div>
+
+    <div class="panel on" id="tab-cli" role="tabpanel">
+      <div class="term">
+        <div class="term-bar"><i></i><i></i><i></i><span style="margin-left:6px">zsh — hippomind</span><button class="copy" data-copy>COPY</button></div>
+        <pre><span class="c"># 初始化、启动、写入第一条带证据的记忆</span>
+<span class="p">$</span> hippomind init
+<span class="p">$</span> hippomind start
+<span class="p">$</span> hippomind ingest --agent me --evidence <span class="s">"docs/arch.md#L12"</span> \
+    --content <span class="s">"支付服务部署在 us-west-2"</span>
+
+<span class="c"># 按任务取最小上下文，再给真实结果打分</span>
+<span class="p">$</span> hippomind context <span class="s">"支付服务部署在哪"</span> --max-items 4
+<span class="p">$</span> hippomind feedback &lt;memory_id&gt; 1.0
+
+<span class="c"># 只读体检：完整性 / FTS / 游标 / claim 一致性</span>
+<span class="p">$</span> hippomind checkup</pre>
+      </div>
+      <div>
+        <ul class="pts">
+          <li>从初始化、写入、检索到备份迁移，<b>全生命周期</b>都能在终端完成。</li>
+          <li><b>退出码即结论</b>：checkup 发现问题时 exit 1，可直接当 CI 门。</li>
+          <li><b>JSON 优先</b>：大部分命令支持 <span class="mono">--json</span>，方便接脚本与监控。</li>
+          <li>维护类命令要求独占写连接，daemon 运行时先 <span class="mono">stop</span>，避免锁冲突。</li>
+        </ul>
+        <div class="aside-note"><b>SHARED CONTRACT</b>四个入口共享同一份 token、scope 与账本指纹；写入永远只有一条路径。</div>
+      </div>
+    </div>
+
+    <div class="panel" id="tab-mcp" role="tabpanel">
+      <div class="term">
+        <div class="term-bar"><i></i><i></i><i></i><span style="margin-left:6px">MCP stdio — 11 tools</span><button class="copy" data-copy>COPY</button></div>
+        <pre><span class="c"># 一次写入所有已检测 Agent 的 MCP profile</span>
+<span class="p">$</span> hippomind install-agents --auto
+<span class="p">$</span> hippomind agent-status
+
+<span class="c"># 编辑器重启后，Agent 可直接调用：</span>
+hippomind_context_pack   <span class="c">按任务取最小上下文</span>
+hippomind_recall         <span class="c">关键词检索</span>
+hippomind_ingest         <span class="c">写入带证据的事实</span>
+hippomind_feedback       <span class="c">验证结果升降权</span>
+hippomind_conflicts      <span class="c">冲突谱系</span>
+hippomind_graph          <span class="c">实体图谱</span>
+<span class="c">… stats / injection / sync / pin / forget</span></pre>
+      </div>
+      <div>
+        <ul class="pts">
+          <li><b>11 个工具</b>，读写权限随凭据分级：受限 Agent 只能碰自己的 scope。</li>
+          <li>Resource 模板 <span class="mono">hippomind://projects/{name}/active-context</span> 可被宿主直接挂出来。</li>
+          <li>注册后做真实 <span class="mono">initialize + tools/list</span> 握手验证，不是只写配置文件。</li>
+          <li>暂不支持 MCP 的运行时，回退到托管规则，同样能自动预取。</li>
+        </ul>
+        <div class="aside-note"><b>SCOPE-AWARE</b>受限凭据只能读写自己的作用域；管理员 token 才看得到全量账本。</div>
+      </div>
+    </div>
+
+    <div class="panel" id="tab-http" role="tabpanel">
+      <div class="term">
+        <div class="term-bar"><i></i><i></i><i></i><span style="margin-left:6px">127.0.0.1:8765</span><button class="copy" data-copy>COPY</button></div>
+        <pre><span class="c"># 存活与账本指纹（防止拿 A 库 token 操作 B 库）</span>
+<span class="p">$</span> curl -s localhost:8765/health
+
+<span class="c"># 管理员令牌走请求头，不进 URL、不进日志</span>
+<span class="p">$</span> curl -s -H <span class="s">"X-HippoMind-Token: $TOKEN"</span> \
+       localhost:8765/stats
+
+<span class="p">$</span> curl -s -X POST localhost:8765/context-pack \
+       -H <span class="s">"Content-Type: application/json"</span> \
+       -d <span class="s">'{"query":"数据库端口","max_items":4}'</span>
+
+<span class="c"># Prometheus 文本指标</span>
+<span class="p">$</span> curl -s localhost:8765/metrics</pre>
+      </div>
+      <div>
+        <ul class="pts">
+          <li>默认只绑 <b>127.0.0.1</b>，拒绝绑定任何非回环地址。</li>
+          <li>keep-alive、backlog 128、请求槽位限流；8 客户端压测 48,000 行零丢失。</li>
+          <li><b>/api/v1/*</b> 是 Atlas 的只读数据面：分页有界、内容截断、管理员令牌限定。</li>
+          <li>唯一写操作是置顶与反馈，复用账本的审计路径。</li>
+        </ul>
+        <div class="aside-note"><b>LOCAL ONLY</b>拒绝绑定非回环地址；对外暴露不是配置项，而是不支持。</div>
+      </div>
+    </div>
+
+    <div class="panel" id="tab-atlas" role="tabpanel">
+      <div>
+        <ul class="pts">
+          <li><b>11 个视图</b>：脉搏、记忆库、检索、上下文、图谱、事实、年轮、端点、体检、参考、遗忘。</li>
+          <li>零构建、零第三方依赖（原生 ES Modules），不引入 npm、CDN 或外链字体。</li>
+          <li><b>⌘K</b> 命令面板，1–0 切视图，R 刷新，T 切主题，Esc 关抽屉。</li>
+          <li>页面源码不含 token 或账本路径；/ui 只服务包内静态文件，带 CSP / frame-ancestors。</li>
+        </ul>
+        <div class="chips" style="margin-top:18px">
+          <span class="chip teal">/ui 同源</span><span class="chip">一次性登录令牌</span><span class="chip">纸本档案馆 · 可切夜间</span>
+        </div>
+      </div>
+      <figure class="shot">
+        <img src="assets/memory-network.png" alt="HippoMind 全屏层状记忆网络截图，六列分别为驱力、记忆域、活跃情景、语义规则、冷归档和共通 Agent" loading="lazy">
+        <figcaption>全屏层状记忆网络（保留的实验界面）：驱力 → 域 → 情景 → 语义 → 归档 → 全机共通。连线只画真实亲和、归属与因果，不用随机线制造复杂感。</figcaption>
+      </figure>
+    </div>
+  </div>
+</section>
+
+<!-- ============ SCENES ============ -->
+<section class="sec" id="scenes">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="sec-idx">08<em>SCENES</em></div>
+      <div>
+        <h2 class="rv">现场</h2>
+        <p class="lede rv" data-d="1">它不是「更长的系统提示词」。下面六件事，是这套系统真正被用到的时刻。</p>
+      </div>
+    </div>
+
+    <div class="scene-grid">
+      <article class="card scene rv">
+        <div class="tag">SCENE 01 / HANDOVER</div>
+        <h3>换了个 Agent，接着昨天的活</h3>
+        <p>Claude 里定的方案，Codex 一开口就能查到。记忆属于账本，不属于某个客户端。</p>
+        <div class="q"><span>→</span> hippomind_recall <span>"上次部署失败的原因"</span></div>
+      </article>
+
+      <article class="card scene rv" data-d="1">
+        <div class="tag">SCENE 02 / EVIDENCE</div>
+        <h3>「你凭什么这么说？」</h3>
+        <p>每条事实都带 source / scope / 有效期 / 替代关系。过期或被替代的证据不参与召回，而不是靠模型自觉。</p>
+        <div class="q"><span>→</span> hippomind context <span>"支付服务部署在 us-west-2 的依据"</span></div>
+      </article>
+
+      <article class="card scene rv" data-d="2">
+        <div class="tag">SCENE 03 / CONFLICT</div>
+        <h3>三个说法，只留一个事实</h3>
+        <p>同一个槽位出现互斥取值时自动下线败者，保留谱系。分数接近且都是强断言，就停下来等人裁决。</p>
+        <div class="q"><span>→</span> hippomind conflicts <span>--claim clm_7f2</span></div>
+      </article>
+
+      <article class="card scene rv">
+        <div class="tag">SCENE 04 / TIME TRAVEL</div>
+        <h3>半年后回看：当时为什么这么定</h3>
+        <p>双时态让每条 claim 同时拥有「何时为真」与「何时被记录」。历史切片能回答过去，而不是把旧结论混进现在。</p>
+        <div class="q"><span>→</span> context <span>"…"</span> --as-of 2026-08-01</div>
+      </article>
+
+      <article class="card scene rv" data-d="1">
+        <div class="tag">SCENE 05 / OFFLINE</div>
+        <h3>断网、内网、合规现场</h3>
+        <p>单文件 SQLite，零外呼。需要只读镜像时，--read-only 让整台机器在物理上不可能误写主库。</p>
+        <div class="q"><span>→</span> hippomind start <span>--read-only</span></div>
+      </article>
+
+      <article class="card scene rv" data-d="2">
+        <div class="tag">SCENE 06 / PORTABILITY</div>
+        <h3>换机器，或者交给同事</h3>
+        <p>导出只带结构化事件：raw 聊天、游标、token、凭据、daemon 状态一律排除。导入幂等去重，重导零重复。</p>
+        <div class="q"><span>→</span> hippomind export <span>→ dump.jsonl →</span> import</div>
+      </article>
+    </div>
+  </div>
+</section>
+
+<!-- ============ BOUNDS (inverted) ============ -->
+<section class="invert" id="bounds">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="sec-idx">09<em>BOUNDARIES</em></div>
+      <div>
+        <h2 class="rv">边境：默认安全，<br>以及我们还没做到的事。</h2>
+        <p class="lede rv" data-d="1">记忆系统最危险的地方，是它看起来什么都记得。所以这里写两件事：默认挡住了什么，以及哪些地方仍然挡不住。</p>
+      </div>
+    </div>
+
+    <div class="spec rv">
+      <div class="spec-row head"><span>威胁</span><span>默认防线</span><span>残余风险</span></div>
+      <div class="spec-row">
+        <h3>同机其它进程读取账本</h3>
+        <p>只绑回环地址；token 文件 0600；token 绑定账本指纹，换库即失效。</p>
+        <div class="risk">同一系统账号仍是信任边界</div>
+      </div>
+      <div class="spec-row">
+        <h3>跨 Agent 记忆串味</h3>
+        <p>scope 隔离；只采 user / assistant；raw 默认不进活跃池、不进上下文包。</p>
+        <div class="risk">共享账本不是 ACL 或签名服务</div>
+      </div>
+      <div class="spec-row">
+        <h3>记忆被当成指令执行</h3>
+        <p>动态 nonce 包裹、XML 转义、整包标注为不可信参考数据。</p>
+        <div class="risk">模型仍可能误读参考数据</div>
+      </div>
+      <div class="spec-row">
+        <h3>误删或改错一条事实</h3>
+        <p>事件溯源可重建投影；软遗忘保留审计；备份带 sha256 校验。</p>
+        <div class="risk">--purge 不可逆，需人工确认</div>
+      </div>
+    </div>
+
+    <div class="gaps">
+      <div class="gap rv"><b>GAP 01</b><span><strong>语义召回 ~0.24。</strong>关键词集 recall@8 是 1.000，但 53 条改写问法里只有约四分之一能召回——词法通道的真实上限就在这里。</span></div>
+      <div class="gap rv"><b>GAP 02</b><span><strong>Cursor 未做端到端实测。</strong>适配器已实现并用合成 fixture 验证，但本机没装 Cursor，不能算已验证。</span></div>
+      <div class="gap rv"><b>GAP 03</b><span><strong>注入效果没有闭环。</strong>只有 injection.jsonl 的留痕，没有「注入后是否被用上」的评估，样本仍为 0。</span></div>
+      <div class="gap rv"><b>GAP 04</b><span><strong>历史还没回填完。</strong>自动提炼吞吐 16 条 / 5 分钟，25 万条 raw 存量需要更长时间消化。</span></div>
+      <div class="gap rv"><b>GAP 05</b><span><strong>中文检索依赖 trigram。</strong>旧版 SQLite 会优雅回退到 LIKE；同义改写仍可能漏召回。</span></div>
+      <div class="gap rv"><b>GAP 06</b><span><strong>它不是云端服务。</strong>没有多租户、没有跨机实时同步——这是定位，不是缺陷。</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ NUMBERS ============ -->
+<section class="sec" id="numbers">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="sec-idx">10<em>READINGS</em></div>
+      <div>
+        <h2 class="rv">读数</h2>
+        <p class="lede rv" data-d="1">所有数字都来自生产账本快照或仓库内可复现的评测脚本。日期不同，所以分开标注——不把不同时间的指标拼成一个漂亮的总分。</p>
+      </div>
+    </div>
+
+    <div class="num-grid rv">
+      <div class="nc hl"><div class="k">RAW EVIDENCE</div><div class="v">26.7<small>万条</small></div><div class="note">生产账本证据行（2026-10-24）</div></div>
+      <div class="nc"><div class="k">ACTIVE CLAIMS</div><div class="v">2,815</div><div class="note">悬空 0 · 冲突 22（2026-10-25）</div></div>
+      <div class="nc"><div class="k">INJECTION SURFACE</div><div class="v">23 / 23</div><div class="note">注入面健康 · 13 / 13 Agent 端到端</div></div>
+      <div class="nc"><div class="k">TEST SUITE</div><div class="v">1,501</div><div class="note">测试全绿 · lint 干净（2026-10-25）</div></div>
+      <div class="nc"><div class="k">REFUSAL LEAK</div><div class="v">0 / 38</div><div class="note">账本答不了的问题，零泄漏</div></div>
+      <div class="nc"><div class="k">COMPACTION</div><div class="v">406<small>MB</small></div><div class="note">4.48 GB → 406.8 MB（−91%）</div></div>
+      <div class="nc"><div class="k">WRITE THROUGHPUT</div><div class="v">9.5<small>k RPS</small></div><div class="note">8 线程 × 1000，零丢失</div></div>
+      <div class="nc"><div class="k">NETWORK EGRESS</div><div class="v">0</div><div class="note">除本机回环外无任何外呼</div></div>
+    </div>
+
+    <div class="recall-bars rv">
+      <div class="rb"><span>关键词集 recall@8</span><div class="t"><i data-w="100" style="background:linear-gradient(90deg,#63e6cf,#8fe9dd)"></i></div><b style="color:#63e6cf">1.000</b></div>
+      <div class="rb"><span>改写集 recall@8</span><div class="t"><i data-w="24" style="background:linear-gradient(90deg,#a78bfa,#c4b5fd)"></i></div><b style="color:#a78bfa">0.24</b></div>
+      <div class="rb"><span>Pack recall@8</span><div class="t"><i data-w="100" style="background:linear-gradient(90deg,#63e6cf,#8fe9dd)"></i></div><b style="color:#63e6cf">1.000</b></div>
+      <p class="rb-caption">46 例关键词集 / 53 例改写集（2026-10-23 / 10-24 基线）；实测区间 0.207–0.283。<br>改写集的 ~0.24 被写进文档当作「真实缺口」，而不是藏进平均分。</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ START ============ -->
+<section class="sec" id="start">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="sec-idx">11<em>QUICKSTART</em></div>
+      <div>
+        <h2 class="rv">三分钟，让它开始记</h2>
+        <p class="lede rv" data-d="1">不需要注册、不需要 API Key、不需要把数据发出去。Python 3.9+ 就能跑；旧版 matplotlib 界面才需要额外依赖。</p>
+      </div>
+    </div>
+
+    <div class="start">
+      <div class="rv">
+        <ul class="start-steps">
+          <li><span class="n">01</span><div><h3>初始化账本</h3><p>幂等。已存在就复用，不会覆盖你的记忆。</p></div></li>
+          <li><span class="n">02</span><div><h3>启动 daemon</h3><p>默认 127.0.0.1:8765，自动带采集与提炼循环。</p></div></li>
+          <li><span class="n">03</span><div><h3>接入你的 Agent</h3><p>自动发现 → 只对已检测的运行时安装 → 握手验证。</p></div></li>
+          <li><span class="n">04</span><div><h3>验证</h3><p>体检 + 状态 + 一次真实召回，确认链路通。</p></div></li>
+        </ul>
+        <p class="req">PYTHON ≥ 3.9 · macOS / LINUX / WINDOWS · 零第三方运行时依赖 · MIT</p>
+      </div>
+
+      <div class="big-term rv" data-d="1">
+        <div class="term-bar"><i></i><i></i><i></i><span style="margin-left:6px">quickstart — 4 steps</span><button class="copy" data-copy>COPY</button></div>
+        <pre><span class="c"># 1. 初始化（幂等）</span>
+<span class="p">$</span> python3 -m hippomind init
+
+<span class="c"># 2. 启动或复用本机 daemon</span>
+<span class="p">$</span> python3 -m hippomind start
+
+<span class="c"># 3. 接入已检测到的 Agent（未知运行时只报告）</span>
+<span class="p">$</span> python3 -m hippomind install-agents --auto
+
+<span class="c"># 4. 验证：体检 + 打开控制台</span>
+<span class="p">$</span> python3 -m hippomind checkup
+<span class="p">$</span> open http://127.0.0.1:8765/ui
+
+<span class="c"># macOS 也可双击 start-hippomind.command</span>
+<span class="c"># 或 ./start-hippomind.command --web</span></pre>
+      </div>
+    </div>
+
+    <p class="sec-note rv">升级代码后重跑一次 <span class="mono">scripts/install-autostart.sh</span>：它会把包同步到内置盘 runtime，并校准所有 Agent 的注入面。</p>
+  </div>
+</section>
+
+<!-- ============ TIMELINE ============ -->
+<section class="sec" id="timeline" style="padding-top:0">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="sec-idx">12<em>TIMELINE</em></div>
+      <div>
+        <h2 class="rv">年轮</h2>
+        <p class="lede rv" data-d="1">从「标记驱动的归档」到「装完就忘的闭环」，中间隔了三次重构和一次数据治理。</p>
+      </div>
+    </div>
+
+    <div class="tl">
+      <div class="tl-item rv"><div class="d">2026-08 · v0.9.2</div><h3>本机 Memory Hub</h3><p>SQLite/WAL 事件账本成为事实来源；daemon 提供 CLI、localhost HTTP 与 MCP stdio；watcher 低频采集归档。</p></div>
+      <div class="tl-item rv"><div class="d">2026-08-21 · v0.9.3</div><h3>检索 · 凝练 · 注入 · 长跑</h3><p>FTS 与 LIKE 双通道 RRF 融合、实体扩展、近似重复硬剔除、PACMS 覆盖度奖励、时间短语解析、空闲睡眠巩固。</p></div>
+      <div class="tl-item rv"><div class="d">2026-10-19 · v1.0.0</div><h3>一次针对真实账本的重构</h3><p>稳定身份键止住重复入库；保留期真正删除（gzip → fsync → 回读校验 → 分批删）；4.48 GB 压到 406.8 MB；ledger 与 cli 拆成 mixin 包。</p></div>
+      <div class="tl-item rv"><div class="d">2026-10-23 · v1.1</div><h3>HippoMind Atlas</h3><p>零构建的 Web 控制台：纸本档案馆视觉、11 个视图、⌘K 命令面板；数据面 /api/v1 只读有界。</p></div>
+      <div class="tl-item rv"><div class="d">2026-10-24 · v2</div><h3>自动记忆环路</h3><p>取消标记：60 秒采集、5 分钟提炼、相关性门控注入、冲突自动裁决，全链路留痕可审计。</p></div>
+      <div class="tl-item rv"><div class="d">2026-10-25 · round 12</div><h3>把「假绿」变成硬门禁</h3><p>悬空 claim 1,671 → 0；双时态历史回填；拒答测试扩到 38 条并进门禁，leak 恒为 0；实体成为第三路检索信号。</p></div>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<!-- ============ FOOTER ============ -->
+<footer class="foot">
+  <div class="wrap">
+    <div class="foot-top">
+      <div class="foot-brand">
+        <div class="brand" style="font-size:1.05rem">
+          <svg viewBox="0 0 32 32" fill="none" aria-hidden="true" style="width:28px;height:28px">
+            <circle cx="16" cy="16" r="13.2" stroke="rgba(99,230,207,.55)" stroke-width="1"/>
+            <circle cx="16" cy="16" r="8.4" stroke="rgba(167,139,250,.6)" stroke-width="1"/>
+            <circle cx="16" cy="16" r="3.2" fill="#63e6cf"/>
+          </svg>
+          <b>HippoMind</b>
+        </div>
+        <p>本机、单用户、带证据的 Agent 记忆中枢。账本是事实来源，上下文只是它的一次有界投影。</p>
+      </div>
+      <div>
+        <h4>文档</h4>
+        <ul class="foot-links">
+          <li><a href="https://github.com/zps-31/hippomind" target="_blank" rel="noopener">GitHub 仓库</a></li>
+          <li><a href="https://github.com/zps-31/hippomind/blob/main/docs/DETAILED_GUIDE.md" target="_blank" rel="noopener">详细拆解指南</a></li>
+          <li><a href="https://github.com/zps-31/hippomind/blob/main/docs/ARCHITECTURE.md" target="_blank" rel="noopener">架构与设计取舍</a></li>
+          <li><a href="https://github.com/zps-31/hippomind/blob/main/docs/AUTOMATIC_MEMORY.md" target="_blank" rel="noopener">自动记忆运维</a></li>
+        </ul>
+      </div>
+      <div>
+        <h4>项目</h4>
+        <ul class="foot-links">
+          <li><a href="#bounds">已知边界</a></li>
+          <li><a href="#numbers">评测与读数</a></li>
+          <li><a href="https://github.com/zps-31/hippomind/blob/main/LICENSE" target="_blank" rel="noopener">MIT License</a></li>
+          <li><a href="#top">回到顶部 ↑</a></li>
+        </ul>
+      </div>
+    </div>
+    <div class="foot-word">HippoMind</div>
+    <div class="foot-bot">
+      <span>LOCAL-FIRST · EVIDENCE-BACKED · EVENT-SOURCED</span>
+      <span>2026 · 数据不出机器</span>
+    </div>
+  </div>
+</footer>
+
+<script>
+(function () {
+  "use strict";
+  var reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  /* ---------- progress + nav ---------- */
+  var nav = document.getElementById("nav");
+  var prog = document.getElementById("progress");
+  function onScroll() {
+    var y = window.scrollY || window.pageYOffset;
+    nav.classList.toggle("solid", y > 24);
+    var light = document.getElementById("bounds");
+    if (light) {
+      var r = light.getBoundingClientRect();
+      nav.classList.toggle("on-light", r.top <= 80 && r.bottom > 40);
+    }
+    var h = document.documentElement.scrollHeight - window.innerHeight;
+    prog.style.width = (h > 0 ? Math.min(100, (y / h) * 100) : 0) + "%";
+  }
+  window.addEventListener("scroll", onScroll, { passive: true });
+  onScroll();
+
+  /* ---------- mobile menu ---------- */
+  var burger = document.getElementById("burger");
+  var menu = document.getElementById("mobileMenu");
+  function setMenu(open) {
+    menu.classList.toggle("open", open);
+    burger.setAttribute("aria-expanded", open ? "true" : "false");
+    document.body.style.overflow = open ? "hidden" : "";
+  }
+  burger.addEventListener("click", function () { setMenu(!menu.classList.contains("open")); });
+  menu.querySelectorAll("a").forEach(function (a) { a.addEventListener("click", function () { setMenu(false); }); });
+  window.addEventListener("keydown", function (e) { if (e.key === "Escape") setMenu(false); });
+
+  /* ---------- reveal ---------- */
+  var rvItems = document.querySelectorAll(".rv");
+  if ("IntersectionObserver" in window && !reduce) {
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (en) {
+        if (en.isIntersecting) { en.target.classList.add("in"); io.unobserve(en.target); }
+      });
+    }, { rootMargin: "0px 0px -8% 0px", threshold: 0.08 });
+    rvItems.forEach(function (el) { io.observe(el); });
+  } else {
+    rvItems.forEach(function (el) { el.classList.add("in"); });
+  }
+
+  /* ---------- scroll spy ---------- */
+  var sections = Array.prototype.slice.call(document.querySelectorAll("section[id]"));
+  var spyLinks = Array.prototype.slice.call(document.querySelectorAll("[data-spy]"));
+  function spy() {
+    var current = "";
+    var line = window.innerHeight * 0.34;
+    sections.forEach(function (s) {
+      if (s.getBoundingClientRect().top <= line) current = s.id;
+    });
+    spyLinks.forEach(function (a) { a.classList.toggle("on", a.dataset.spy === current); });
+  }
+  window.addEventListener("scroll", spy, { passive: true });
+  spy();
+
+  /* ---------- journey ---------- */
+  var steps = Array.prototype.slice.call(document.querySelectorAll("#jBody .step"));
+  var jBtns = Array.prototype.slice.call(document.querySelectorAll("#jList button"));
+  var meter = document.getElementById("jMeter");
+  function setStep(i, scroll) {
+    steps.forEach(function (s, k) { s.classList.toggle("on", k === i); });
+    jBtns.forEach(function (b, k) { b.classList.toggle("on", k === i); });
+    if (meter) meter.style.width = ((i + 1) / steps.length * 100) + "%";
+    if (scroll && steps[i]) {
+      var top = steps[i].getBoundingClientRect().top + window.pageYOffset - 110;
+      window.scrollTo({ top: top, behavior: reduce ? "auto" : "smooth" });
+    }
+  }
+  jBtns.forEach(function (b, i) {
+    b.addEventListener("click", function () { setStep(i, true); });
+  });
+  function stepSpy() {
+    if (!steps.length) return;
+    var mid = window.innerHeight * 0.42, best = 0, bestD = Infinity;
+    steps.forEach(function (s, i) {
+      var r = s.getBoundingClientRect();
+      var d = Math.abs(r.top + r.height * 0.35 - mid);
+      if (r.bottom > 90 && r.top < window.innerHeight && d < bestD) { bestD = d; best = i; }
+    });
+    setStep(best, false);
+  }
+  window.addEventListener("scroll", stepSpy, { passive: true });
+  setStep(0, false);
+
+  /* ---------- anatomy accordion ---------- */
+  document.querySelectorAll(".layer-btn").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var layer = btn.closest(".layer");
+      var open = !layer.classList.contains("open");
+      document.querySelectorAll(".layer").forEach(function (l) {
+        l.classList.remove("open");
+        var b = l.querySelector(".layer-btn");
+        if (b) b.setAttribute("aria-expanded", "false");
+      });
+      layer.classList.toggle("open", open);
+      btn.setAttribute("aria-expanded", open ? "true" : "false");
+    });
+  });
+
+  /* ---------- tabs ---------- */
+  var tabs = Array.prototype.slice.call(document.querySelectorAll(".tabs button"));
+  tabs.forEach(function (t) {
+    t.addEventListener("click", function () {
+      tabs.forEach(function (x) { x.classList.remove("on"); x.setAttribute("aria-selected", "false"); });
+      t.classList.add("on"); t.setAttribute("aria-selected", "true");
+      document.querySelectorAll(".panel").forEach(function (p) { p.classList.remove("on"); });
+      var panel = document.getElementById("tab-" + t.dataset.tab);
+      if (panel) panel.classList.add("on");
+    });
+  });
+
+  /* ---------- copy ---------- */
+  function copyText(text, btn) {
+    function done() {
+      var old = btn.textContent;
+      btn.textContent = "COPIED";
+      setTimeout(function () { btn.textContent = old; }, 1400);
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done, function () { fallback(); });
+    } else { fallback(); }
+    function fallback() {
+      var ta = document.createElement("textarea");
+      ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.appendChild(ta); ta.select();
+      try { document.execCommand("copy"); done(); } catch (e) { /* ignore */ }
+      document.body.removeChild(ta);
+    }
+  }
+  document.querySelectorAll("[data-copy]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var box = btn.closest(".term, .big-term, .code");
+      var pre = box && box.querySelector("pre");
+      if (pre) copyText(pre.innerText, btn);
+    });
+  });
+
+  /* ---------- decay lab ---------- */
+  (function () {
+    var range = document.getElementById("decayRange");
+    if (!range) return;
+    var path = document.getElementById("decayPath");
+    var area = document.getElementById("decayArea");
+    var nowLine = document.getElementById("nowLine");
+    var nowDot = document.getElementById("nowDot");
+    var nowHalo = document.getElementById("nowHalo");
+    var halfLine = document.getElementById("halfLine");
+    var halfText = document.getElementById("halfText");
+    var floorLine = document.getElementById("floorLine");
+    var floorText = document.getElementById("floorText");
+    var valEl = document.getElementById("decayVal");
+    var daysEl = document.getElementById("decayDays");
+    var rows = Array.prototype.slice.call(document.querySelectorAll(".mem-row"));
+
+    var L = 36, R = 508, T = 18, B = 210, MAXD = 365, LAMBDA = 0.008, FLOOR = 0.02;
+    function X(d) { return L + (d / MAXD) * (R - L); }
+    function Y(w) { return B - w * (B - T); }
+    function weight(w0, d) { return Math.max(FLOOR, w0 * Math.exp(-LAMBDA * d)); }
+
+    var d1 = "";
+    for (var d = 0; d <= MAXD; d += 2) {
+      d1 += (d === 0 ? "M" : "L") + X(d).toFixed(2) + " " + Y(weight(1, d)).toFixed(2) + " ";
+    }
+    path.setAttribute("d", d1);
+    area.setAttribute("d", d1 + "L" + R + " " + B + " L" + L + " " + B + " Z");
+
+    halfLine.setAttribute("x1", X(86.6)); halfLine.setAttribute("x2", X(86.6));
+    halfText.setAttribute("x", X(86.6) + 5); halfText.setAttribute("y", 28);
+    floorLine.setAttribute("y1", Y(FLOOR)); floorLine.setAttribute("y2", Y(FLOOR));
+    floorText.setAttribute("x", L + 12); floorText.setAttribute("y", Y(FLOOR) - 6);
+
+    function render() {
+      var days = +range.value;
+      var w = weight(0.92, days);
+      valEl.innerHTML = w.toFixed(3) + "<small>w</small>";
+      daysEl.textContent = days;
+      var nx = X(days), ny = Y(w);
+      nowLine.setAttribute("x1", nx); nowLine.setAttribute("x2", nx);
+      nowDot.setAttribute("cx", nx); nowDot.setAttribute("cy", ny);
+      nowHalo.setAttribute("cx", nx); nowHalo.setAttribute("cy", ny);
+      rows.forEach(function (row) {
+        var w0 = parseFloat(row.dataset.w0);
+        var v = weight(w0, days);
+        row.querySelector("b").textContent = v.toFixed(3);
+        row.querySelector(".track i").style.width = (v * 100) + "%";
+      });
+    }
+    range.addEventListener("input", render);
+    render();
+  })();
+
+  /* ---------- recall bars ---------- */
+  (function () {
+    var bars = document.querySelectorAll(".recall-bars .rb .t i");
+    if (!bars.length) return;
+    function fill() {
+      bars.forEach(function (b) { b.style.width = (b.dataset.w || 0) + "%"; });
+    }
+    if ("IntersectionObserver" in window) {
+      var io2 = new IntersectionObserver(function (en) {
+        if (en[0].isIntersecting) { fill(); io2.disconnect(); }
+      }, { threshold: 0.3 });
+      io2.observe(document.querySelector(".recall-bars"));
+    } else { fill(); }
+  })();
+
+  /* ---------- hero flow canvas ---------- */
+  (function () {
+    var canvas = document.getElementById("flowCanvas");
+    if (!canvas) return;
+    var ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    var W = 0, H = 0, dpr = 1, raf = null, visible = true, last = 0;
+    var particles = [];
+    var bars = [];
+    var ROWS = [0.20, 0.35, 0.50, 0.65, 0.80];
+    var SOURCES = ["CLAUDE", "CODEX", "GEMINI", "PI", "DSH"];
+    var gateX = 0, barsX = 0, barW = 0;
+
+    function measure() {
+      var r = canvas.getBoundingClientRect();
+      dpr = Math.min(2, window.devicePixelRatio || 1);
+      W = r.width; H = r.height;
+      canvas.width = Math.round(W * dpr);
+      canvas.height = Math.round(H * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      gateX = W * 0.56;
+      barsX = W * 0.76;
+      barW = W * 0.17;
+      bars = [];
+      for (var i = 0; i < 8; i++) {
+        bars.push({ y: H * (0.15 + i * 0.083), pulse: 0 });
+      }
+    }
+
+    function spawn() {
+      var row = Math.floor(Math.random() * ROWS.length);
+      particles.push({
+        x: W * 0.135,
+        y: H * ROWS[row] + (Math.random() - 0.5) * H * 0.035,
+        vx: 12 + Math.random() * 26,
+        row: row,
+        pass: Math.random() < 0.16,
+        life: 1,
+        dead: false,
+        r: 1.0 + Math.random() * 1.3
+      });
+    }
+
+    function draw(dt) {
+      ctx.clearRect(0, 0, W, H);
+
+      /* source rails */
+      ctx.save();
+      var showSrc = W > 430;
+      for (var i = 0; i < ROWS.length; i++) {
+        var y = H * ROWS[i];
+        ctx.strokeStyle = "rgba(255,255,255,.045)";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(showSrc ? W * 0.115 : W * 0.05, y);
+        ctx.lineTo(gateX - 6, y);
+        ctx.stroke();
+        if (showSrc) {
+          ctx.fillStyle = "rgba(152,165,188,.62)";
+          ctx.font = "9px ui-monospace, Menlo, monospace";
+          ctx.fillText(SOURCES[i], 11, y + 3);
+        }
+      }
+      ctx.restore();
+
+      /* gate */
+      var g = ctx.createLinearGradient(0, H * 0.1, 0, H * 0.9);
+      g.addColorStop(0, "rgba(99,230,207,0)");
+      g.addColorStop(0.2, "rgba(99,230,207,.35)");
+      g.addColorStop(0.5, "rgba(99,230,207,.75)");
+      g.addColorStop(0.8, "rgba(99,230,207,.35)");
+      g.addColorStop(1, "rgba(99,230,207,0)");
+      var band = ctx.createLinearGradient(gateX - 14, 0, gateX + 14, 0);
+      band.addColorStop(0, "rgba(99,230,207,0)");
+      band.addColorStop(0.5, "rgba(99,230,207,.07)");
+      band.addColorStop(1, "rgba(99,230,207,0)");
+      ctx.fillStyle = band;
+      ctx.fillRect(gateX - 14, H * 0.08, 28, H * 0.84);
+      ctx.strokeStyle = g;
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.moveTo(gateX, H * 0.1);
+      ctx.lineTo(gateX, H * 0.9);
+      ctx.stroke();
+
+      /* particles */
+      for (var p = particles.length - 1; p >= 0; p--) {
+        var pt = particles[p];
+        pt.x += pt.vx * dt;
+        if (pt.x >= gateX && !pt.gated) {
+          pt.gated = true;
+          if (!pt.pass) { pt.dead = true; pt.fadeAt = gateX; }
+        }
+        if (pt.dead) {
+          pt.life -= dt * 2.2;
+          pt.x += dt * 6;
+          if (pt.life <= 0) { particles.splice(p, 1); continue; }
+        }
+        if (pt.pass && pt.x >= barsX - 4) {
+          var idx = Math.min(bars.length - 1, pt.row + Math.floor(Math.random() * 3));
+          bars[idx].pulse = 1;
+          particles.splice(p, 1);
+          continue;
+        }
+        if (pt.x > W + 10) { particles.splice(p, 1); continue; }
+
+        var alpha = pt.dead ? Math.max(0, pt.life) * 0.55 : (pt.pass ? 0.95 : 0.55);
+        ctx.beginPath();
+        ctx.fillStyle = pt.pass && !pt.dead ? "rgba(99,230,207," + alpha + ")" : "rgba(167,139,250," + alpha + ")";
+        ctx.arc(pt.x, pt.y, pt.r, 0, 6.2832);
+        ctx.fill();
+        if (pt.pass && !pt.dead) {
+          ctx.beginPath();
+          ctx.fillStyle = "rgba(99,230,207,.08)";
+          ctx.arc(pt.x, pt.y, pt.r * 3.4, 0, 6.2832);
+          ctx.fill();
+        }
+      }
+
+      /* 8 bars */
+      for (var b = 0; b < bars.length; b++) {
+        var bar = bars[b];
+        bar.pulse = Math.max(0, bar.pulse - dt * 0.8);
+        var h = 5;
+        ctx.fillStyle = "rgba(255,255,255,.075)";
+        roundRect(barsX, bar.y - h / 2, barW, h, 2);
+        ctx.fill();
+        var fw = barW * (0.28 + 0.5 * Math.min(1, bar.pulse + 0.12));
+        ctx.fillStyle = "rgba(99,230,207," + (0.30 + bar.pulse * 0.6) + ")";
+        roundRect(barsX, bar.y - h / 2, fw, h, 2);
+        ctx.fill();
+      }
+    }
+
+    function roundRect(x, y, w, h, r) {
+      ctx.beginPath();
+      ctx.moveTo(x + r, y);
+      ctx.arcTo(x + w, y, x + w, y + h, r);
+      ctx.arcTo(x + w, y + h, x, y + h, r);
+      ctx.arcTo(x, y + h, x, y, r);
+      ctx.arcTo(x, y, x + w, y, r);
+      ctx.closePath();
+    }
+
+    var acc = 0, t0 = 0;
+    function loop(ts) {
+      raf = null;
+      if (!last) last = ts;
+      var dt = Math.min(0.05, (ts - last) / 1000);
+      last = ts;
+      if (!t0) t0 = ts;
+      if (visible) {
+        acc += dt;
+        if (acc > 0.055) {
+          var n = Math.random() < 0.6 ? 2 : 3;
+          if (ts - t0 > 1600) {
+            for (var i = 0; i < n; i++) if (particles.length < 190) spawn();
+          }
+          draw(Math.min(0.12, acc));
+          acc = 0;
+        }
+        raf = requestAnimationFrame(loop);
+      }
+    }
+
+    measure();
+    for (var s0 = 0; s0 < 65; s0++) {
+      spawn();
+      var sp = particles[s0];
+      sp.row = s0 % ROWS.length;
+      sp.y = H * ROWS[sp.row] + (Math.random() - 0.5) * H * 0.022;
+      var k = Math.floor(s0 / ROWS.length);
+      sp.x = W * 0.145 + ((k + 0.15 + Math.random() * 0.7) / 13) * (barsX - W * 0.145);
+      sp.gated = sp.x > gateX;
+      if (sp.gated && !sp.pass) { sp.dead = true; sp.life = 0.15 + Math.random() * 0.85; sp.fadeAt = gateX; }
+    }
+    if (reduce) {
+      for (var s = 0; s < 22; s++) { spawn(); particles[s].x = Math.random() * barsX; particles[s].life = 1; }
+      draw(0);
+    } else {
+      if ("IntersectionObserver" in window) {
+        new IntersectionObserver(function (en) {
+          visible = en[0].isIntersecting;
+          if (visible && !raf) { last = 0; raf = requestAnimationFrame(loop); }
+        }, { threshold: 0.02 }).observe(canvas);
+      }
+      raf = requestAnimationFrame(loop);
+    }
+
+    var rt = null;
+    window.addEventListener("resize", function () {
+      clearTimeout(rt);
+      rt = setTimeout(function () {
+        measure();
+        if (reduce) { particles = []; for (var s = 0; s < 22; s++) { spawn(); particles[s].x = Math.random() * barsX; particles[s].life = 1; } draw(0); }
+      }, 180);
+    }, { passive: true });
+  })();
+})();
+</script>
+</body>
+</html>

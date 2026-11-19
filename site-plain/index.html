@@ -1,0 +1,950 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HippoMind — 让 AI 记住你们聊过的事</title>
+<meta name="description" content="一个跑在你电脑上的小工具，替 AI 记住你们聊过的事：自动记下、整理成卡片、需要时挑几张递过去。不用注册，不上传。">
+<meta name="theme-color" content="#FBF6EC">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect x='3' y='4' width='26' height='24' rx='5' fill='%23F3E3C8'/><path d='M9 12h14M9 17h10M9 22h6' stroke='%23B44E2C' stroke-width='2.4' stroke-linecap='round'/></svg>">
+<style>
+/* ---------- 基础 ---------- */
+:root{
+  --bg:#fbf6ec;
+  --bg-2:#f6efe1;
+  --card:#fffdf8;
+  --ink:#26231d;
+  --ink-2:#5e574b;
+  --ink-3:#948b7b;
+  --line:#e8ddcb;
+  --line-2:#d9cbb4;
+  --accent:#b44e2c;
+  --accent-2:#d2603a;
+  --accent-soft:#f6e0d3;
+  --green:#3f7a62;
+  --green-soft:#e2eee7;
+  --yellow:#f6e3a6;
+  --blue:#4f6f8f;
+  --maxw:1080px;
+  --read:720px;
+  --ease:cubic-bezier(.22,.61,.36,1);
+  --sans:-apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Segoe UI",sans-serif;
+  --serif:"Songti SC","Noto Serif CJK SC","Source Han Serif SC",Georgia,serif;
+  --mono:"SF Mono",ui-monospace,Menlo,Consolas,monospace;
+}
+*,*::before,*::after{box-sizing:border-box}
+html{scroll-behavior:smooth;-webkit-text-size-adjust:100%}
+body{
+  margin:0;background:var(--bg);color:var(--ink);
+  font-family:var(--sans);font-size:18px;line-height:1.95;
+  -webkit-font-smoothing:antialiased;overflow-x:hidden;
+}
+body::before{
+  content:"";position:fixed;inset:0;z-index:0;pointer-events:none;
+  background:
+    radial-gradient(760px 520px at 82% -6%, rgba(210,96,58,.10), transparent 62%),
+    radial-gradient(620px 460px at 4% 8%, rgba(63,122,98,.07), transparent 60%);
+}
+::selection{background:rgba(246,227,166,.9);color:#26231d}
+a{color:inherit;text-decoration:none}
+button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
+img{max-width:100%;display:block}
+h1,h2,h3,h4{margin:0;font-weight:600;letter-spacing:-.03em;line-height:1.22}
+h1,h2{text-wrap:balance}
+p{margin:0}
+ul{margin:0;padding:0;list-style:none}
+.wrap{width:min(var(--maxw),calc(100% - 48px));margin:0 auto;position:relative;z-index:2}
+.read{width:min(var(--read),100%);margin:0 auto}
+.mono{font-family:var(--mono)}
+.hl{background:linear-gradient(180deg,transparent 56%,var(--yellow) 56%,var(--yellow) 92%,transparent 92%)}
+.muted{color:var(--ink-2)}
+
+/* ---------- 顶栏 ---------- */
+#bar{position:fixed;top:0;left:0;height:3px;width:0;background:var(--accent);z-index:80;transition:width .1s linear}
+.nav{
+  position:fixed;top:0;left:0;right:0;z-index:70;height:66px;display:flex;align-items:center;
+  transition:background .3s var(--ease),border-color .3s var(--ease),backdrop-filter .3s;
+  border-bottom:1px solid transparent;
+}
+.nav.solid{background:rgba(251,246,236,.9);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border-bottom-color:var(--line)}
+.nav-in{width:min(var(--maxw),calc(100% - 48px));margin:0 auto;display:flex;align-items:center;justify-content:space-between;gap:20px}
+.brand{display:flex;align-items:center;gap:9px;font-weight:600;font-size:1.02rem;letter-spacing:-.02em}
+.brand svg{width:26px;height:26px;flex:none}
+.brand small{font-family:var(--mono);font-size:.58rem;letter-spacing:.14em;color:var(--ink-3);text-transform:uppercase;font-weight:400}
+.nav a.link{font-size:.9rem;color:var(--ink-2);padding:7px 11px;border-radius:99px;transition:.2s}
+.nav a.link:hover{color:var(--ink);background:rgba(38,35,29,.05)}
+.nav a.link.on{color:var(--accent)}
+.links{display:flex;gap:2px;align-items:center}
+.nav .go{font-size:.86rem;border:1px solid var(--line-2);border-radius:99px;padding:8px 15px;color:var(--ink);transition:.2s}
+.nav .go:hover{background:#fff;border-color:var(--accent);color:var(--accent)}
+.burger{display:none;width:42px;height:42px;border:1px solid var(--line);border-radius:12px;align-items:center;justify-content:center}
+.burger i{display:block;width:17px;height:1.6px;background:var(--ink);position:relative}
+.burger i::before,.burger i::after{content:"";position:absolute;left:0;width:17px;height:1.6px;background:var(--ink)}
+.burger i::before{top:-5px}.burger i::after{top:5px}
+.mob{position:fixed;inset:0;z-index:65;background:var(--bg);padding:88px 28px 28px;display:none;flex-direction:column}
+.mob.open{display:flex}
+.mob a{padding:20px 4px;border-bottom:1px solid var(--line);font-size:1.35rem;letter-spacing:-.02em}
+.mob a em{font-family:var(--mono);font-style:normal;font-size:.62rem;color:var(--accent);margin-right:14px;letter-spacing:.1em}
+
+/* ---------- 首屏 ---------- */
+.hero{padding:132px 0 76px;position:relative}
+.hero-grid{display:grid;grid-template-columns:1.02fr .98fr;gap:54px;align-items:center}
+.kicker{display:inline-flex;align-items:center;gap:9px;font-size:.78rem;color:var(--ink-2);background:#fff;border:1px solid var(--line);border-radius:99px;padding:7px 14px}
+.kicker::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--accent)}
+h1{margin-top:24px;font-size:clamp(2.5rem,4.8vw,4.05rem);line-height:1.14;letter-spacing:-.045em}
+h1 b{font-weight:600;color:var(--accent)}
+.lede{margin-top:24px;font-size:1.12rem;line-height:1.95;color:var(--ink-2);max-width:500px}
+.cta{display:flex;flex-wrap:wrap;gap:12px;margin-top:32px}
+.btn{display:inline-flex;align-items:center;gap:9px;border-radius:99px;padding:13px 24px;font-size:.98rem;font-weight:500;transition:.2s var(--ease);border:1px solid transparent}
+.btn svg{width:16px;height:16px;transition:transform .2s}
+.btn:hover svg{transform:translateX(3px)}
+.btn-main{background:var(--accent);color:#fff;box-shadow:0 8px 24px -12px rgba(180,78,44,.55)}
+.btn-main:hover{background:#9d4224;transform:translateY(-1px)}
+.btn-ghost{border-color:var(--line-2);color:var(--ink);background:rgba(255,255,255,.5)}
+.btn-ghost:hover{background:#fff;border-color:var(--ink-3)}
+.meta{display:flex;flex-wrap:wrap;gap:16px;margin-top:26px;font-size:.82rem;color:var(--ink-3)}
+.meta span{display:inline-flex;align-items:center;gap:7px}
+.meta span::before{content:"";width:4px;height:4px;border-radius:50%;background:var(--ink-3);opacity:.6}
+
+/* 聊天窗口示意 */
+.chat{
+  background:#fff;border:1px solid var(--line);border-radius:24px;padding:18px;
+  box-shadow:0 26px 60px -34px rgba(70,50,20,.35),0 2px 0 rgba(255,255,255,.8) inset;
+  transform:rotate(.7deg);position:relative;
+}
+.chat-head{display:flex;align-items:center;gap:8px;padding:2px 6px 12px;border-bottom:1px solid var(--line)}
+.chat-head i{width:9px;height:9px;border-radius:50%;background:#e9dfcf;display:block}
+.chat-head span{margin-left:6px;font-size:.76rem;color:var(--ink-3)}
+.day{padding:13px 4px 4px;border-bottom:1px dashed var(--line)}
+.day:last-child{border-bottom:0;padding-bottom:6px}
+.day > b{display:block;font-size:.7rem;color:var(--ink-3);font-weight:400;margin-bottom:8px;letter-spacing:.04em}
+.msg{display:flex;gap:8px;margin-bottom:8px;align-items:flex-start}
+.msg .who{flex:none;width:24px;height:24px;border-radius:8px;display:grid;place-items:center;font-size:.62rem;color:#fff;margin-top:2px}
+.msg.user .who{background:#8a7f6c}
+.msg.ai .who{background:var(--green)}
+.bubble{background:#f7f1e5;border-radius:12px;padding:8px 12px;font-size:.83rem;line-height:1.65;color:var(--ink);max-width:88%}
+.msg.ai .bubble{background:#f2f7f3}
+.msg.mini .bubble{color:var(--ink-3);font-style:normal}
+.msg .fade{color:var(--ink-3);letter-spacing:.16em}
+.chat-note{display:flex;align-items:flex-start;gap:9px;margin-top:14px;padding:11px 13px;border-radius:12px;background:var(--green-soft);color:#2e5d4b;font-size:.8rem;line-height:1.75}
+.chat-note svg{width:16px;height:16px;flex:none;margin-top:3px}
+
+/* ---------- 一句话 ---------- */
+.tldr{padding:0 0 12px}
+.tldr-box{
+  background:#fff;border:1px solid var(--line);border-radius:20px;padding:26px 30px;
+  display:grid;grid-template-columns:auto 1fr;gap:18px;align-items:start;
+  box-shadow:0 12px 30px -26px rgba(70,50,20,.4);
+}
+.tldr-box .tag{font-family:var(--mono);font-size:.62rem;letter-spacing:.12em;color:var(--accent);background:var(--accent-soft);border-radius:8px;padding:5px 9px;white-space:nowrap;margin-top:3px}
+.tldr-box p{font-size:1.02rem;line-height:1.9}
+.tldr-box b{font-weight:600}
+
+/* ---------- 章节 ---------- */
+.sec{padding:86px 0;position:relative}
+.sec.alt{background:linear-gradient(180deg,rgba(255,253,248,.7),rgba(246,239,225,.5))}
+.head{display:grid;grid-template-columns:56px 1fr;gap:18px;margin-bottom:42px}
+.head .n{
+  width:44px;height:44px;border-radius:50%;background:var(--accent);color:#fff;
+  display:grid;place-items:center;font-family:var(--mono);font-size:.82rem;letter-spacing:.02em;
+  box-shadow:0 8px 18px -10px rgba(180,78,44,.7);
+}
+.head .k{font-size:.76rem;letter-spacing:.1em;color:var(--ink-3);font-family:var(--mono);text-transform:uppercase;margin-bottom:8px}
+h2{font-size:clamp(1.75rem,3.3vw,2.55rem);line-height:1.3}
+.head p{margin-top:12px;font-size:1.02rem;color:var(--ink-2);max-width:640px}
+
+/* 场景引言 */
+.quotes{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:30px}
+.q{background:#fff;border:1px solid var(--line);border-radius:18px;padding:24px 22px;position:relative}
+.q::before{content:"“";position:absolute;top:8px;left:16px;font-family:var(--serif);font-size:2.6rem;color:var(--accent-soft);line-height:1}
+.q p{position:relative;font-size:1.02rem;line-height:1.8;padding-top:14px}
+.after-note{text-align:center;color:var(--ink-2);font-size:1rem;max-width:660px;margin:0 auto}
+.after-note b{color:var(--ink)}
+
+/* 比喻 */
+.quote-big{
+  font-family:var(--serif);font-size:clamp(1.3rem,2.4vw,1.8rem);line-height:1.75;
+  background:#fff;border:1px solid var(--line);border-left:5px solid var(--accent);
+  border-radius:6px 18px 18px 6px;padding:26px 30px;margin-bottom:36px;color:#332f27;
+}
+.quote-big b{color:var(--accent);font-weight:600;white-space:nowrap}
+
+.things{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.thing{background:#fff;border:1px solid var(--line);border-radius:20px;padding:26px;display:grid;grid-template-columns:44px 1fr;gap:16px;align-items:start;transition:.25s var(--ease)}
+.thing:hover{transform:translateY(-2px);box-shadow:0 16px 34px -30px rgba(70,50,20,.5)}
+.thing .ico{width:44px;height:44px;border-radius:13px;display:grid;place-items:center;background:var(--bg-2);color:var(--accent)}
+.thing .ico svg{width:22px;height:22px}
+.thing h3{font-size:1.08rem;letter-spacing:-.01em}
+.thing p{margin-top:6px;font-size:.94rem;line-height:1.85;color:var(--ink-2)}
+.thing .num{font-family:var(--mono);font-size:.62rem;color:var(--ink-3);letter-spacing:.1em;display:block;margin-bottom:5px}
+
+/* 衰减演示 */
+.demo{display:grid;grid-template-columns:.92fr 1.08fr;gap:36px;align-items:start}
+.demo-left{position:sticky;top:100px}
+.slider-card{background:#fff;border:1px solid var(--line);border-radius:20px;padding:24px}
+.slider-card .t{font-size:.78rem;color:var(--ink-3);font-family:var(--mono);letter-spacing:.08em}
+.slider-card .big{font-size:1.9rem;font-weight:600;letter-spacing:-.03em;margin-top:6px}
+.slider-card .big small{font-size:.9rem;color:var(--ink-2);font-weight:400;margin-left:4px}
+input[type=range]{
+  -webkit-appearance:none;appearance:none;width:100%;height:6px;border-radius:6px;background:var(--line);
+  margin:20px 0 6px;cursor:pointer;outline:none;
+}
+input[type=range]::-webkit-slider-thumb{
+  -webkit-appearance:none;width:24px;height:24px;border-radius:50%;background:#fff;border:3px solid var(--accent);
+  box-shadow:0 3px 8px rgba(0,0,0,.12);cursor:grab;
+}
+input[type=range]::-moz-range-thumb{width:20px;height:20px;border-radius:50%;background:#fff;border:3px solid var(--accent)}
+.ticks{position:relative;height:18px;font-size:.72rem;color:var(--ink-3);font-family:var(--mono)}
+.ticks span{position:absolute;top:2px;transform:translateX(-50%);white-space:nowrap}
+.ticks span:first-child{transform:none}
+.ticks span:last-child{transform:translateX(-100%)}
+.demo-tip{margin-top:16px;font-size:.86rem;color:var(--ink-2);line-height:1.8;border-top:1px dashed var(--line);padding-top:14px}
+.demo-tip b{color:var(--ink)}
+
+.cards{display:grid;gap:12px}
+.mcard{
+  background:#fff;border:1px solid var(--line);border-radius:16px;padding:16px 18px;
+  transition:opacity .25s linear,transform .25s var(--ease);
+}
+.mcard .top{display:flex;justify-content:space-between;gap:12px;align-items:baseline}
+.mcard h4{font-size:.98rem;line-height:1.6;letter-spacing:0}
+.mcard .st{font-size:.72rem;color:var(--ink-3);white-space:nowrap}
+.mcard .track{height:5px;border-radius:5px;background:var(--bg-2);margin-top:12px;overflow:hidden}
+.mcard .track i{display:block;height:100%;border-radius:5px;background:linear-gradient(90deg,#7fb39c,#d2603a);transition:width .25s linear}
+.mcard .from{font-size:.74rem;color:var(--ink-3);margin-top:9px}
+.demo-foot{margin-top:20px;font-size:.88rem;color:var(--ink-2);line-height:1.9}
+.demo-foot b{color:var(--ink)}
+
+/* 一张卡片 */
+.anatomy{display:grid;grid-template-columns:1.05fr .95fr;gap:44px;align-items:center}
+.bigcard{
+  background:#fff;border:1px solid var(--line);border-radius:20px;padding:26px 26px 22px;
+  transform:rotate(-1.2deg);box-shadow:0 24px 50px -32px rgba(70,50,20,.5);position:relative;
+}
+.bigcard::before{
+  content:"";position:absolute;inset:10px -6px -8px 12px;background:#fff;border:1px solid var(--line);
+  border-radius:20px;z-index:-1;transform:rotate(1.6deg);
+}
+.bigcard .label{font-family:var(--mono);font-size:.6rem;letter-spacing:.12em;color:var(--accent);margin-bottom:10px}
+.bigcard h3{font-size:1.35rem;line-height:1.55}
+.bigcard .rule{height:1px;background:var(--line);margin:16px 0}
+.bigcard dl{display:grid;grid-template-columns:76px 1fr;gap:8px 12px;margin:0;font-size:.86rem}
+.bigcard dt{color:var(--ink-3)}
+.bigcard dd{margin:0;color:var(--ink-2)}
+.bigcard .stamp{
+  margin-top:18px;display:inline-flex;align-items:center;gap:7px;font-size:.76rem;
+  background:var(--green-soft);color:#2e5d4b;border-radius:99px;padding:5px 11px;
+}
+.anatomy-notes li{display:grid;grid-template-columns:26px 1fr;gap:10px;padding:12px 0;border-bottom:1px solid var(--line)}
+.anatomy-notes li:last-child{border-bottom:0}
+.anatomy-notes .b{font-family:var(--mono);font-size:.68rem;color:var(--accent);padding-top:4px}
+.anatomy-notes h4{font-size:1rem;letter-spacing:0}
+.anatomy-notes p{font-size:.9rem;color:var(--ink-2);line-height:1.8;margin-top:2px}
+
+/* 五步 */
+.steps{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;position:relative}
+.steps::before{content:"";position:absolute;left:8%;right:8%;top:23px;border-top:2px dashed var(--line-2);z-index:0}
+.step{position:relative;z-index:1;text-align:center;padding:0 4px}
+.step .dot{
+  width:46px;height:46px;border-radius:50%;background:#fff;border:2px solid var(--line-2);
+  display:grid;place-items:center;margin:0 auto 14px;color:var(--accent);
+}
+.step .dot svg{width:21px;height:21px}
+.step h4{font-size:.95rem;line-height:1.5}
+.step p{font-size:.82rem;color:var(--ink-2);line-height:1.75;margin-top:4px}
+.steps-note{margin-top:30px;text-align:center;font-size:.9rem;color:var(--ink-2)}
+.steps-note b{color:var(--ink)}
+
+/* 能帮什么 */
+.helps{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+.help{background:#fff;border:1px solid var(--line);border-radius:18px;padding:24px;transition:.25s var(--ease)}
+.help:hover{transform:translateY(-2px);box-shadow:0 16px 34px -30px rgba(70,50,20,.5)}
+.help .ico{width:38px;height:38px;border-radius:11px;display:grid;place-items:center;background:var(--bg-2);color:var(--green);margin-bottom:14px}
+.help .ico svg{width:19px;height:19px}
+.help h3{font-size:1.02rem}
+.help p{font-size:.9rem;color:var(--ink-2);line-height:1.8;margin-top:6px}
+
+/* 实话 */
+.honest{background:#fdf6e2;border:1px solid #ecd9a8;border-radius:24px;padding:34px 34px 30px}
+.honest h2{font-size:clamp(1.5rem,2.6vw,2rem)}
+.honest > p{margin-top:10px;color:#6b5f43;font-size:.98rem}
+.honest ul{margin-top:24px;display:grid;gap:14px;max-width:880px}
+.honest li{display:grid;grid-template-columns:22px 1fr;gap:10px;font-size:.95rem;line-height:1.85;color:#554b35}
+.honest li::before{content:"—";color:#b08a3e;font-family:var(--mono);line-height:1.95}
+.honest b{color:#3f3724;font-weight:600}
+
+/* 开始 */
+.start{display:grid;grid-template-columns:.95fr 1.05fr;gap:44px;align-items:start}
+.start-steps li{display:grid;grid-template-columns:34px 1fr;gap:14px;padding:16px 0;border-top:1px solid var(--line)}
+.start-steps li:last-child{border-bottom:1px solid var(--line)}
+.start-steps .n{font-family:var(--mono);font-size:.7rem;color:var(--accent);padding-top:5px}
+.start-steps h3{font-size:1.05rem}
+.start-steps p{font-size:.9rem;color:var(--ink-2);line-height:1.8;margin-top:3px}
+.term{background:#2c2822;border-radius:18px;overflow:hidden;box-shadow:0 24px 50px -34px rgba(44,40,34,.8)}
+.term-bar{display:flex;align-items:center;gap:7px;padding:12px 16px;border-bottom:1px solid rgba(255,255,255,.1);color:#a79c88;font-size:.68rem;font-family:var(--mono)}
+.term-bar i{width:8px;height:8px;border-radius:50%;background:#4a4338}
+.term-bar .copy{margin-left:auto;color:#a79c88;font-size:.64rem;letter-spacing:.08em;padding:3px 7px;border-radius:5px;border:1px solid transparent}
+.term-bar .copy:hover{color:#fff;border-color:rgba(255,255,255,.25)}
+.term pre{margin:0;padding:18px 18px 20px;overflow-x:auto;font-family:var(--mono);font-size:.78rem;line-height:2.1;color:#e8e0d0}
+.term pre .c{color:#8c8270}
+.term pre .p{color:#e7a97c}
+.start-note{margin-top:22px;font-size:.86rem;color:var(--ink-3);line-height:1.85}
+
+/* 结尾 */
+.closing{padding:96px 0 88px;text-align:center}
+.closing .big{font-family:var(--serif);font-size:clamp(1.7rem,3.4vw,2.6rem);line-height:1.65;letter-spacing:.01em}
+.closing .big span{color:var(--accent)}
+.closing .sub{margin-top:18px;color:var(--ink-3);font-size:.9rem}
+.closing .back{display:inline-block;margin-top:28px;font-size:.88rem;color:var(--ink-2);border-bottom:1px solid var(--line-2);padding-bottom:2px}
+.closing .back:hover{color:var(--accent);border-color:var(--accent)}
+
+.foot{border-top:1px solid var(--line);padding:34px 0 40px}
+.foot-in{display:flex;align-items:center;justify-content:space-between;gap:18px;flex-wrap:wrap;font-size:.8rem;color:var(--ink-3)}
+.foot a:hover{color:var(--accent)}
+.foot .l{display:flex;gap:18px;flex-wrap:wrap}
+
+/* 动效 */
+.rv{opacity:0;transform:translateY(14px);transition:opacity .6s var(--ease),transform .6s var(--ease)}
+.rv.in{opacity:1;transform:none}
+
+.rv[data-d="1"]{transition-delay:.08s}
+.rv[data-d="2"]{transition-delay:.16s}
+
+@media (max-width:980px){
+  .links{display:none}
+  .nav .go{display:none}
+  .burger{display:flex}
+  .hero{padding-top:118px}
+  .hero-grid{grid-template-columns:1fr;gap:38px}
+  .demo{grid-template-columns:1fr;gap:26px}
+  .demo-left{position:static}
+  .anatomy{grid-template-columns:1fr;gap:30px}
+  .start{grid-template-columns:1fr;gap:28px}
+  .things{grid-template-columns:1fr}
+  .quotes{grid-template-columns:1fr}
+  .helps{grid-template-columns:1fr 1fr}
+  .steps{grid-template-columns:1fr 1fr;gap:24px 12px}
+  .steps::before{display:none}
+  .head{grid-template-columns:44px 1fr;gap:14px}
+  h2{font-size:clamp(1.6rem,3vw,2.2rem)}
+}
+@media (max-width:620px){
+  body{font-size:17px}
+  .wrap{width:calc(100% - 34px)}
+  .sec{padding:64px 0}
+  .hero{padding:112px 0 52px}
+  h1{font-size:clamp(2.1rem,8.6vw,2.7rem)}
+  .quotes{gap:10px}
+  .helps{grid-template-columns:1fr}
+  .steps{grid-template-columns:1fr;gap:18px}
+  .step{display:grid;grid-template-columns:46px 1fr;text-align:left;gap:14px;align-items:start}
+  .step .dot{margin:0}
+  .step h4{margin-top:2px}
+  .step p{grid-column:2;margin-top:2px}
+  .tldr-box{grid-template-columns:1fr;gap:10px;padding:22px}
+  .honest{padding:26px 22px;border-radius:18px}
+  .head{grid-template-columns:1fr;gap:10px}
+  .head .n{width:38px;height:38px;font-size:.74rem;margin-bottom:2px}
+  h2{font-size:1.55rem}
+  .bigcard{transform:none}
+  .bigcard::before{display:none}
+  .closing{padding:70px 0 62px}
+  .term pre{font-size:.72rem}
+  .chat{transform:none}
+}
+@media (prefers-reduced-motion:reduce){
+  html{scroll-behavior:auto}
+  *,*::before,*::after{transition-duration:.001ms!important;animation-duration:.001ms!important}
+  .rv{opacity:1;transform:none}
+}
+</style>
+</head>
+<body>
+<div id="bar"></div>
+
+<header class="nav" id="nav">
+  <div class="nav-in">
+    <a class="brand" href="#top" aria-label="回到顶部">
+      <svg viewBox="0 0 28 28" fill="none" aria-hidden="true">
+        <rect x="2.5" y="3.5" width="23" height="21" rx="5" fill="#F3E3C8"/>
+        <path d="M8 10h12M8 14.5h9M8 19h5.5" stroke="#B44E2C" stroke-width="2.1" stroke-linecap="round"/>
+      </svg>
+      HippoMind <small>记住这件事</small>
+    </a>
+    <nav class="links" aria-label="页面导航">
+      <a class="link" href="#trouble">遇到过吗</a>
+      <a class="link" href="#how">它做什么</a>
+      <a class="link" href="#demo">看看效果</a>
+      <a class="link" href="#help">能帮什么</a>
+      <a class="link" href="#truth">说实话</a>
+    </nav>
+    <a class="go" href="#start">三分钟装上</a>
+    <button class="burger" id="burger" aria-label="打开菜单" aria-expanded="false"><i></i></button>
+  </div>
+</header>
+
+<nav class="mob" id="mob">
+  <a href="#trouble"><em>01</em>你可能也遇到过</a>
+  <a href="#how"><em>02</em>它到底在做什么</a>
+  <a href="#demo"><em>03</em>三个月后还剩下什么</a>
+  <a href="#help"><em>04</em>它能帮你什么</a>
+  <a href="#truth"><em>05</em>说点实话</a>
+  <a href="#start"><em>06</em>怎么开始</a>
+</nav>
+
+<main id="top">
+
+<!-- ============ 首屏 ============ -->
+<section class="hero">
+  <div class="wrap">
+    <div class="hero-grid">
+      <div>
+        <span class="kicker">一个跑在你电脑上的小工具</span>
+        <h1>你的 AI 助手，<br>其实一直在<b>失忆</b>。</h1>
+        <p class="lede">
+          每次新开一个对话，它就不记得昨天帮你改过什么、你不喜欢哪种写法、上次那个问题最后是怎么解决的。
+          这不是它笨——是它根本没有记性。
+        </p>
+        <p class="lede" style="margin-top:14px">
+          HippoMind 做的事很简单：<span class="hl">在你的电脑上，替它记住</span>。
+        </p>
+        <div class="cta">
+          <a class="btn btn-main" href="#how">
+            看看它怎么记
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+          </a>
+          <a class="btn btn-ghost" href="#start">三分钟装上</a>
+        </div>
+        <div class="meta">
+          <span>不用注册</span><span>不用 API Key</span><span>数据留在本机</span>
+        </div>
+      </div>
+
+      <div>
+        <div class="chat" aria-label="同一个问题问了三遍的对话示意">
+          <div class="chat-head"><i></i><i></i><i></i><span>你和 AI 的真实日常</span></div>
+
+          <div class="day">
+            <b>第 1 天</b>
+            <div class="msg user"><span class="who">你</span><div class="bubble">部署脚本放在哪个目录？</div></div>
+            <div class="msg ai"><span class="who">AI</span><div class="bubble">在 <span class="mono">deploy/</span> 下面，直接跑 <span class="mono">deploy.sh</span> 就行。</div></div>
+          </div>
+
+          <div class="day">
+            <b>第 3 天</b>
+            <div class="msg user"><span class="who">你</span><div class="bubble">部署脚本放在哪个目录？</div></div>
+            <div class="msg ai"><span class="who">AI</span><div class="bubble">请问你说的是哪个项目？可以告诉我更多信息吗？</div></div>
+          </div>
+
+          <div class="day">
+            <b>第 7 天</b>
+            <div class="msg user"><span class="who">你</span><div class="bubble">部署脚本放在哪个目录？</div></div>
+            <div class="msg ai mini"><span class="who">AI</span><div class="bubble"><span class="fade">· · · · · ·</span></div></div>
+          </div>
+
+          <div class="chat-note">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3l2.7 5.7 6.3.9-4.6 4.4 1.1 6.2L12 17.3 6.5 20.2l1.1-6.2L3 9.6l6.3-.9L12 3z"/></svg>
+            <span><b>同一个问题，问了三遍。</b>不是它不想答，是它每次都从一张白纸开始。</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="tldr" style="margin-top:64px">
+      <div class="tldr-box">
+        <span class="tag">一句话版本</span>
+        <p>
+          想象你旁边坐着一个很聪明、但记性只有七秒的同事。HippoMind 就是那个同事桌上的<b>资料管理员</b>：
+          平时把你们说过的话整理成小卡片，下次开口前，挑最相关的几张递给他。<b>就这一件事。</b>
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 01 遇到过吗 ============ -->
+<section class="sec alt" id="trouble">
+  <div class="wrap">
+    <div class="head read rv">
+      <div class="n">01</div>
+      <div>
+        <div class="k">先说人话</div>
+        <h2>这些场景，你可能也遇到过</h2>
+        <p>不是你不会用 AI，是大部分 AI 工具，本来就不负责「记住」。</p>
+      </div>
+    </div>
+
+    <div class="quotes">
+      <div class="q rv"><p>「这个我们上周不是刚弄过吗？」</p></div>
+      <div class="q rv" data-d="1"><p>「刚跟它说完，换个窗口它又忘了。」</p></div>
+      <div class="q rv" data-d="2"><p>「它说得很肯定，可我找不到依据在哪。」</p></div>
+    </div>
+
+    <p class="after-note rv">
+      你花十分钟解释项目背景，它三秒钟就忘干净。<br>
+      下一次，你还得从头再讲一遍。
+    </p>
+  </div>
+</section>
+
+<!-- ============ 02 它做什么 ============ -->
+<section class="sec" id="how">
+  <div class="wrap">
+    <div class="head read rv">
+      <div class="n">02</div>
+      <div>
+        <div class="k">它是怎么工作的</div>
+        <h2>它其实只做四件事</h2>
+        <p>没有玄学。把这四件事拆开看，你大概五分钟就能明白它在干嘛。</p>
+      </div>
+    </div>
+
+    <p class="quote-big read rv">
+      把 AI 想成一个很聪明、但记性只有七秒的同事。<br>
+      HippoMind 是坐在他旁边的<b>资料管理员</b>。
+    </p>
+
+    <div class="things">
+      <article class="thing rv">
+        <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 20l4-1 10-10a2.5 2.5 0 0 0-3.5-3.5L4.5 15.5 4 20z"/><path d="M13 7l4 4"/></svg></div>
+        <div>
+          <span class="num">第 1 件</span>
+          <h3>记下来</h3>
+          <p>你和 AI 聊过的内容，一分钟内会被收进一个本子里。不用你专门说「请记住这个」。</p>
+        </div>
+      </article>
+
+      <article class="thing rv" data-d="1">
+        <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="3.5" width="16" height="17" rx="3"/><path d="M8 9h8M8 13h6M8 17h4"/></svg></div>
+        <div>
+          <span class="num">第 2 件</span>
+          <h3>整理成小卡片</h3>
+          <p>把啰嗦的对话压成一句话。比如「生产库端口是 6543」，而不是三百行的聊天记录。</p>
+        </div>
+      </article>
+
+      <article class="thing rv">
+        <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M7 11V7a2 2 0 0 1 4 0v3"/><path d="M11 10V6a2 2 0 0 1 4 0v4"/><path d="M15 10V8a2 2 0 0 1 4 0v6a6 6 0 0 1-6 6h-1a7 7 0 0 1-5.6-2.8L4 14.5a2 2 0 0 1 3-2.5l2 2"/></svg></div>
+        <div>
+          <span class="num">第 3 件</span>
+          <h3>挑几张递过去</h3>
+          <p>每次开口前，只挑最相关的几张，最多 8 张。不是把三个月的聊天全塞给它。</p>
+        </div>
+      </article>
+
+      <article class="thing rv" data-d="1">
+        <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3c4 4 6 7 6 10a6 6 0 0 1-12 0c0-3 2-6 6-10z"/><path d="M12 21V9"/></svg></div>
+        <div>
+          <span class="num">第 4 件</span>
+          <h3>让不重要的慢慢忘</h3>
+          <p>很久没再用到的卡片会慢慢褪色。像人一样——但只是变淡，不是烧掉。</p>
+        </div>
+      </article>
+    </div>
+
+    <p class="after-note rv" style="margin-top:34px">
+      这四件事全在后台自动做。你要做的，只是<b>照常聊天</b>。
+    </p>
+  </div>
+</section>
+
+<!-- ============ 03 衰减演示 ============ -->
+<section class="sec alt" id="demo">
+  <div class="wrap">
+    <div class="head read rv">
+      <div class="n">03</div>
+      <div>
+        <div class="k">看看效果</div>
+        <h2>三个月后，它还剩下什么</h2>
+        <p>记忆不是越存越多就好。真正好用的记忆，会自己分轻重。拖一下下面的滑块，看看四张卡片怎么变淡。</p>
+      </div>
+    </div>
+
+    <div class="demo">
+      <div class="demo-left rv">
+        <div class="slider-card">
+          <div class="t">时间过去了</div>
+          <div class="big"><span id="dayNum">90</span><small>天</small></div>
+          <input id="range" type="range" min="0" max="365" step="1" value="90" aria-label="选择过去了多少天">
+          <div class="ticks"><span style="left:0">今天</span><span style="left:24.6%">3 个月</span><span style="left:50%">半年</span><span style="left:100%">1 年</span></div>
+          <div class="demo-tip">
+            越久没被用到，颜色越淡。<b>被重新用到会加回来一点</b>，但不会变回全新——就像你对一件旧事的记忆。
+          </div>
+        </div>
+      </div>
+
+      <div class="rv" data-d="1">
+        <div class="cards" id="cards">
+          <article class="mcard" data-w="0.95">
+            <div class="top"><h4>部署脚本在 deploy/ 下，跑 deploy.sh</h4><span class="st">清晰</span></div>
+            <div class="track"><i></i></div>
+            <div class="from">三天前刚用过</div>
+          </article>
+          <article class="mcard" data-w="0.80">
+            <div class="top"><h4>上次那个报错，是缓存没清</h4><span class="st">清晰</span></div>
+            <div class="track"><i></i></div>
+            <div class="from">上个月验证过一次</div>
+          </article>
+          <article class="mcard" data-w="0.50">
+            <div class="top"><h4>这个项目先不改样式，等下个版本</h4><span class="st">还记得</span></div>
+            <div class="track"><i></i></div>
+            <div class="from">三个月前提过一次</div>
+          </article>
+          <article class="mcard" data-w="0.30">
+            <div class="top"><h4>周五下午最好别安排发布</h4><span class="st">有点模糊</span></div>
+            <div class="track"><i></i></div>
+            <div class="from">去年随口说过一次</div>
+          </article>
+        </div>
+        <p class="demo-foot">
+          这不是随便做的动画。真实的系统里，每天都在跑同一条曲线：<b>久不用的变淡，常被用到、被验证过的留得久</b>。
+          淡到很低也不会真的消失，只是沉到旧档案里——真要用，还能翻出来。这张图只演示「不再被提起」的情况；实际用起来，常被用到的会被重新想起，掉得慢一些。
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 04 一张卡片 ============ -->
+<section class="sec" id="card">
+  <div class="wrap">
+    <div class="head read rv">
+      <div class="n">04</div>
+      <div>
+        <div class="k">它记住的样子</div>
+        <h2>一张卡片上，写了什么</h2>
+        <p>它不会把整段聊天原封不动塞给 AI。真正被留下来的，是一张张小卡片，每张都能说清「我从哪来」。</p>
+      </div>
+    </div>
+
+    <div class="anatomy">
+      <div class="rv">
+        <div class="bigcard">
+          <div class="label">记忆卡片 · 编号 8f31</div>
+          <h3>生产库端口是 6543</h3>
+          <div class="rule"></div>
+          <dl>
+            <dt>从哪来</dt><dd>10 月 21 日 · 和 Codex 的对话</dd>
+            <dt>何时有效</dt><dd>2026-10-21 起，暂时没被推翻</dd>
+            <dt>谁写的</dt><dd>自动整理，不是人手工填的</dd>
+            <dt>可信度</dt><dd>0.94 / 1.00</dd>
+          </dl>
+          <span class="stamp">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 12l5 5L20 6"/></svg>
+            有出处 · 能追溯
+          </span>
+        </div>
+      </div>
+
+      <ul class="anatomy-notes rv" data-d="1">
+        <li>
+          <span class="b">01</span>
+          <div><h4>只留一句话</h4><p>不是三百行聊天记录，而是一句能直接用的事实。</p></div>
+        </li>
+        <li>
+          <span class="b">02</span>
+          <div><h4>写着从哪听来的</h4><p>哪次对话、哪个文件。所以它能说「我记得」，也能说「我记错了，因为……」</p></div>
+        </li>
+        <li>
+          <span class="b">03</span>
+          <div><h4>事实变了会让位</h4><p>端口从 6543 改成 7000，旧卡片不会继续骗人，新的会顶上去，旧的留作记录。</p></div>
+        </li>
+        <li>
+          <span class="b">04</span>
+          <div><h4>可信度会变</h4><p>被真实结果验证过的往上走，从没验证过的排在后面。</p></div>
+        </li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 05 五步 ============ -->
+<section class="sec alt" id="flow">
+  <div class="wrap">
+    <div class="head read rv">
+      <div class="n">05</div>
+      <div>
+        <div class="k">一次对话</div>
+        <h2>你提问之后，它做了五件事</h2>
+        <p>整套动作都在你的电脑里完成，通常一瞬间就好了。</p>
+      </div>
+    </div>
+
+    <div class="steps">
+      <div class="step rv">
+        <div class="dot"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 5h16v11H9l-5 4V5z"/></svg></div>
+        <h4>你提问</h4>
+        <p>就跟平时一样，不用加任何特殊指令。</p>
+      </div>
+      <div class="step rv" data-d="1">
+        <div class="dot"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="8" height="7" rx="1.5"/><rect x="13" y="4" width="8" height="7" rx="1.5"/><rect x="3" y="14" width="8" height="6" rx="1.5"/><rect x="13" y="14" width="8" height="6" rx="1.5"/></svg></div>
+        <h4>翻卡片</h4>
+        <p>按你话里的关键词，把相关的卡片找出来。</p>
+      </div>
+      <div class="step rv" data-d="2">
+        <div class="dot"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M8 6h9a2 2 0 0 1 2 2v9"/><rect x="5" y="9" width="9" height="9" rx="2"/></svg></div>
+        <h4>挑出 8 张</h4>
+        <p>只留最相关的，最多 8 张，控制在几千字。</p>
+      </div>
+      <div class="step rv" data-d="2">
+        <div class="dot"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 12h13M13 7l5 5-5 5"/><path d="M20 4v16"/></svg></div>
+        <h4>递给 AI</h4>
+        <p>附一句：这些只是参考资料，不是命令。</p>
+      </div>
+      <div class="step rv" data-d="2">
+        <div class="dot"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3l2.6 5.4 5.9.8-4.3 4.1 1.1 5.9L12 16.4l-5.3 2.8 1.1-5.9L3.5 9.2l5.9-.8L12 3z"/></svg></div>
+        <h4>用完了打分</h4>
+        <p>结果好就加分，不好就减分，下次排序更准。</p>
+      </div>
+    </div>
+
+    <p class="steps-note rv">
+      关键在第三步：<b>不是把所有记忆都塞过去，而是只递最该递的那几张。</b>
+    </p>
+  </div>
+</section>
+
+<!-- ============ 06 能帮什么 ============ -->
+<section class="sec" id="help">
+  <div class="wrap">
+    <div class="head read rv">
+      <div class="n">06</div>
+      <div>
+        <div class="k">用得上吗</div>
+        <h2>它能帮你什么</h2>
+        <p>不是「更聪明的 AI」，而是「不用每次都从头讲起」。</p>
+      </div>
+    </div>
+
+    <div class="helps">
+      <article class="help rv">
+        <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 5h12a4 4 0 0 1 4 4v10H8a4 4 0 0 1-4-4V5z"/><path d="M8 9h8M8 13h5"/></svg></div>
+        <h3>少解释一遍</h3>
+        <p>你的偏好、项目背景、常用命令，说一次就够。下次它自己知道。</p>
+      </article>
+      <article class="help rv" data-d="1">
+        <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 8h13l-3-3M20 16H7l3 3"/></svg></div>
+        <h3>换个工具也能接上</h3>
+        <p>在 Claude Code 里说过的，换到 Codex、Cursor，照样能查到。</p>
+      </article>
+      <article class="help rv" data-d="2">
+        <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="8.5"/><path d="M12 7v5l3.5 2"/></svg></div>
+        <h3>翻旧账</h3>
+        <p>「上次那个报错最后怎么修的？」直接问，不用翻聊天记录。</p>
+      </article>
+      <article class="help rv">
+        <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6l8-3z"/><path d="M9 12l2 2 4-4"/></svg></div>
+        <h3>少踩同一个坑</h3>
+        <p>踩过的坑会被记下来，下次动手前它先提醒你一句。</p>
+      </article>
+      <article class="help rv" data-d="1">
+        <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5L21 21"/></svg></div>
+        <h3>说话有依据</h3>
+        <p>每条结论都能点回原话，不是凭空编一个听起来很像的答案。</p>
+      </article>
+      <article class="help rv" data-d="2">
+        <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="10" width="16" height="10" rx="2.5"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg></div>
+        <h3>数据不出门</h3>
+        <p>没有云端账号，也不上传。记忆就是这台电脑上的一个文件。</p>
+      </article>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 07 说实话 ============ -->
+<section class="sec" id="truth" style="padding-top:20px">
+  <div class="wrap">
+    <div class="honest rv">
+      <div class="k" style="font-family:var(--mono);font-size:.72rem;letter-spacing:.12em;color:#a3772f;margin-bottom:8px">说点实话</div>
+      <h2>它做不到的事，也写在前面</h2>
+      <p>一个工具值不值得用，先看它的短板你能不能接受。</p>
+      <ul>
+        <li><span><b>换个说法问，它可能找不到。</b>它是按关键词找的，不是真的懂意思。我们测过：用原话问，几乎都能找到；换个说法，大约四次里只有一次。</span></li>
+        <li><span><b>只在这台电脑上。</b>换电脑要手动搬一次；手机上看不到。</span></li>
+        <li><span><b>要动手装。</b>现在还不是双击就用的成品，需要一点命令行基础。</span></li>
+        <li><span><b>记多了要整理。</b>它会自动整理，但不是魔法，偶尔需要人看一眼。</span></li>
+        <li><span><b>不会替你做决定。</b>它只提供记忆，不提供判断。</span></li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 08 怎么开始 ============ -->
+<section class="sec alt" id="start">
+  <div class="wrap">
+    <div class="head read rv">
+      <div class="n">07</div>
+      <div>
+        <div class="k">想试试的话</div>
+        <h2>三步，让它开始记</h2>
+        <p>不用注册，不用 API Key，不会上传任何东西。</p>
+      </div>
+    </div>
+
+    <div class="start">
+      <div class="rv">
+        <ul class="start-steps">
+          <li><span class="n">01</span><div><h3>装好它</h3><p>需要 Python 3.9 以上。一条命令，装完就在那了。</p></div></li>
+          <li><span class="n">02</span><div><h3>让它跑起来</h3><p>启动后它在后台待着，平时不打扰你。</p></div></li>
+          <li><span class="n">03</span><div><h3>照常聊天</h3><p>打开你常用的 AI 工具，该干嘛干嘛。它会自己开始记事。</p></div></li>
+        </ul>
+        <p class="start-note">
+          第一次装，建议先跑一下体检命令，确认它真的在记。<br>
+          想看看它记了什么，浏览器打开 <span class="mono">127.0.0.1:8765/ui</span> 就行。
+        </p>
+      </div>
+
+      <div class="rv" data-d="1">
+        <div class="term">
+          <div class="term-bar"><i></i><i></i><i></i><span style="margin-left:6px">终端 · 三条命令</span><button class="copy" data-copy>复制</button></div>
+          <pre><span class="c"># 1. 初始化（已经装过就跳过）</span>
+<span class="p">$</span> python3 -m hippomind init
+
+<span class="c"># 2. 启动，之后它会一直在后台</span>
+<span class="p">$</span> python3 -m hippomind start
+
+<span class="c"># 3. 接上你常用的 AI 工具</span>
+<span class="p">$</span> python3 -m hippomind install-agents --auto
+
+<span class="c"># 检查它是否正常</span>
+<span class="p">$</span> python3 -m hippomind checkup</pre>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 结尾 ============ -->
+<section class="closing">
+  <div class="wrap">
+    <p class="big rv">
+      它不聪明。<br>
+      它只是<span>记性好</span>。
+    </p>
+    <p class="sub rv" data-d="1">而很多时候，记住就够了。</p>
+    <a class="back rv" data-d="2" href="#top">回到开头 ↑</a>
+  </div>
+</section>
+
+</main>
+
+<footer class="foot">
+  <div class="wrap">
+    <div class="foot-in">
+      <div class="l">
+        <span>HippoMind</span>
+        <span>一个跑在本机的记忆小工具</span>
+      </div>
+      <div class="l">
+        <a href="https://github.com/zps-31/hippomind" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://github.com/zps-31/hippomind/blob/main/LICENSE" target="_blank" rel="noopener">MIT 许可</a>
+        <a href="../site/index.html">想看技术细节 →</a>
+      </div>
+    </div>
+  </div>
+</footer>
+
+<script>
+(function () {
+  "use strict";
+  var reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  var nav = document.getElementById("nav");
+  var bar = document.getElementById("bar");
+
+  function onScroll() {
+    var y = window.scrollY || 0;
+    nav.classList.toggle("solid", y > 18);
+    var h = document.documentElement.scrollHeight - window.innerHeight;
+    bar.style.width = (h > 0 ? Math.min(100, y / h * 100) : 0) + "%";
+    var ids = ["trouble", "how", "demo", "help", "truth", "start"];
+    var cur = "";
+    ids.forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el && el.getBoundingClientRect().top <= 140) cur = id;
+    });
+    document.querySelectorAll(".nav a.link").forEach(function (a) {
+      a.classList.toggle("on", a.getAttribute("href") === "#" + cur);
+    });
+  }
+  window.addEventListener("scroll", onScroll, { passive: true });
+  onScroll();
+
+  /* 移动端菜单 */
+  var burger = document.getElementById("burger");
+  var mob = document.getElementById("mob");
+  function setMenu(open) {
+    mob.classList.toggle("open", open);
+    burger.setAttribute("aria-expanded", open ? "true" : "false");
+    document.body.style.overflow = open ? "hidden" : "";
+  }
+  burger.addEventListener("click", function () { setMenu(!mob.classList.contains("open")); });
+  mob.querySelectorAll("a").forEach(function (a) { a.addEventListener("click", function () { setMenu(false); }); });
+  window.addEventListener("keydown", function (e) { if (e.key === "Escape") setMenu(false); });
+
+  /* 出现动画 */
+  var items = document.querySelectorAll(".rv");
+  if ("IntersectionObserver" in window && !reduce) {
+    var io = new IntersectionObserver(function (es) {
+      es.forEach(function (e) { if (e.isIntersecting) { e.target.classList.add("in"); io.unobserve(e.target); } });
+    }, { rootMargin: "0px 0px -6% 0px", threshold: 0.08 });
+    items.forEach(function (el) { io.observe(el); });
+  } else {
+    items.forEach(function (el) { el.classList.add("in"); });
+  }
+
+  /* 复制 */
+  document.querySelectorAll("[data-copy]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var pre = btn.closest(".term").querySelector("pre");
+      if (!pre) return;
+      var text = pre.innerText;
+      function done() {
+        var old = btn.textContent;
+        btn.textContent = "已复制";
+        setTimeout(function () { btn.textContent = old; }, 1500);
+      }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, fallback);
+      } else { fallback(); }
+      function fallback() {
+        var ta = document.createElement("textarea");
+        ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+        document.body.appendChild(ta); ta.select();
+        try { document.execCommand("copy"); done(); } catch (e) { /* ignore */ }
+        document.body.removeChild(ta);
+      }
+    });
+  });
+
+  /* 衰减演示：w = max(0.02, w0 * e^(-0.008 * t)) */
+  (function () {
+    var range = document.getElementById("range");
+    if (!range) return;
+    var dayNum = document.getElementById("dayNum");
+    var cards = Array.prototype.slice.call(document.querySelectorAll(".mcard"));
+    var FLOOR = 0.02, LAMBDA = 0.008;
+
+    function label(w) {
+      if (w >= 0.75) return "清晰";
+      if (w >= 0.45) return "还记得";
+      if (w >= 0.22) return "有点模糊";
+      return "几乎想不起";
+    }
+    function render() {
+      var days = +range.value;
+      dayNum.textContent = days;
+      cards.forEach(function (card) {
+        var w0 = parseFloat(card.dataset.w);
+        var w = Math.max(FLOOR, w0 * Math.exp(-LAMBDA * days));
+        card.style.opacity = (0.18 + 0.82 * w).toFixed(3);
+        card.querySelector(".st").textContent = label(w);
+        card.querySelector(".track i").style.width = (w * 100).toFixed(1) + "%";
+      });
+    }
+    range.addEventListener("input", render);
+    render();
+  })();
+})();
+</script>
+</body>
+</html>
