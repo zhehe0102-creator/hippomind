@@ -16,11 +16,12 @@ from __future__ import annotations
 import json
 import math
 import os
+import tempfile
+import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
-
-from functools import lru_cache
 
 from .textutil import tokenize_multilingual
 
@@ -103,6 +104,8 @@ class SemanticSpaceEmbedding:
         self.dim = int(model.get("dim") or 0)
         self.vectors = model.get("vectors") or {}
         self.fallback = fallback
+        self._cache: OrderedDict[str, tuple] = OrderedDict()
+        self._cache_lock = threading.Lock()
 
     @classmethod
     def load(cls, path: Optional[os.PathLike] = None, fallback=None):
@@ -115,8 +118,12 @@ class SemanticSpaceEmbedding:
             return None
         return cls(model, fallback=fallback)
 
-    @lru_cache(maxsize=4096)
     def _embed_cached(self, text: str) -> tuple:
+        with self._cache_lock:
+            cached = self._cache.get(text)
+            if cached is not None:
+                self._cache.move_to_end(text)
+                return cached
         tokens = tokenize_multilingual(text)
         accumulator = [0.0] * self.dim
         used = 0
@@ -128,10 +135,18 @@ class SemanticSpaceEmbedding:
             for i, value in enumerate(vector):
                 accumulator[i] += value
         if used == 0:
-            fallback = self.fallback.embed(text) if self.fallback is not None else []
-            return tuple(fallback)
-        norm = math.sqrt(sum(value * value for value in accumulator)) or 1.0
-        return tuple(value / norm for value in accumulator)
+            if self.fallback is not None and int(getattr(self.fallback, "dim", 0) or 0) == self.dim:
+                vec = tuple(self.fallback.embed(text))
+            else:
+                vec = (0.0,) * max(0, self.dim)
+        else:
+            norm = math.sqrt(sum(value * value for value in accumulator)) or 1.0
+            vec = tuple(value / norm for value in accumulator)
+        with self._cache_lock:
+            self._cache[text] = vec
+            if len(self._cache) > 4096:
+                self._cache.popitem(last=False)
+        return vec
 
     def embed(self, text: str) -> List[float]:
         return list(self._embed_cached(str(text or "")))
@@ -143,10 +158,34 @@ class SemanticSpaceEmbedding:
 
 
 def save(model: Mapping[str, Any], path: Optional[os.PathLike] = None) -> Path:
+    """Atomically persist the fitted model (unique temp file + os.replace).
+
+    The daemon rebuilds this model in a background pass while readers may be
+    loading it for live queries.  Writing the target in place let a reader
+    observe a truncated JSON document and silently fall back to the
+    deterministic embedder; a unique temporary file published with
+    os.replace makes every reader see either the previous model or the new
+    one, and keeps two concurrent savers from sharing one temp path.
+    """
     target = Path(path).expanduser() if path else default_model_path()
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(model, ensure_ascii=False, separators=(",", ":")),
-                      encoding="utf-8")
+    payload = json.dumps(model, ensure_ascii=False, separators=(",", ":"))
+    temporary = ""
+    try:
+        fd, temporary = tempfile.mkstemp(
+            prefix="." + target.name + ".", suffix=".tmp", dir=str(target.parent))
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+        temporary = ""
+    finally:
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
     return target
 
 

@@ -81,6 +81,165 @@ class AsOfSliceTests(unittest.TestCase):
         self.assertNotIn("8000", str(pack_now.get("text", "")))
 
 
+class ContextPackTaskExpansionAsOfTests(unittest.TestCase):
+    """WP-C：任务状态补充检索也必须透传 as_of。
+
+    历史包回答的是「as_of 当时系统认为什么为真」。任务状态展开是主检索之外
+    的第二条查询（ledger.search("", task_id=...)）；漏传 as_of 时它按「现在」
+    取数，会把 as_of 之后才登记的进度/决定塞回历史包——主检索是对的，双时态
+    却在展开通路上悄悄失效。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="hippo-asof-expand-")
+        self.addCleanup(self.tmp.cleanup)
+        self.ledger = SQLiteLedger(Path(self.tmp.name) / "hub.sqlite")
+        self.addCleanup(self.ledger.close)
+        now = time.time()
+        self.as_of = _fmt(now - 2 * 86400)
+        self.ledger.ingest({
+            "kind": "task", "scope": "shared", "source_agent": "tester",
+            "content": "任务 t-100 登录页重构 阶段一已完成",
+            "evidence": ["e:asof-past"], "task_id": "t-100", "project": "atlas",
+            "valid_from": _fmt(now - 3 * 86400),
+            "timestamp": _fmt(now - 3 * 86400),
+            "event_id": "asof-expand-past",
+            "metadata": {"context": {"progress": ["阶段一：登录页重构已完成"]}},
+        })
+        # as_of 之后才登记的进度：历史切片里必须不存在，当前包里才应可见。
+        self.ledger.ingest({
+            "kind": "progress", "scope": "shared", "source_agent": "tester",
+            "content": "任务 t-100 进度 阶段二密码重置改造已完成",
+            "evidence": ["e:asof-new"], "task_id": "t-100", "project": "atlas",
+            "valid_from": _fmt(now - 86400),
+            "timestamp": _fmt(now - 86400),
+            "event_id": "asof-expand-new",
+            "metadata": {"context": {"progress": ["阶段二：密码重置改造已完成"]}},
+        })
+
+    def test_historical_pack_excludes_progress_added_after_as_of(self):
+        builder = ContextPackBuilder(self.ledger)
+        current = builder.build("登录页重构", ContextPackOptions(max_items=4))
+        self.assertIn("密码重置", str(current.get("text", "")),
+                      "夹具前提不成立：当前包应当渲染阶段二进度")
+
+        historical = builder.build(
+            "登录页重构", ContextPackOptions(max_items=4, as_of=self.as_of))
+        text = str(historical.get("text", ""))
+        self.assertIn("阶段一", text, "历史包应当包含 as_of 当时的任务状态")
+        self.assertNotIn("密码重置", text,
+                         "历史包包含了 as_of 之后才登记的进度（任务展开漏传 as_of）")
+
+        # 历史切片必须排除 as_of 之后才生效的记忆本身（主检索路径）。
+        hits = self.ledger.search("登录页重构", scope="shared", limit=10,
+                                  as_of=self.as_of)
+        self.assertNotIn("密码重置", " ".join(hit["content"] for hit in hits))
+
+
+class ContextPackCausalAncestorAsOfTests(unittest.TestCase):
+    """WP-H：因果祖先展开也必须遵守 as_of（历史包不得泄漏 as_of 之后才生效的祖先）。
+
+    context_pack 的任务卡展开会调用 causal_ancestors 补因果证据；WP-H 之前
+    该接口没有 as_of，只能按「现在」过滤祖先窗口，于是历史包会带上 as_of
+    之后才出现的祖先（未来泄漏），同时看不见当时有效、现在 superseded 的
+    祖先（历史欠收）。这里端到端锁定 context_pack 的透传。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="hippo-asof-causal-")
+        self.addCleanup(self.tmp.cleanup)
+        self.ledger = SQLiteLedger(Path(self.tmp.name) / "hub.sqlite")
+        self.addCleanup(self.ledger.close)
+        now = time.time()
+        self.as_of = _fmt(now - 5 * 86400)
+        past_from = _fmt(now - 10 * 86400)
+        recent_from = _fmt(now - 3600)
+        old = self.ledger.ingest({
+            "kind": "blocker", "scope": "shared", "source_agent": "tester",
+            "content": "祖先阻塞甲 证书审批未完成", "evidence": ["e:anc-old"],
+            "valid_from": past_from, "timestamp": past_from,
+            "event_id": "asof-causal-old",
+        })
+        new = self.ledger.ingest({
+            "kind": "blocker", "scope": "shared", "source_agent": "tester",
+            "content": "祖先阻塞乙 新出现的监控告警", "evidence": ["e:anc-new"],
+            "valid_from": recent_from, "timestamp": recent_from,
+            "event_id": "asof-causal-new",
+        })
+        self.ledger.ingest({
+            "kind": "task", "scope": "shared", "source_agent": "tester",
+            "content": "任务 t-200 部署交接 阶段一", "evidence": ["e:seed"],
+            "task_id": "t-200", "valid_from": past_from, "timestamp": past_from,
+            "event_id": "asof-causal-seed",
+            "metadata": {"context": {"progress": ["阶段一：交接准备完成"]}},
+            "causal_parents": [
+                {"memory_id": old.memory_id, "relation_type": "caused_by"},
+                {"memory_id": new.memory_id, "relation_type": "caused_by"},
+            ],
+        })
+
+    def test_historical_pack_excludes_ancestor_that_appears_later(self):
+        builder = ContextPackBuilder(self.ledger)
+        current = builder.build("部署交接", ContextPackOptions(max_items=4))
+        cur_text = str(current.get("text", ""))
+        self.assertIn("证书审批", cur_text,
+                      "夹具前提不成立：当前包应渲染历史祖先")
+        self.assertIn("监控告警", cur_text,
+                      "夹具前提不成立：当前包应渲染新近祖先")
+
+        historical = builder.build(
+            "部署交接", ContextPackOptions(max_items=4, as_of=self.as_of))
+        hist_text = str(historical.get("text", ""))
+        self.assertIn("证书审批", hist_text,
+                      "as_of 当时已生效的祖先必须出现在历史包")
+        self.assertNotIn("监控告警", hist_text,
+                         "历史包泄漏了 as_of 之后才生效的因果祖先")
+
+
+class FollowupAnchorAsOfTests(unittest.TestCase):
+    """WP-M：as_of 历史切片不得用当前会话做 follow-up 锚定。
+
+    锚点来自「现在」的会话消息；把它注入点时间查询会把 as_of 之后才发生的
+    上下文带进历史包。实现里 as_of 非空时跳过锚定（debug 不出现
+    query_context），这里端到端锁定该边界。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="hippo-asof-anchor-")
+        self.addCleanup(self.tmp.cleanup)
+        self.ledger = SQLiteLedger(Path(self.tmp.name) / "hub.sqlite")
+        self.addCleanup(self.ledger.close)
+        self.ledger.ingest({
+            "kind": "task", "scope": "shared", "source_agent": "tester",
+            "content": "GUI recall 视图优化任务", "evidence": ["e:asof-anchor"],
+            "task_id": "gui-recall",
+            "metadata": {"context": {"goal": ["优化 GUI 的 recall 视图"]}},
+        })
+        self.ledger.ingest({
+            "kind": "raw_chat", "raw_chat": True, "role": "user",
+            "scope": "shared", "source_agent": "claude", "session_id": "s-asof",
+            "content": "优化 GUI 的 recall 视图", "evidence": ["e:raw-anchor"],
+        })
+        self.as_of = _fmt(time.time() - 2 * 86400)
+
+    def test_as_of_disables_followup_anchoring(self):
+        builder = ContextPackBuilder(self.ledger)
+        anchored = builder.build("继续", ContextPackOptions(max_items=4, min_score=0,
+                                                            debug=True))
+        self.assertIn("GUI", str(anchored.get("text", "")))
+        self.assertTrue(anchored["debug"]["query_context"]["applied"])
+
+        historical = builder.build(
+            "继续", ContextPackOptions(max_items=4, min_score=0, debug=True,
+                                      as_of=self.as_of))
+        historical_off = builder.build(
+            "继续", ContextPackOptions(max_items=4, min_score=0, debug=True,
+                                      as_of=self.as_of, query_context=False))
+        self.assertEqual(historical, historical_off,
+                         "as_of 历史包在锚定开关开/关下必须完全一致")
+        self.assertNotIn("query_context", historical.get("debug", {}))
+
+
 class SlowSearchSentinelTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

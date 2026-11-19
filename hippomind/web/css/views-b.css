@@ -567,6 +567,51 @@
 .vb-recall-foot-note { font-size: 11px; }
 .vb-suggestions { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; }
 
+/* as_of 双时态切片：输入格 + 一键回到现在。
+   清空按钮只在输入框里有草稿时才有意义，所以和输入框同排、右对齐。 */
+.vb-asof-cell { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.vb-asof-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+.vb-asof-clear { flex: 0 0 auto; }
+.vb-asof-note {
+  display: none;
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--warn);
+}
+.vb-asof-note.is-visible { display: inline; }
+
+/* 历史切片横幅。这是整个视图里唯一一处「结果不是当前状态」的显式声明，
+   所以用整条底色带 + 左侧色条，而不是普通提示文字：用户扫一眼结果区就
+   必须先看到它。颜色全部走 token，两套主题都成立。 */
+.vb-recall-slice {
+  display: flex;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--warn);
+  border-left-width: 3px;
+  border-radius: var(--radius-control);
+  background: var(--surface-2);
+  color: var(--ink-2);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.vb-recall-slice .icon { flex: 0 0 auto; margin-top: 1px; color: var(--warn); }
+.vb-recall-slice-body { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.vb-recall-slice-body b {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.vb-recall-slice-stamp {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--warn);
+  overflow-wrap: anywhere;
+}
+.vb-recall-slice-note { margin: 0; color: var(--ink-3); font-size: 11.5px; }
+
+
 /* ------------------------------------------------------------ compose -- */
 
 .vb-compose {
@@ -759,6 +804,8 @@
   .vb-budget { grid-template-columns: minmax(0, 1fr); }
   .vb-budget-meta { grid-column: auto; }
   .vb-recall-input { font-size: 20px; }
+  .vb-asof-actions { flex-direction: column; align-items: flex-start; }
+  .vb-recall-slice { padding: 9px 10px; }
   .vb-pack-field { grid-template-columns: minmax(0, 1fr); gap: 0; }
 }
 
@@ -936,4 +983,278 @@
 @media (max-width: 760px) {
   .vb-toolbar-exports { align-items: flex-start; }
   .vb-facts-actions { width: 100%; }
+}
+
+/* ============================================================= forgetting -- */
+/* 11 forgetting: an audit sheet.  Every colour comes from tokens.css; the tone
+   attributes carry the honesty verdict, so a "none" coverage state must read as
+   danger in both registers without any colour literal here. */
+.vb-forgetting { display: flex; flex-direction: column; gap: var(--space-4); min-width: 0; }
+.vb-forgetting.is-busy { opacity: .72; }
+.vb-fg-body { display: flex; flex-direction: column; gap: var(--space-4); min-width: 0; }
+
+.vb-fg-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--space-3) var(--space-5);
+  padding-bottom: var(--space-3);
+  border-bottom: 1px solid var(--rule);
+}
+.vb-fg-toolbar-main { display: flex; flex-wrap: wrap; align-items: flex-end; gap: var(--space-4); }
+.vb-fg-control { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.vb-fg-toolbar-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.vb-fg-toolbar-meta .vb-note { padding-top: 0; }
+
+/* ---- verdict ---- */
+.vb-fg-verdict {
+  display: grid;
+  grid-template-columns: minmax(0, 1.65fr) minmax(0, 1fr);
+  gap: var(--space-4) var(--space-6);
+  padding: var(--space-5) var(--space-6);
+  border: 1px solid var(--rule);
+  border-left: 3px solid var(--rule-strong);
+  background: var(--surface);
+}
+.vb-fg-verdict[data-tone="danger"] { border-left-color: var(--danger); }
+.vb-fg-verdict[data-tone="warn"] { border-left-color: var(--warn); }
+.vb-fg-verdict[data-tone="ok"] { border-left-color: var(--ok); }
+.vb-fg-verdict-main { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.vb-fg-verdict-word {
+  font-family: var(--font-serif);
+  font-size: 34px;
+  line-height: 1.1;
+  letter-spacing: .02em;
+  color: var(--ink-3);
+}
+.vb-fg-verdict-word[data-tone="danger"] { color: var(--danger); }
+.vb-fg-verdict-word[data-tone="warn"] { color: var(--warn); }
+.vb-fg-verdict-word[data-tone="ok"] { color: var(--ok); }
+.vb-fg-verdict-headline { font-size: 13.5px; line-height: 1.65; color: var(--ink-2); }
+.vb-fg-verdict-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--ink-3);
+}
+.vb-fg-verdict-side {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-3);
+  align-content: start;
+}
+.vb-fg-caveats {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--rule);
+}
+.vb-fg-caveat {
+  display: flex;
+  gap: 7px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--ink-2);
+}
+.vb-fg-caveat-mark { flex: 0 0 auto; color: var(--ink-4); }
+
+/* ---- the three properties ---- */
+.vb-fg-principles { display: flex; flex-direction: column; gap: var(--space-3); margin-top: var(--space-3); }
+.vb-fg-principle {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 14px;
+  border: 1px solid var(--rule);
+  border-left: 3px solid var(--rule-strong);
+  background: var(--surface-2);
+}
+.vb-fg-principle[data-tone="danger"] { border-left-color: var(--danger); }
+.vb-fg-principle[data-tone="warn"] { border-left-color: var(--warn); }
+.vb-fg-principle[data-tone="ok"] { border-left-color: var(--ok); }
+.vb-fg-principle-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.vb-fg-principle-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--rule-strong);
+}
+.vb-fg-principle-dot.tone-danger { background: var(--danger); }
+.vb-fg-principle-dot.tone-warn { background: var(--warn); }
+.vb-fg-principle-dot.tone-ok { background: var(--ok); }
+.vb-fg-principle-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--font-serif);
+  font-size: 15px;
+  font-weight: 600;
+}
+.vb-fg-principle-evidence {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.65;
+  color: var(--ink-3);
+}
+.vb-fg-principle-reading { font-size: 12.5px; line-height: 1.7; color: var(--ink-2); }
+
+/* ---- coverage ---- */
+.vb-fg-coverage { display: flex; flex-direction: column; gap: var(--space-4); }
+.vb-fg-coverage-meters {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-4);
+}
+.vb-fg-warn {
+  padding: 8px 12px;
+  border-left: 2px solid var(--warn);
+  background: var(--surface-2);
+  font-size: 11.5px;
+  line-height: 1.65;
+  color: var(--ink-2);
+}
+
+/* ---- reasons ---- */
+.vb-fg-rules { display: flex; flex-direction: column; margin: var(--space-3) 0 0; }
+.vb-fg-rule-row {
+  display: grid;
+  grid-template-columns: minmax(150px, 220px) minmax(0, 1fr);
+  gap: var(--space-3);
+  padding: 10px 0;
+  border-top: 1px solid var(--rule);
+}
+.vb-fg-rule-row:first-child { border-top: 0; }
+.vb-fg-rule-row dt { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; margin: 0; }
+.vb-fg-rule-row dd { margin: 0; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.vb-fg-rule-label { font-size: 12px; color: var(--ink-2); }
+.vb-fg-rule-text { font-size: 11.5px; line-height: 1.6; color: var(--ink-3); }
+.vb-fg-rule-stats {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--ink-3);
+}
+
+/* ---- top drops ---- */
+.vb-fg-drops { min-width: 720px; }
+.vb-fg-mid { font-family: var(--font-mono); font-size: 11px; color: var(--ink-2); }
+.vb-fg-zero-drop { color: var(--ink-3); }
+.vb-fg-zero-note {
+  padding: 8px 12px;
+  border-left: 2px solid var(--warn);
+  background: var(--surface-2);
+  margin-top: var(--space-2);
+}
+
+/* ---- recoverability ---- */
+.vb-fg-recall { display: flex; flex-direction: column; gap: var(--space-3); }
+.vb-fg-blockers, .vb-fg-blocker-examples {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding-top: var(--space-2);
+}
+.vb-fg-blocker {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: 4px 0;
+  border-bottom: 1px dotted var(--rule);
+}
+.vb-fg-blocker-code { font-family: var(--font-mono); font-size: 11px; color: var(--ink-2); overflow-wrap: anywhere; }
+.vb-fg-blocker-count { font-family: var(--font-mono); font-size: 11px; color: var(--ink-3); flex: 0 0 auto; }
+.vb-fg-blocker-example {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  padding: 3px 0;
+  font-size: 11px;
+}
+.vb-fg-recall-explain { display: flex; flex-direction: column; gap: var(--space-2); }
+.vb-fg-recall-steps {
+  margin: 0;
+  padding-left: 20px;
+  font-size: 11.5px;
+  line-height: 1.7;
+  color: var(--ink-2);
+}
+.vb-fg-recall-steps li { margin: 2px 0; }
+
+/* ---- distribution ---- */
+.vb-fg-dist {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-4);
+}
+.vb-fg-dist-block { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.vb-fg-targets { display: flex; flex-wrap: wrap; gap: 8px; }
+.vb-fg-target { display: inline-flex; align-items: center; gap: 6px; }
+.vb-fg-target-count { font-family: var(--font-mono); font-size: 11px; color: var(--ink-3); }
+
+/* ---- reproduce ---- */
+.vb-fg-repro { display: flex; flex-direction: column; gap: var(--space-2); }
+.vb-fg-cmd {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: 7px 10px;
+  border: 1px solid var(--rule);
+  background: var(--surface-2);
+}
+.vb-fg-cmd-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--ink-2);
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 1200px) {
+  .vb-fg-dist { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .vb-fg-verdict { grid-template-columns: minmax(0, 1fr); }
+  .vb-fg-verdict-side { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+@media (max-width: 900px) {
+  .vb-fg-verdict { padding: var(--space-4); }
+  .vb-fg-coverage-meters { grid-template-columns: minmax(0, 1fr); }
+  .vb-fg-dist { grid-template-columns: minmax(0, 1fr); }
+  .vb-fg-rule-row { grid-template-columns: minmax(0, 1fr); gap: 6px; }
+}
+@media (max-width: 760px) {
+  .vb-fg-toolbar { flex-direction: column; align-items: stretch; }
+  .vb-fg-toolbar-main { flex-direction: column; align-items: stretch; }
+  .vb-fg-verdict-side { grid-template-columns: minmax(0, 1fr); }
+  .vb-fg-verdict-word { font-size: 26px; }
+  .vb-fg-cmd { flex-direction: column; align-items: stretch; gap: 8px; }
+}
+
+/* ================================================= relation tier swatches -- */
+/* 图例里的关系层级色块。同主语/同任务靠**线型**区分（虚线/点线），
+   不只靠颜色：色相继续表示因果/支持/冲突，两个结构层级在色觉之外也能分辨。
+   色块用 border-style 画线型，颜色全部走 token。 */
+.vb-dot--ink2 { background: var(--ink-2); }
+.vb-dot--dotted {
+  background: transparent;
+  border-top: 2px dotted var(--ink-3);
+  border-radius: 0;
+  height: 0;
+  width: 9px;
+}
+/* 同主语在图例里用虚线：和画布上的 relationDash([7,3]) 对应。 */
+.vb-legend-item .vb-dot--ink2 {
+  background: transparent;
+  border-top: 2px dashed var(--ink-2);
+  border-radius: 0;
+  height: 0;
+  width: 9px;
+}
+@media (max-width: 760px) {
+  .vb-graph-legend { gap: 8px 12px; font-size: 10.5px; }
 }

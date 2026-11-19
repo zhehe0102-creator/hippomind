@@ -34,9 +34,15 @@ class MetricsEndpointTests(unittest.TestCase):
                      "X-HippoMind-Token": self.service.token})
         urllib.request.urlopen(req, timeout=10).read()
 
+    def _metrics(self):
+        # /metrics now requires the local token (it used to be anonymous).
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/metrics",
+            headers={"X-HippoMind-Token": self.service.token})
+        return urllib.request.urlopen(req, timeout=5)
+
     def test_prometheus_format_and_counts(self):
-        resp = urllib.request.urlopen(
-            f"http://127.0.0.1:{self.port}/metrics", timeout=5)
+        resp = self._metrics()
         self.assertIn("text/plain; version=0.0.4", resp.headers["Content-Type"])
         body = resp.read().decode()
         for name in ("hippomind_memories_total", "hippomind_events_total",
@@ -48,8 +54,7 @@ class MetricsEndpointTests(unittest.TestCase):
         self.assertGreaterEqual(int(float(val.split()[-1])), 3)
 
     def test_uptime_non_negative(self):
-        body = urllib.request.urlopen(
-            f"http://127.0.0.1:{self.port}/metrics", timeout=5).read().decode()
+        body = self._metrics().read().decode()
         up = [l for l in body.splitlines()
               if l.startswith("hippomind_uptime_seconds ")][0]
         self.assertGreaterEqual(float(up.split()[-1]), 0.0)

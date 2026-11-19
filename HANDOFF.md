@@ -1,8 +1,91 @@
 # HippoMind 交接说明（新会话直接粘贴用）
 
-> 生成时间：2026-10-24 22:12 PDT
-> 工作目录：`/Volumes/移动硬盘/记忆系统重构`
-> 当前 HEAD：`84bdd12`（round 11，工作区干净，只有无关的 `系统盘清理仪表盘.html` 未跟踪）
+> 生成时间：2026-11-13 01:30 PST
+> 工作目录：/Volumes/移动硬盘/记忆系统重构
+> 当前 HEAD：fd8b3a6（round 12）+ 未提交的 round 13 全面优化（详见 OPTIMIZATION_REPORT.md）
+
+
+## 0. round 13：按审计结论完成的全面优化（2026-11-13）
+
+本轮不再新增功能，专注修复审计会话 e71ca582 的 13 条可复现缺陷与 P2 工程债。
+完整清单、设计取舍与验收证据见 OPTIMIZATION_REPORT.md；实施分解见
+docs/OPTIMIZATION_PLAN_2026-11-13.md。
+
+**修复摘要（按 WP）**
+
+| WP | 内容 | 关键产物 |
+| --- | --- | --- |
+| A | 注入边界：payload 的 < 转义，渲染恰好 1 开 1 闭 | llm_agent.escape_untrusted_text/render_untrusted_block、DSH escapeUntrusted/clipEscaped |
+| B | 只读模式：mode=ro+query_only，后台写循环全停，/metrics 鉴权，trace/metrics 0600+轮转+尾部读，跨线程连接回收 | SQLiteLedger(read_only=True)、daemon 门禁、health.background |
+| C | 冲突裁决收窄到槽位；as_of 全链路透传；同秒窗口 +1s；负反馈不抬置信度 | resolve_claim 委托 settle_claim_slot、test_conflict_blast_radius |
+| D | 采集游标持久化绝对行号/session/cwd；Gemini 复合 keyset；提炼继承 scope + 派生标记；摘要随新消息刷新并 supersede | transcripts.py、gemini_capture.py、distill.py、session_digest.py |
+| E | identity v3（来源事件 ID + 流式修订收敛，v2/v1 兼容）；JSONL 导出完整 claims/procedural；向量并发快照 + 原子保存 | ledger/identity.py、ledger/clients.py、vector_index.py |
+| F | HTTP 注入统一 trace（含空结果/未注入对照组、延迟、memory_ids），/stats 有界窗口 | injection_trace.record_server_injection、daemon /context-pack |
+| G | integrations/query.py 原子重写 + flock + upsert | test_query_rewrite.py |
+
+**验收（本机实测）**
+
+- 全量：Ran 1864 tests — OK（全部通过；顺带修掉一个依赖固定日期的时效用例）。
+- 审计验收：python3 scripts/audit_acceptance.py --json → 13/13 PASS。
+- schema drill ok=true；node tests/test_dsh_plugin.mjs 7/7；scripts/lint.sh OK（ruff 0.16.3，gate 90/90）。
+
+**行为变化（会用到的）**
+
+- resolve_claim 现在只裁决传入槽位，不再让整条败者记忆下线；返回 resolved/winner/losers 兼容字段。
+- --read-only 要求已初始化账本快照；只读进程不写账本/不改 Agent 配置；/metrics 需 token。
+- 新增 GET /context-pack（与 POST 同语义、同鉴权）。
+- 提炼产物继承来源 scope；私有 raw 默认不再进 shared。
+- 注入 trace 新增 injected=false 对照组与 empty_reason/latency_ms。
+
+
+**第二轮增强（2026-11-13 晚，目标接近满分）**
+
+| 工作包 | 内容 |
+| --- | --- |
+| WP-H | causal_ancestors 新增 as_of；context_pack 透传，历史包不再泄漏未来祖先 |
+| WP-I | commons 双存储对账（compare/repair + scripts/reconcile_commons.py，默认只读、repair 只同步窗口） |
+| WP-J | CI 矩阵 3.9–3.13 + macOS；release-gate job；scripts/release_check.sh 一键 7 步门禁 |
+| WP-K | HTTP /context-pack 随机 A/B：control 臂空包 + arm 分桶 trace；scripts/injection_ab_report.py 因果分析 |
+| WP-L | scripts/governance_rehearsal.py：冻结副本治理演练（backup 快照、源指纹校验、apply 只写副本） |
+| 兼容 | Python 3.13 全量通过（random seed 兼容、停机 WAL 顺序重写、跨 SQLite 版本侧车断言） |
+
+复跑口径：`bash scripts/release_check.sh` → 9/9 PASS；Python 3.9 与 3.13 各 `Ran 2066 tests ... OK`；审计验收 13/13；检索质量门禁 recall 1.000 / MRR 0.9722 / update 1.000 / abstain 1.000；备份/恢复/篡改拒绝演练 PASS。
+审计验收 `scripts/audit_acceptance.py --json` → 13/13；治理演练合成账本 before 悬空 26 / 重复 60 → after 全 0。
+
+仍未闭环（环境/数据边界）：生产部署未执行（本机无生产主账本与 daemon）、A/B 需真实流量样本、
+关系边时间窗与 claim 级历史投影仍欠收、commons stale/missing 需人工修复。
+**下一步建议**：commons 双存储对账（reconcile）、graph.causal_ancestors 增加 as_of、
+
+**第三轮增强（2026-11-14，理解层 + 证明层）**
+
+| 工作包 | 内容 |
+| --- | --- |
+| WP-M | 会话感知 follow-up 锚定（继续/同上→同会话最近真实用户消息），安全守卫 + 普通查询逐字节不变；follow-up 命中 5/18→18/18 |
+| WP-N | 基准式检索质量门禁：48 查询 fixture（5 类）、阈值文件、`release_check.sh` 第 8 步、CI release-gate、LongMemEval 子集适配器 |
+| WP-O | 事实卡原型（slot 当前值 + 变更历史 + as_of），渲染比原始 claims JSON 缩减 81.6%，尚未接入注入 |
+| WP-P | trace 按时间保留（`HIPPOMIND_TRACE_RETENTION_DAYS` 默认 30 天，原子清理，坏行保留） |
+
+第三轮验收：3.9 与 3.13 各 `Ran 2012 tests ... OK`；`release_check.sh` 8/8 PASS；
+审计验收 13/13；检索基准 recall 1.000 / MRR 0.9722 / update_hit 1.000 / abstain 1.000；
+follow-up 锚点查询 p95 0.175ms。
+
+第三轮仍未闭环：生产部署/真实数据治理（本机无生产账本）、线上 A/B 样本、官方 LongMemEval
+
+**第四轮增强（2026-11-14，可解释性/事实卡/成本观测/灾备）**
+
+| 工作包 | 内容 |
+| --- | --- |
+| WP-Q | 事实卡 opt-in 接入 Context Pack（memory_ids 过滤、有界卡块、与已选文本去重、`HIPPOMIND_FACT_CARDS` 开关默认关） |
+| WP-R | `hippomind explain`：离线只读解释检索（候选/score_parts/过滤原因/为空原因/门控/--trace，人类+JSON 同源） |
+| WP-S | distill `cost_stats()` + llm_client 传输统计（调用/失败/超时/解析/耗时），行为不变 |
+| A4 | `scripts/backup_restore_drill.sh` 灾备演练接入 release_check 第 9 步与 CI |
+
+第四轮验收：3.9 与 3.13 各 `Ran 2066 tests ... OK`；`release_check.sh` 9/9 PASS；审计 13/13；lint OK。
+
+仍受环境限制：生产部署/真实库治理、线上 A/B 样本、官方 LongMemEval 数据、事实卡默认开启 A/B、
+cost_stats 接 /stats。
+数据未内置（仅有自建维度对齐集回归门禁）、事实卡接入注入、关系边时间窗与 claim 级投影。
+CI 补 Python 3.13/macOS 矩阵、注入效果的线上随机 A/B。
 
 ## 一、目标（Goal）
 

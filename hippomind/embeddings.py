@@ -291,7 +291,7 @@ class LocalVectorEmbedding:
             return [0.0] * self.dim
         hits = self._match_terms(lowered)
         if not hits:
-            return list(self.fallback.embed(lowered))
+            return self.fallback.embed(lowered)
         vector = [0.0] * self.dim
         for term in hits:
             term_vector = self.vectors[term]

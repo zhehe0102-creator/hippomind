@@ -23,6 +23,21 @@ correction      Whether a reply both mentions an injected signal and carries a
                 contradiction marker.  This is a *negative* signal: the pack
                 may have been actively wrong.
 
+Arms (since the claude hook, 2026-10-25)
+--------------------------------------
+Traces may carry arm (treatment/control).  The claude hook runs a
+*matched* randomised experiment: both arms retrieve, both record the memory ids
+that were offered, and only delivery differs.  When both arms have enough
+evaluable traces, the report compares them directly instead of relying on the
+post-hoc "matched but not injected" control, which is still computed for older
+traces that have no arm.
+
+The distinction matters for what may be said.  The post-hoc control answers
+"do injected memories get reused more than similar non-injected ones?" - an
+association.  The arm comparison answers "does delivering the pack change reuse,
+compared with not delivering the same pack?" - still not a proof, but it holds
+the candidate set fixed, which is the part that was previously unknowable.
+
 What is NOT claimed
 -------------------
 None of this is causal.  An agent can reuse a term it already knew, the reply
@@ -355,6 +370,8 @@ def _trace_row(ledger, conn, trace: Mapping[str, Any], *, window_minutes: int,
         "signals": 0, "citation_rate": None, "cited": False,
         "paraphrase": None, "corrected": False,
         "control_rate": None, "control_pairs": 0, "lift": None,
+        "arm": str(trace.get("arm") or "") or "unknown",
+        "delivered": bool(trace.get("injected", True)),
         "evaluable": False, "skip_reason": "",
     }
     if not memory_ids:
@@ -456,6 +473,50 @@ def _trace_row(ledger, conn, trace: Mapping[str, Any], *, window_minutes: int,
 # ---------------------------------------------------------------------------
 
 
+def _arm_split(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Compare the two arms of the matched experiment.
+
+    Both arms are counted on the *same* metrics, so the difference is a
+    like-for-like comparison rather than two separately-computed rates.  The
+    result is None-heavy by design: with a handful of control traces per week,
+    "not enough control samples" is the normal answer and must stay visible.
+    """
+    # 只保留「两臂本来都能拿到东西」的 trace。
+    #
+    # 一次检索返回 0 条（empty_pack）时，两个臂都没有东西可投递——
+    # 对照组不是因为「被扣留」才空，而是本来就没有。把它算进对照臂，
+    # 等于把「检索没命中」记成「注入无效」，会让注入效果被系统性低估。
+    # 实测生产 trace：16 条被 A/B 分流的里有 13 条是 empty_pack，
+    # 如果不排除，对照臂会被这类噪声完全主导。
+    informative = [row for row in rows
+                   if row.get("evaluable") and int(row.get("items") or 0) > 0]
+    sampled = informative
+    treated = [row for row in sampled if row.get("delivered")]
+    control = [row for row in sampled if not row.get("delivered")]
+
+    def _rate(group: Sequence[Mapping[str, Any]]) -> Optional[float]:
+        if not group:
+            return None
+        return round(sum(1 for row in group if row.get("cited")) / len(group), 3)
+
+    treatment_rate = _rate(treated)
+    control_rate = _rate(control)
+    return {"treatment_n": len(treated), "control_n": len(control),
+            "treatment_citation_rate": treatment_rate,
+            "control_citation_rate": control_rate,
+            "treatment_ci": wilson(sum(1 for row in treated if row.get("cited")),
+                                   len(treated)),
+            "control_ci": wilson(sum(1 for row in control if row.get("cited")),
+                                 len(control)),
+            "difference": (None if treatment_rate is None or control_rate is None
+                           else round(treatment_rate - control_rate, 3)),
+            "matched": bool(treated) and bool(control),
+            # 被排除的空包 trace 数：样本为什么这么小，必须能解释。
+            "excluded_empty_pack": int(sum(
+                1 for row in rows if row.get("evaluable")
+                and int(row.get("items") or 0) == 0))}
+
+
 def _aggregate(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     sampled = [row for row in rows if row.get("evaluable")]
     cited = [row for row in sampled if row.get("cited")]
@@ -483,6 +544,7 @@ def _aggregate(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
         "paraphrase_n": len(paraphrases),
         "control_n": len(lifts),
         "control_lift_mean": _mean(lifts),
+        "arms": _arm_split(sampled),
     }
 
 
@@ -529,6 +591,19 @@ def _verdict(sampled: int, aggregate: Mapping[str, Any], *, min_samples: int,
                              "逐条排查线索，不能当作注入有效或无效的证据。"
                              % (sampled, min_samples)),
                 "caveats": caveats}
+    arms = aggregate.get("arms") or {}
+    if arms.get("matched") and min(int(arms.get("treatment_n") or 0),
+                                   int(arms.get("control_n") or 0)) >= min_samples:
+        difference = float(arms.get("difference") or 0)
+        code = "arm_positive" if difference > 0 else "arm_no_lift"
+        headline = ("随机分组对照：注入臂复用率 %s (n=%d)，对照组 %s (n=%d)，差 %+.3f。"
+                    "两组检索同一批候选，差别只在是否投递；这比观察性对照强得多，"
+                    "但仍是单账户数据，不是绝对因果证明。"
+                    % (arms.get("treatment_citation_rate"), arms.get("treatment_n"),
+                       arms.get("control_citation_rate"), arms.get("control_n"),
+                       difference))
+        return {"code": code, "conclusive": True, "headline": headline,
+                "caveats": caveats + ["随机分组对照仍是单账户数据，不能排除时间趋势。"]}
     lift = aggregate.get("control_lift_mean")
     if control_mode == "none":
         return {"code": "no_control", "conclusive": False,
@@ -764,6 +839,7 @@ def evaluate(ledger, traces: Sequence[Mapping[str, Any]], *,
                            "rate": aggregate["correction_rate"],
                            "ci": aggregate["correction_rate_ci"]},
         },
+        "arms": aggregate.get("arms") or _arm_split([]),
         "control": {
             "mode": control_mode,
             "pairs": aggregate["control_n"],

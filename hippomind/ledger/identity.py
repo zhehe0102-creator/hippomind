@@ -6,10 +6,14 @@ former single ``ledger.py``; behaviour and wire formats are unchanged).
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from ..textutil import normalise_for_dedup
 from ..sanitize import MAX_ARCHIVE_MESSAGE_CHARS, sanitize_chat_content
 from typing import Any, Dict, Iterable, List, Mapping
+# 双时态窗口的闭合规则只有一处实现（见 lifecycle._supersede_window_end 的
+# docstring）：散在多个写入点里，任何一处漏掉都会静默产生重叠窗口。
+from .lifecycle import _supersede_window_end
 from ._helpers import (
     DEFAULT_AGENT_TRUST,
     IngestResult,
@@ -53,11 +57,35 @@ from ._helpers import (
 #: v2 only lets an *explicitly supplied* ``valid_from`` participate, so genuine
 #: bitemporal history (a caller asserting the same sentence as valid from two
 #: different dates) is still two observations, while capture-time drift is not.
-IDENTITY_VERSION = 2
+#:
+#: v3 keeps both rules and adds the one discriminator v2 could not express: an
+#: explicitly supplied source event id (event_id / external_id) enters raw-chat
+#: identity.  Raw capture used to be keyed by (agent, session, role, content)
+#: alone, which is right for append-only transcripts but wrong for two distinct
+#: events carrying the same text ("ok" answered twice), and wrong for a bubble
+#: Cursor streams in place: the draft and the finished answer were two
+#: identities, so both stayed recallable.
+#:
+#: With an event id, distinct source events keep two rows (the append-only
+#: contract) and *the same* event revised in place is superseded by its newest
+#: revision inside the insert transaction.  With no event id the raw key is
+#: byte-for-byte the v2 key, i.e. "no id keeps the v2 dedup rule".
+#:
+#: Structured rows already carried external_id in their key since v2; v3 leaves
+#: that key untouched and only bumps the version marker (itself hashed).  Both
+#: older rules remain as compatibility probes -- see
+#: IdentityMixin._find_existing_event -- so upgrading a live ledger does not
+#: re-ingest rows written by the previous release.
+IDENTITY_VERSION = 3
 
 #: Version stamped into every prepared record (and persisted in metadata) so a
 #: future format change can tell which rows were minted under which rule.
 IDENTITY_VERSION_KEY = "identity_version"
+
+#: The immediately preceding identity rule.  Not a stored marker: it names the
+#: digest recomputed for the compatibility probe that recognises rows written by
+#: the version being upgraded from.
+IDENTITY_VERSION_V2 = 2
 
 #: Records written before v2 carry no version marker; they were all v1.
 IDENTITY_VERSION_LEGACY = 1
@@ -111,6 +139,13 @@ class IdentityMixin:
         # left for the explicit historical redaction command so old evidence
         # can be audited and repaired deterministically.
         metadata = _sanitize_untrusted_metadata(metadata)
+        # v3: the stable source event id is projection data too, so a later
+        # revision of the same event can be located and superseded.  Written
+        # *after* sanitisation so the stored value is byte-identical to the
+        # one that entered the identity key above (a redaction pass must
+        # never make the projection disagree with the digest).
+        if external_id:
+            metadata["external_id"] = external_id
         evidence = [sanitize_chat_content(ref, limit=512)[0] for ref in evidence]
         fts_content = _fts_text(content, metadata)
         now = utc_now()
@@ -175,6 +210,11 @@ class IdentityMixin:
                 "role": role,
                 "content": normalise_for_dedup(content),
             }
+            # v3: an explicit source event id is part of raw identity.
+            # Without one this dict is byte-for-byte the v2 form, so capture
+            # paths that never had stable ids keep the v2 dedup rule.
+            if external_id:
+                identity["external_id"] = external_id
         else:
             # ``role`` and ``evidence`` are deliberately absent: an agent that
             # re-reports the same decision with a fresh evidence id is repeating
@@ -211,10 +251,26 @@ class IdentityMixin:
                 "valid_until": valid_until,
                 "content": normalise_for_dedup(content),
             }
+        # The immediately preceding rule (v2) applied to *this* record.  It is
+        # probed after the current digest so the first v3 pass over an existing
+        # ledger recognises rows written by the release being upgraded instead
+        # of re-ingesting them under a new hash (the 1.47M-row duplicate storm).
+        if raw_chat and external_id:
+            v2_identity = {key: value for key, value in identity.items()
+                           if key != "external_id"}
+        else:
+            v2_identity = dict(identity)
         identity_payload = dict(identity, **{IDENTITY_VERSION_KEY: IDENTITY_VERSION})
         content_hash = _hash(_json(identity_payload, "ingest identity", MAX_CONTENT_CHARS + 8_000))
-        # v1 key for the same record, used only to recognise pre-v2 rows.
-        legacy_payload = dict(identity)
+        v2_payload = dict(v2_identity, **{IDENTITY_VERSION_KEY: IDENTITY_VERSION_V2})
+        compat_hash = _hash(_json(v2_payload, "ingest identity", MAX_CONTENT_CHARS + 8_000))
+        # v1 key for the same record, used only to recognise pre-v2 rows.  The
+        # payload is rebuilt exactly as _legacy_identity_hash reconstructs it:
+        # v1 never hashed external_id at all (the reconstruction pins it to the
+        # empty string), so neither may the compatibility probe.
+        legacy_payload = dict(v2_identity)
+        if not raw_chat:
+            legacy_payload["external_id"] = ""
         if not raw_chat and explicit_observed_at and not explicit_valid_from:
             # v1 kept the derived observation time unconditionally; that is what
             # the historical rows were minted with, so the compatibility probe
@@ -241,7 +297,12 @@ class IdentityMixin:
             # so a row written before this change is recognised as a duplicate
             # instead of being re-ingested under its new id.
             "legacy_hash": legacy_hash,
+            # The v2 digest for this same record: _find_existing_event probes
+            # it so rows written by the previous release are duplicates, not
+            # fresh events.
+            "compat_hash": compat_hash,
             "identity_version": IDENTITY_VERSION,
+            "identity_external_id": external_id,
             # Fields the backward-compatibility probe needs.  Kept on the prepared
             # record so _insert_prepared never has to re-derive them from the raw
             # input (which would drift from what identity actually used).
@@ -256,7 +317,8 @@ class IdentityMixin:
 
     @staticmethod
     def _agent_trust_for(conn: sqlite3.Connection, source_agent: str) -> float:
-        row = conn.execute("SELECT baseline FROM agent_trust WHERE agent_id=?", (source_agent,)).fetchone()
+        agent_key = _short(source_agent, 128).lower()
+        row = conn.execute("SELECT baseline FROM agent_trust WHERE agent_id=?", (agent_key,)).fetchone()
         if row is None:
             return DEFAULT_AGENT_TRUST
         return _clamp_float(row[0], DEFAULT_AGENT_TRUST, 0.0, 1.0)
@@ -277,8 +339,30 @@ class IdentityMixin:
         return row is not None
 
     @staticmethod
-    def _insert_claims(conn: sqlite3.Connection, prepared: Mapping[str, Any], source_trust: float) -> None:
-        for claim in prepared.get("claims", []):
+    def _insert_claims(conn: sqlite3.Connection, prepared: Mapping[str, Any], source_trust: float) -> bool:
+        """Insert claims for a newly ingested memory; return True if memory stays accepted."""
+        claims = list(prepared.get("claims", []))
+        if not claims:
+            return str(prepared.get("quality_state") or "") == "accepted"
+        if str(prepared.get("quality_state") or "") != "accepted":
+            # Quarantine / non-accepted memories never activate claims or race live slots.
+            for claim in claims:
+                claim_id = "cl_" + _hash(
+                    prepared["memory_id"], claim["subject"], claim["predicate"], claim["slot_key"]
+                )[:32]
+                conn.execute("""
+                    INSERT INTO memory_claims(
+                        claim_id,memory_id,scope,subject,predicate,slot_key,value_json,value_hash,
+                        valid_from,valid_until,asserted_at,confidence,source_trust,state,created_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """, (claim_id, prepared["memory_id"], prepared["scope"], claim["subject"], claim["predicate"],
+                      claim["slot_key"], claim["value_json"], claim["value_hash"], claim["valid_from"],
+                      claim["valid_until"], claim["asserted_at"], claim["confidence"], source_trust,
+                      "superseded", prepared["asserted_at"]))
+            return False
+
+        memory_conflicted = False
+        for claim in claims:
             incoming_score = float(claim["confidence"]) * source_trust
             existing = conn.execute("""
                 SELECT c.*,m.lifecycle AS memory_lifecycle,m.quality_state AS memory_quality
@@ -289,33 +373,48 @@ class IdentityMixin:
                   AND (?='' OR c.valid_from<?)
                   AND m.lifecycle='active' AND m.quality_state='accepted'
             """, (prepared["scope"], claim["subject"], claim["predicate"], claim["slot_key"],
-                  prepared["memory_id"], claim["valid_from"], claim["valid_until"], claim["valid_from"])).fetchall()
+                  prepared["memory_id"], claim["valid_from"], claim["valid_until"], claim["valid_until"])).fetchall()
             state = "active"
             for old in existing:
                 if old["value_hash"] == claim["value_hash"]:
                     continue
                 old_score = float(old["confidence"]) * float(old["source_trust"])
                 if incoming_score > old_score + 0.05:
-                    # The whole losing memory leaves recall, so every active
-                    # claim on it must leave the active set as well; otherwise
-                    # health reports dangling active claims forever.
-                    conn.execute("UPDATE memory_claims SET state='superseded' "
-                                 "WHERE memory_id=? AND state='active'", (old["memory_id"],))
-                    conn.execute("""UPDATE memories SET lifecycle='superseded',superseded_by=?,quality_state='superseded',updated_at=?
-                                    WHERE memory_id=? AND lifecycle='active'""",
-                                 (prepared["memory_id"], prepared["asserted_at"], old["memory_id"]))
-                    conn.execute("DELETE FROM memory_fts WHERE memory_id=?", (old["memory_id"],))
+                    # 双时态 + 单槽位作用域：高分断言顶掉旧事实时，仅退位当前槽位的旧
+                    # claim，并在胜者 valid_from 闭合其窗口；只有当旧记忆不再持有任何
+                    # active/conflict claim 时才将整条旧记忆下线，消除爆炸半径。
+                    window_end = _supersede_window_end(
+                        conn, str(old["valid_from"] or ""),
+                        prepared["memory_id"], prepared["asserted_at"])
+                    conn.execute("UPDATE memory_claims SET state='superseded',"
+                                 "valid_until=CASE WHEN valid_until='' THEN ? "
+                                 "ELSE valid_until END "
+                                 "WHERE claim_id=? AND state='active'",
+                                 (window_end, old["claim_id"]))
+                    remaining = int(conn.execute(
+                        "SELECT COUNT(*) FROM memory_claims WHERE memory_id=? AND state IN ('active','conflict')",
+                        (old["memory_id"],)).fetchone()[0])
+                    if remaining == 0:
+                        conn.execute("""UPDATE memories SET lifecycle='superseded',superseded_by=?,quality_state='superseded',
+                                        valid_until=CASE WHEN valid_until='' THEN ? ELSE valid_until END,updated_at=?
+                                        WHERE memory_id=? AND lifecycle='active'""",
+                                     (prepared["memory_id"], window_end,
+                                      prepared["asserted_at"], old["memory_id"]))
+                        conn.execute("DELETE FROM memory_fts WHERE memory_id=?", (old["memory_id"],))
                 elif old_score > incoming_score + 0.05:
                     # 既有高置信事实胜出：保持旧 claim/memory 为 accepted，
                     # 只把低分新断言记为 conflict，避免把获胜方也踢出召回。
                     state = "conflict"
                 else:
-                    # 分数接近、无法裁决：双方同时下线等待更强证据。
+                    # 分数接近、无法裁决：双方同时下线并从 FTS 移除，等待更强证据。
                     state = "conflict"
                     conn.execute("UPDATE memory_claims SET state='conflict' "
                                  "WHERE memory_id=? AND state='active'", (old["memory_id"],))
                     conn.execute("UPDATE memories SET quality_state='conflict',updated_at=? WHERE memory_id=?",
                                  (prepared["asserted_at"], old["memory_id"]))
+                    conn.execute("DELETE FROM memory_fts WHERE memory_id=?", (old["memory_id"],))
+            if state != "active":
+                memory_conflicted = True
             claim_id = "cl_" + _hash(prepared["memory_id"], claim["subject"], claim["predicate"], claim["slot_key"])[:32]
             conn.execute("""
                 INSERT INTO memory_claims(
@@ -324,14 +423,20 @@ class IdentityMixin:
                 ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (claim_id, prepared["memory_id"], prepared["scope"], claim["subject"], claim["predicate"],
                   claim["slot_key"], claim["value_json"], claim["value_hash"], claim["valid_from"],
-                  claim["valid_until"], claim["asserted_at"], claim["confidence"], source_trust, state,
+                  claim["valid_until"], claim["asserted_at"], claim["confidence"], source_trust,
+                  "conflict" if memory_conflicted else state,
                   prepared["asserted_at"]))
-            if state != "active":
-                conn.execute("UPDATE memories SET quality_state='conflict',updated_at=? WHERE memory_id=?",
-                             (prepared["asserted_at"], prepared["memory_id"]))
+        if memory_conflicted:
+            conn.execute("UPDATE memory_claims SET state='conflict' WHERE memory_id=? AND state='active'",
+                         (prepared["memory_id"],))
+            conn.execute("UPDATE memories SET quality_state='conflict',updated_at=? WHERE memory_id=?",
+                         (prepared["asserted_at"], prepared["memory_id"]))
+            return False
+        return True
 
     @classmethod
     def _insert_relations(cls, conn: sqlite3.Connection, prepared: Mapping[str, Any]) -> None:
+        default_from = str(prepared.get("valid_from") or "")
         for parent in prepared.get("causal_parents", []):
             parent_id = str(parent.get("memory_id", ""))
             if not parent_id or conn.execute("SELECT 1 FROM memories WHERE memory_id=?", (parent_id,)).fetchone() is None:
@@ -339,12 +444,15 @@ class IdentityMixin:
             if cls._relation_would_cycle(conn, parent_id, prepared["memory_id"]):
                 raise LedgerError("causal relation 不能形成环路")
             relation_id = "rel_" + _hash(parent_id, prepared["memory_id"], parent.get("relation_type", "caused_by"))[:32]
+            rel_from = _timestamp(parent["valid_from"]) if parent.get("valid_from") else default_from
+            rel_until = _timestamp(parent["valid_until"]) if parent.get("valid_until") else ""
             conn.execute("""
                 INSERT OR IGNORE INTO memory_relations(
-                    relation_id,parent_memory_id,child_memory_id,relation_type,confidence,created_at
-                ) VALUES(?,?,?,?,?,?)
+                    relation_id,parent_memory_id,child_memory_id,relation_type,confidence,created_at,valid_from,valid_until
+                ) VALUES(?,?,?,?,?,?,?,?)
             """, (relation_id, parent_id, prepared["memory_id"], parent.get("relation_type", "caused_by"),
-                  _clamp_float(parent.get("confidence", 0.5), 0.5, 0.0, 1.0), prepared["asserted_at"]))
+                  _clamp_float(parent.get("confidence", 0.5), 0.5, 0.0, 1.0), prepared["asserted_at"],
+                  rel_from, rel_until))
 
     @staticmethod
     def _legacy_identity_hash(row: Any) -> str:
@@ -393,27 +501,27 @@ class IdentityMixin:
                              prepared: Mapping[str, Any]) -> Any:
         """Return the already-stored event for this record, if any.
 
-        Three probes, cheapest first:
+        Four probes, cheapest first:
 
-        1. **current identity (v2)** -- an indexed UNIQUE lookup, the steady
+        1. **current identity (v3)** -- an indexed UNIQUE lookup, the steady
            state for every write after the upgrade.
-        2. **legacy identity (v1) recomputed for this record** -- catches an
-           idempotent replay of exactly the same observation (same timestamp),
-           which is what the watcher does when nothing changed.
-        3. **bounded semantic probe** -- the important one for backward
+        2. **previous identity (v2) recomputed for this record** -- v3 only
+           *adds* the external id to the raw key (the structured key is
+           unchanged), so the v2 digest of this same record catches rows
+           written by the release being upgraded from.  Without it the first
+           capture pass after the upgrade would re-ingest the whole ledger
+           under v3 ids (the 141-duplicate production storm).
+        3. **legacy identity (v1) recomputed for this record** -- catches an
+           idempotent replay of exactly the same v1 observation.
+        4. **bounded semantic probe** -- the important one for backward
            compatibility.  A v1 row hashed the *derived* observation time, so a
            re-observation with a refreshed timestamp produces a v1 hash that
-           matches nothing.  Probe 2 therefore cannot find it; only comparing
+           matches nothing.  Probe 3 therefore cannot find it; only comparing
            normalised content within the same (task|session, agent, scope)
            bucket can.  Candidates are confirmed to be v1 rows by recomputing
-           their own v1 hash, so a genuine v2 row is never silently merged.
+           their own v1 hash, so a genuine v2/v3 row is never silently merged.
 
-        Without probe 3 the first capture pass after the upgrade would
-        re-ingest every historical row under its new id: measured on the
-        production ledger, 141 rows share one v2 identity, so each pass would
-        have added another duplicate on top of them.
-
-        Probe 3 is skipped when the record carries an **explicit** ``valid_from``:
+        Probe 4 is skipped when the record carries an **explicit** valid_from:
         that is a deliberate bitemporal assertion, and two different dates must
         stay two observations.
         """
@@ -423,6 +531,13 @@ class IdentityMixin:
             (current,)).fetchone()
         if existing is not None:
             return existing
+        compat = str(prepared.get("compat_hash") or "")
+        if compat and compat != current:
+            existing = conn.execute(
+                "SELECT event_id, content_hash FROM ledger_events WHERE content_hash=?",
+                (compat,)).fetchone()
+            if existing is not None:
+                return existing
         legacy = str(prepared.get("legacy_hash") or "")
         if legacy and legacy != current:
             existing = conn.execute(
@@ -466,8 +581,8 @@ class IdentityMixin:
                    "AND scope=? AND lifecycle!='superseded' LIMIT ?")
             params = (agent, session_id, scope, IdentityMixin.LEGACY_PROBE_LIMIT)
         else:
-            # No indexed narrowing available: refuse to scan.  Probe 2 still
-            # covers the exact-replay case for these rows.
+            # No indexed narrowing available: refuse to scan.  Probe 3 (the
+            # recomputed v1 digest) still covers the exact-replay case here.
             return None
         target = str(prepared.get("identity_content") or "")
         if not target:
@@ -494,14 +609,225 @@ class IdentityMixin:
             return event
         return None
 
+    #: Cap for the external-id revision probe.  Every candidate set is bounded
+    #: so a streamed bubble can never turn an ingest into a table scan.
+    REVISION_PROBE_LIMIT = 256
+
+    @staticmethod
+    def _metadata_value(metadata_json: Any, key: str) -> str:
+        try:
+            metadata = json.loads(metadata_json or "{}")
+        except (TypeError, ValueError):
+            return ""
+        if not isinstance(metadata, dict):
+            return ""
+        value = metadata.get(key)
+        return value if isinstance(value, str) else ""
+
+    @staticmethod
+    def _json_string_list_has(encoded: Any, needle: str) -> bool:
+        try:
+            values = json.loads(encoded or "[]")
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(values, list):
+            return False
+        return needle in [str(value) for value in values]
+
+    @staticmethod
+    def _revision_row_matches(row: Any, external_id: str,
+                              evidence: List[str], raw_chat: bool) -> bool:
+        """True when this stored row is an older revision of the same event.
+
+        A v3 row is decided by its projection-level event id only: a caller may
+        reuse one evidence string across structured records, so evidence must
+        never overrule an explicit id.  Rows written before v3 have no
+        projection-level id, and the stable evidence string is the only bridge
+        back to their event for raw streaming capture.
+        """
+        stored_external = IdentityMixin._metadata_value(
+            row["metadata_json"], "external_id")
+        if stored_external:
+            return stored_external == external_id
+        if not raw_chat:
+            return False
+        return any(IdentityMixin._json_string_list_has(
+                       row["evidence_json"], reference)
+                   for reference in evidence)
+
+    @staticmethod
+    def _revision_candidates(conn: sqlite3.Connection,
+                             prepared: Mapping[str, Any]) -> List[Any]:
+        """Rows that describe the *same source event* as ``prepared``.
+
+        Streaming sources rewrite one bubble in place, so one stable event id
+        arrives several times with growing content.  Earlier rows must not
+        co-exist with the finished revision.
+
+        The probe is bounded in two different ways, because the two shapes have
+        different anchors:
+
+        * records that name a task/session use the same indexed
+          (task|session, agent, scope) bucket as the legacy semantic probe, so
+          the scan is an index seek rather than a table walk;
+        * records without any anchor fall back to the *newest* REVISION_PROBE_LIMIT
+          rows (rowid DESC).  A live event's previous revision was inserted
+          moments earlier, so it is necessarily inside that bounded window;
+          an unindexed full-table LIKE scan per ingest would not be.
+        """
+        external_id = str(prepared.get("identity_external_id") or "")
+        if not external_id:
+            return []
+        agent = str(prepared.get("source_agent") or "")
+        scope = str(prepared.get("scope") or "")
+        task_id = str(prepared.get("task_id") or "")
+        session_id = str(prepared.get("session_id") or "")
+        memory_id = str(prepared.get("memory_id") or "")
+        raw_chat = bool(prepared.get("raw_chat"))
+        try:
+            parsed_evidence = json.loads(prepared.get("evidence_json") or "[]")
+        except (TypeError, ValueError):
+            parsed_evidence = []
+        evidence: List[str] = []
+        if isinstance(parsed_evidence, list):
+            evidence = [str(item) for item in parsed_evidence if str(item)][:4]
+        if task_id:
+            bucket: Any = ("task_id=? AND source_agent=? AND scope=?",
+                           (task_id, agent, scope))
+        elif session_id:
+            bucket = ("source_agent=? AND session_id=? AND scope=?",
+                      (agent, session_id, scope))
+        else:
+            bucket = None
+        if bucket is None:
+            sql = ("SELECT * FROM memories WHERE lifecycle='active' "
+                   "AND memory_id!=? ORDER BY rowid DESC LIMIT ?")
+            try:
+                candidates = conn.execute(
+                    sql, (memory_id, IdentityMixin.REVISION_PROBE_LIMIT)).fetchall()
+            except sqlite3.DatabaseError:
+                return []
+            return [row for row in candidates
+                    if IdentityMixin._revision_row_matches(
+                        row, external_id, evidence, raw_chat)]
+        bucket_sql, bucket_params = bucket
+        # LIKE only prefilters inside the indexed bucket; the exact check above
+        # decides, so a wildcard inside an id cannot retire an unrelated row.
+        metadata_pattern = '%"external_id":' + json.dumps(
+            external_id, ensure_ascii=False) + '%'
+        filters: List[Any] = [("metadata_json LIKE ?", (metadata_pattern,))]
+        if raw_chat:
+            for reference in evidence:
+                filters.append(("evidence_json LIKE ?", ("%" + reference + "%",)))
+        found: Dict[str, Any] = {}
+        for column_filter, filter_params in filters:
+            conditions = [column_filter, bucket_sql, "lifecycle='active'",
+                          "memory_id!=?"]
+            params: Any = (*filter_params, *bucket_params, memory_id)
+            sql = ("SELECT * FROM memories WHERE " + " AND ".join(conditions) +
+                   " ORDER BY created_at ASC LIMIT ?")
+            try:
+                rows = conn.execute(
+                    sql, (*params, IdentityMixin.REVISION_PROBE_LIMIT)).fetchall()
+            except sqlite3.DatabaseError:
+                continue
+            for row in rows:
+                candidate_id = str(row["memory_id"] or "")
+                if not candidate_id or candidate_id in found:
+                    continue
+                if IdentityMixin._revision_row_matches(
+                        row, external_id, evidence, raw_chat):
+                    found[candidate_id] = row
+        return list(found.values())
+
+    @classmethod
+    def _supersede_external_revisions(cls, conn: sqlite3.Connection,
+                                      prepared: Mapping[str, Any]) -> int:
+        """Retire older in-place revisions of the same source event.
+
+        Streaming capture rewrites one record while the answer grows.  Every
+        revision carries the same explicit event id, so the older row stops
+        describing the event the moment newer content arrives.  This runs
+        inside the insert transaction, after the new projection exists (the
+        loser window closes on the winner valid_from) and *before* claims are
+        arbitrated (a retired draft must not fight the finished answer for its
+        slot).  Only rows whose normalised content actually differs are
+        retired: different identity with the same text (an explicitly dated
+        repeat) stays two observations, exactly as v2 did.
+        """
+        target = str(prepared.get("identity_content") or "")
+        retired = 0
+        for row in cls._revision_candidates(conn, prepared):
+            if normalise_for_dedup(row["content"]) == target:
+                continue
+            window_end = _supersede_window_end(
+                conn, str(row["valid_from"] or ""),
+                str(prepared["memory_id"]), str(prepared["asserted_at"]))
+            # Same retirement contract as claim arbitration: every active claim
+            # on the losing projection leaves the active set, otherwise health
+            # reports dangling active claims forever.
+            conn.execute(
+                "UPDATE memory_claims SET state='superseded',"
+                "valid_until=CASE WHEN valid_until='' THEN ? ELSE valid_until END "
+                "WHERE memory_id=? AND state='active'",
+                (window_end, row["memory_id"]))
+            updated = conn.execute(
+                "UPDATE memories SET lifecycle='superseded',superseded_by=?,"
+                "quality_state='superseded',"
+                "valid_until=CASE WHEN valid_until='' THEN ? ELSE valid_until END,"
+                "updated_at=? WHERE memory_id=? AND lifecycle='active'",
+                (prepared["memory_id"], window_end, prepared["asserted_at"],
+                 row["memory_id"]))
+            if not updated.rowcount:
+                continue
+            conn.execute("DELETE FROM memory_fts WHERE memory_id=?", (row["memory_id"],))
+            retired += 1
+        return retired
+
+    @classmethod
+    def _tag_external_id(cls, conn: sqlite3.Connection, memory_id: str,
+                         metadata_json: Any,
+                         prepared: Mapping[str, Any]) -> None:
+        """Attach a v3 event id to an already-stored projection.
+
+        A row written by v2 has no event id in its projection metadata, so the
+        first v3 revision after the upgrade could not find it to supersede.
+        Tagging the surviving duplicate keeps the revision chain connected.
+        Identity is untouched: metadata is projection data and is not part of
+        any identity key.
+        """
+        external_id = str(prepared.get("identity_external_id") or "")
+        if not external_id or not memory_id:
+            return
+        try:
+            metadata = json.loads(metadata_json or "{}")
+        except (TypeError, ValueError):
+            metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        if metadata.get("external_id") == external_id:
+            return
+        metadata["external_id"] = external_id
+        try:
+            encoded = _json(metadata, "metadata")
+        except LedgerError:
+            return
+        conn.execute("UPDATE memories SET metadata_json=? WHERE memory_id=?",
+                     (encoded, memory_id))
+
     @classmethod
     def _insert_prepared(cls, conn: sqlite3.Connection, prepared: Mapping[str, Any]) -> IngestResult:
         existing = cls._find_existing_event(conn, prepared)
         if existing is not None:
             row = conn.execute(
-                "SELECT memory_id FROM memories WHERE origin_event_id=?", (existing["event_id"],)
-            ).fetchone()
-            return IngestResult(existing["event_id"], row["memory_id"] if row else prepared["memory_id"],
+                "SELECT memory_id, metadata_json FROM memories WHERE origin_event_id=?",
+                (existing["event_id"],)).fetchone()
+            memory_id = row["memory_id"] if row else prepared["memory_id"]
+            # Upgrade path: tag the surviving row so the *next* revision of
+            # this same source event can find and supersede it.
+            cls._tag_external_id(conn, memory_id,
+                                 row["metadata_json"] if row else "", prepared)
+            return IngestResult(existing["event_id"], memory_id,
                                 False, existing["content_hash"])
         source_trust = cls._agent_trust_for(conn, str(prepared["source_agent"]))
         effective_confidence = _clamp_float(
@@ -529,9 +855,12 @@ class IdentityMixin:
               prepared["valid_from"], prepared["valid_until"], prepared["asserted_at"], prepared["raw_chat"],
               prepared["weight"], prepared["importance"], prepared["utility"], effective_confidence,
               source_trust, prepared["quality_score"], prepared["quality_state"]))
-        cls._insert_claims(conn, prepared, source_trust)
+        # Streaming revision chain: retire drafts of this same source event
+        # before claims are arbitrated (see _supersede_external_revisions).
+        cls._supersede_external_revisions(conn, prepared)
+        still_accepted = cls._insert_claims(conn, prepared, source_trust)
         cls._insert_relations(conn, prepared)
-        if prepared["quality_state"] == "accepted":
+        if still_accepted and prepared["quality_state"] == "accepted":
             conn.execute("INSERT INTO memory_fts(memory_id,content,task_id,project,source_agent,kind) "
                          "VALUES(?,?,?,?,?,?)",
                          (prepared["memory_id"], prepared["fts_content"], prepared["task_id"], prepared["project"],

@@ -90,6 +90,24 @@ class ResolveClaimTests(unittest.TestCase):
         self.assertEqual(states[self.b.memory_id]["quality_state"], "superseded")
         self.assertEqual(claims[self.a.memory_id], "active")
 
+    def test_result_merges_legacy_and_slot_settlement_fields(self):
+        """WP-C：resolve_claim 委托 settle_claim_slot，兼容字段必须还在。
+
+        旧调用方（CLI / distill）只读 resolved/winner/losers；新实现额外
+        返回 settle 的槽位明细，两者合并在同一个 dict 里，且 losers 就是
+        loser_memories（败者记忆 id），语义不漂移。
+        """
+        result = self.ledger.resolve_claim(self.claim_a, self.b.memory_id)
+        for field in ("resolved", "winner", "losers", "loser_memories",
+                      "crowned", "retired", "demoted", "settled"):
+            self.assertIn(field, result)
+        self.assertEqual(self.claim_a, result["resolved"])
+        self.assertEqual(self.b.memory_id, result["winner"])
+        self.assertEqual([self.a.memory_id], result["losers"])
+        self.assertEqual(result["losers"], result["loser_memories"])
+        self.assertEqual([self.a.memory_id], result["demoted"])
+        self.assertTrue(result["settled"])
+
     def test_unknown_claim_raises(self):
         with self.assertRaises(LedgerError):
             self.ledger.resolve_claim("cl_does_not_exist", self.b.memory_id)

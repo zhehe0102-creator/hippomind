@@ -57,11 +57,12 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping, Optional
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 __all__ = [
     "Breaker",
     "LLMConfig",
+    "TransportStats",
     "available",
     "breaker",
     "complete",
@@ -69,6 +70,7 @@ __all__ = [
     "load_config",
     "parse_completion",
     "reset",
+    "stats",
 ]
 
 #: Wall-clock ceiling for one request.  Measured latency against this endpoint
@@ -339,11 +341,113 @@ def breaker() -> Breaker:
     return _BREAKER
 
 
+class TransportStats:
+    """Lightweight per-call counters for complete().
+
+    Observability only: nothing here influences configuration, the circuit
+    breaker, retries, timeouts or the return value.  The counters exist so a
+    /stats surface can report request count, wall-clock latency and failure
+    classes without every caller growing its own bookkeeping.
+
+    Outcome vocabulary (one record per attempt that reached a request):
+        success        -- parsed answer returned
+        timeout        -- transport timed out (after any retry)
+        error          -- other transport failure (dropped connection, ...)
+        http_error     -- an HTTP status was returned
+        parse_failure  -- body was not a usable completion
+        cancelled      -- caller cancel token fired after the request started
+    Pre-request skips (no configuration, breaker open, empty prompt, cancel
+    before dispatch) are not counted: no request was attempted.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.calls = 0
+        self.successes = 0
+        self.failures = 0
+        self.timeouts = 0
+        self.http_errors = 0
+        self.transport_errors = 0
+        self.parse_failures = 0
+        self.cancellations = 0
+        self.total_ms = 0.0
+        self.last_ms = 0.0
+        self.max_ms = 0.0
+
+    def record(self, outcome: str, elapsed_ms: float) -> None:
+        elapsed = max(0.0, float(elapsed_ms))
+        with self._lock:
+            self.calls += 1
+            self.total_ms += elapsed
+            self.last_ms = elapsed
+            self.max_ms = max(self.max_ms, elapsed)
+            if outcome == "success":
+                self.successes += 1
+            elif outcome == "timeout":
+                self.timeouts += 1
+                self.failures += 1
+            elif outcome == "http_error":
+                self.http_errors += 1
+                self.failures += 1
+            elif outcome == "error":
+                self.transport_errors += 1
+                self.failures += 1
+            elif outcome == "parse_failure":
+                self.parse_failures += 1
+                self.failures += 1
+            elif outcome == "cancelled":
+                self.cancellations += 1
+
+    def reset(self) -> None:
+        with self._lock:
+            self.calls = 0
+            self.successes = 0
+            self.failures = 0
+            self.timeouts = 0
+            self.http_errors = 0
+            self.transport_errors = 0
+            self.parse_failures = 0
+            self.cancellations = 0
+            self.total_ms = 0.0
+            self.last_ms = 0.0
+            self.max_ms = 0.0
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            calls = self.calls
+            total_ms = self.total_ms
+            return {
+                "calls": calls,
+                "successes": self.successes,
+                "failures": self.failures,
+                "timeouts": self.timeouts,
+                "http_errors": self.http_errors,
+                "transport_errors": self.transport_errors,
+                "parse_failures": self.parse_failures,
+                "cancellations": self.cancellations,
+                "total_ms": round(total_ms, 3),
+                "last_ms": round(self.last_ms, 3),
+                "max_ms": round(self.max_ms, 3),
+                "avg_ms": round(total_ms / calls, 3) if calls else 0.0,
+            }
+
+
+_STATS = TransportStats()
+
+
+def stats() -> Dict[str, Any]:
+    """Request count/latency/failure classes plus the breaker snapshot."""
+    report = _STATS.snapshot()
+    report["breaker"] = _BREAKER.status()
+    return report
+
+
 def reset() -> None:
-    """Forget cached configuration and close the breaker (tests, retuning)."""
+    """Forget cached configuration, close the breaker, zero the counters."""
     _SETTINGS_CACHE["key"] = None
     _SETTINGS_CACHE["env"] = {}
     _BREAKER.reset()
+    _STATS.reset()
 
 
 # ---------------------------------------------------------------------------
@@ -453,25 +557,27 @@ def parse_completion(raw: Any) -> Optional[str]:
 _TRANSIENT = (urllib.error.URLError, TimeoutError, ConnectionError, OSError)
 
 
-def complete(prompt: Any, *, max_tokens: int = DEFAULT_MAX_TOKENS,
-             timeout: float = DEFAULT_TIMEOUT, model: str = "",
-             cancel: Any = None) -> Optional[str]:
-    """Ask the endpoint for a completion.  None on any failure, never raises.
+def _complete(prompt: Any, *, max_tokens: int = DEFAULT_MAX_TOKENS,
+              timeout: float = DEFAULT_TIMEOUT, model: str = "",
+              cancel: Any = None) -> Tuple[Optional[str], Optional[str]]:
+    """Internal completion: (answer, outcome).  Outcome is None for skips.
 
-    model overrides the configured model for one call (the conflict decider and
-    the extractor use the same endpoint but may want different budgets).
-    cancel is described in the module docstring.
+    Identical decision path to the pre-instrumentation complete(): same
+    configuration lookup, same breaker gate, same retries/timeouts, same
+    None-on-failure contract.  The only change is that each return site also
+    names the outcome so the public wrapper can count it without touching the
+    request itself.
     """
     text = str(prompt or "")
     if not text.strip():
-        return None
+        return None, None
     config = _safe_config()
     if config is None:
-        return None
+        return None, None
     if not _BREAKER.allow():
-        return None
+        return None, None
     if _cancelled(cancel):
-        return None
+        return None, None
     try:
         budget = max(1, int(max_tokens))
     except (TypeError, ValueError):
@@ -496,7 +602,7 @@ def complete(prompt: Any, *, max_tokens: int = DEFAULT_MAX_TOKENS,
                                          headers=headers, method="POST")
     except (TypeError, ValueError) as exc:
         _BREAKER.record_failure(exc)
-        return None
+        return None, None
     _BREAKER.calls += 1
     raw = ""
     last: Any = None
@@ -508,7 +614,7 @@ def complete(prompt: Any, *, max_tokens: int = DEFAULT_MAX_TOKENS,
         except _Cancelled:
             # A cancellation is the caller's decision, not an endpoint failure;
             # it must not count towards opening the breaker, and must not retry.
-            return None
+            return None, "cancelled"
         except urllib.error.HTTPError as exc:
             # A status code is the server's answer, not a dropped socket:
             # retrying it would just spend the budget twice on the same refusal.
@@ -518,7 +624,7 @@ def complete(prompt: Any, *, max_tokens: int = DEFAULT_MAX_TOKENS,
             except Exception:  # noqa: BLE001 - a body-less error fails cleanly
                 detail = ""
             _BREAKER.record_failure("HTTP %s: %s" % (exc.code, detail))
-            return None
+            return None, "http_error"
         except Exception as exc:  # noqa: BLE001 - the transport must never escape
             last = exc
             if not isinstance(exc, _TRANSIENT) or attempt >= TRANSIENT_RETRIES:
@@ -527,7 +633,7 @@ def complete(prompt: Any, *, max_tokens: int = DEFAULT_MAX_TOKENS,
             # re-send the identical request; measured to succeed on retry.
             delay = RETRY_BACKOFF * (2 ** attempt)
             if _cancelled(cancel):
-                return None
+                return None, "cancelled"
             if cancel is None:
                 time.sleep(delay)
             else:
@@ -536,16 +642,45 @@ def complete(prompt: Any, *, max_tokens: int = DEFAULT_MAX_TOKENS,
                     if _cancelled(cancel):
                         # The caller withdrew: that is not an endpoint failure,
                         # so it must not count towards opening the breaker.
-                        return None
+                        return None, "cancelled"
                     time.sleep(min(0.05, delay))
             if _cancelled(cancel):
-                return None
+                return None, "cancelled"
     if last is not None:
         _BREAKER.record_failure("%s: %s" % (type(last).__name__, last))
-        return None
+        return None, ("timeout" if _is_timeout(last) else "error")
     answer = parse_completion(raw)
     if answer is None:
         _BREAKER.record_failure("empty or unparseable completion")
-        return None
+        return None, "parse_failure"
     _BREAKER.record_success()
+    return answer, "success"
+
+
+def _is_timeout(exc: BaseException) -> bool:
+    """Classify a transport exception as a timeout for the latency report."""
+    if isinstance(exc, TimeoutError):
+        return True
+    message = str(exc).lower()
+    return "timed out" in message or "timeout" in message
+
+
+def complete(prompt: Any, *, max_tokens: int = DEFAULT_MAX_TOKENS,
+             timeout: float = DEFAULT_TIMEOUT, model: str = "",
+             cancel: Any = None) -> Optional[str]:
+    """Ask the endpoint for a completion.  None on any failure, never raises.
+
+    model overrides the configured model for one call (the conflict decider and
+    the extractor use the same endpoint but may want different budgets).
+    cancel is described in the module docstring.
+
+    This wrapper only measures the wall-clock duration and hands it to
+    TransportStats before returning the internal result unchanged; retries,
+    timeouts, breaker decisions and None-on-failure semantics are untouched.
+    """
+    started = time.monotonic()
+    answer, outcome = _complete(prompt, max_tokens=max_tokens, timeout=timeout,
+                                model=model, cancel=cancel)
+    if outcome is not None:
+        _STATS.record(outcome, (time.monotonic() - started) * 1000.0)
     return answer

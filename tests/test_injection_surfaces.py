@@ -18,6 +18,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from hippomind import injection_audit
 from hippomind.injection_audit import (HEALTHY, MISSING, STALE_PATH, VOLATILE_CWD,
                                        WRONG_LEDGER, Finding, inspect_codex_hook,
                                        inspect_mcp_server, inspect_rule_file,
@@ -35,6 +36,10 @@ class TempHomeCase(unittest.TestCase):
         self.ledger.write_bytes(b"SQLite format 3")
         self.runtime = self.home / "runtime"
         (self.runtime / "hippomind").mkdir(parents=True)
+        # 审计现在还会验证"命令里那个 -m 模块在它声明的根目录下真的存在"
+        # （2026-10-25 的真实故障：路径全对、模块没同步，hook 静默 ImportError）。
+        # 这个 fixture 关心的是路径切分，所以先把模块放好，别让新检查抢戏。
+        (self.runtime / "hippomind" / "codex_hook.py").write_text("", encoding="utf-8")
         self.addCleanup(self._tmp.cleanup)
 
 
@@ -84,6 +89,35 @@ class McpAuditTests(TempHomeCase):
             "args": ["--ledger", str(self.ledger)],
             "cwd": str(self.runtime)}}})
         finding = inspect_mcp_server("x", path, ledger_path=self.ledger)
+        self.assertEqual(finding.status, HEALTHY)
+
+
+    def test_image_mount_on_external_volume_is_not_a_fault(self):
+        """磁盘映像挂载出来的卷不受 TCC 限制，不能判成可移动卷。
+
+        2026-10-26 实测：launchd 后台任务直读 /Volumes/<外置卷> 会被
+        Operation not permitted 拒绝，但对同一块盘上 .dmg 挂出来的卷
+        可以正常 open/read/write 并跑 SQLite。判据必须看 hdiutil 的
+        真实挂载表，否则一个能正常工作的部署会被判成坏掉。
+        """
+        from unittest import mock
+        with mock.patch.object(injection_audit, "_image_mount_points",
+                               return_value=frozenset({"/Volumes/DataImage"})):
+            self.assertFalse(injection_audit._is_volatile("/Volumes/DataImage/hippomind.sqlite"))
+            # 同一块盘上**没有**走映像的路径仍然是可移动卷
+            self.assertTrue(injection_audit._is_volatile("/Volumes/SomeDisk/repo"))
+
+    def test_image_mount_keeps_mcp_entry_healthy(self):
+        """MCP 指向映像卷上的账本时必须判 healthy，而不是 stale_path。"""
+        from unittest import mock
+        ledger = Path("/Volumes/DataImage/hippomind.sqlite")
+        path = self._write({"mcpServers": {"hippomind": {
+            "command": "/usr/bin/python3",
+            "args": ["--ledger", str(ledger)],
+            "cwd": "/Volumes/DataImage/runtime"}}})
+        with mock.patch.object(injection_audit, "_image_mount_points",
+                               return_value=frozenset({"/Volumes/DataImage"})):
+            finding = inspect_mcp_server("x", path, ledger_path=ledger)
         self.assertEqual(finding.status, HEALTHY)
 
     def test_unreadable_json_is_not_guessed(self):

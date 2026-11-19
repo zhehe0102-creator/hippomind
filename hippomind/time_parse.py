@@ -22,6 +22,11 @@ def _num(value: str) -> int:
     value = (value or "").strip()
     if value.isdigit():
         return max(1, int(value))
+    if "十" in value:
+        parts = value.split("十", 1)
+        tens = _CN_NUM.get(parts[0], 1) if parts[0] else 1
+        ones = _CN_NUM.get(parts[1], 0) if parts[1] else 0
+        return max(1, tens * 10 + ones)
     total = 0
     for ch in value:
         total += _CN_NUM.get(ch, 0)
@@ -70,7 +75,8 @@ _PATTERNS: List[Tuple[re.Pattern, Optional[_Handler]]] = [
      _relative_days("30")),
     (re.compile(r"最近半(个)?月|近半(个)?月"), _relative_days("15")),
     (re.compile(r"最近一?周|近一?周|一周内"), _relative_days("7")),
-    (re.compile(r"(?:最近|近|过去)?\s*(\d+|[一二两三四五六七八九十]+)\s*天(?:之?内|前)?"),
+    (re.compile(r"(?:(?:最近|近|过去)\s*(\d+|[一二两三四五六七八九十]+)\s*天(?:之?内|前|来)?|"
+                r"(?<![第每])\b(\d+|[一二两三四五六七八九十]+)\s*天(?:之?内|前|来))"),
      None),
 ]
 
@@ -103,13 +109,16 @@ def parse_temporal_expression(query: str, *,
     text = str(query or "")
     if not text:
         return "", ""
-    moment = now or datetime.now(timezone.utc)
+    moment = now if now is not None else datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
     for compiled, handler in _PATTERNS:
         match = compiled.search(text)
         if match is None:
             continue
         if handler is None:
-            handler = _relative_days(match.group(1))
+            days = next((g for g in match.groups() if g), "1")
+            handler = _relative_days(days)
         start, end = handler(moment)
         if end < start:
             start, end = end, start

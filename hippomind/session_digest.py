@@ -40,6 +40,7 @@ class SessionSummary:
     digest: str
     first_at: str
     last_at: str
+    scope: str = "shared"
 
 
 def _clean(value: Any, limit: int) -> str:
@@ -136,27 +137,96 @@ class SessionDigester:
             self.extractor = None if configured in {"heuristic", "off"} else ClaudeExtractor()
 
     # -- collection -------------------------------------------------------
-    def pending_sessions(self, limit: int = 4, *, min_messages: int = 4) -> List[Dict[str, Any]]:
-        """Return sessions with no digest cursor, newest first."""
-        limit = max(1, min(500, int(limit)))
-        with self.ledger._reading() as conn:
-            rows = conn.execute(
-                "SELECT m.session_id, m.source_agent, COUNT(*) n, MIN(m.created_at) first_at, "
-                "MAX(m.created_at) last_at, MAX(m.project) project, MAX(m.task_id) task_id "
-                "FROM memories m LEFT JOIN source_cursors c "
-                "ON c.source_id = 'digest:' || m.session_id "
-                "WHERE m.raw_chat=1 AND m.session_id!='' AND c.source_id IS NULL "
-                "GROUP BY m.session_id HAVING n >= ? "
-                "ORDER BY last_at DESC LIMIT ?", (max(1, int(min_messages)), limit)).fetchall()
-        return [dict(row) for row in rows]
+    @staticmethod
+    def _parse_cursor(raw: Any) -> Dict[str, Any]:
+        """Best-effort decode of a digest cursor.
 
-    def _messages(self, session_id: str) -> List[Dict[str, Any]]:
+        Current shape: {"messages": n, "last_at": iso, "memory_id": id}.  Empty
+        or malformed values mean "never digested"; a legacy object without
+        last_at is still honoured (freshness falls back to the message count).
+        """
+        text = str(raw or "").strip()
+        if not text:
+            return {}
+        try:
+            value = json.loads(text)
+        except (TypeError, ValueError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    @staticmethod
+    def _digest_stale(row: Mapping[str, Any]) -> bool:
+        """True when the session has no digest, or its digest is outdated.
+
+        pending = no cursor OR n > cursor.messages OR last_at > cursor.last_at.
+        Comparing the message count catches appends whose timestamp ties the
+        previous last_at; comparing last_at catches histories whose newest row
+        was rewritten.  Legacy cursors without last_at fall back to the count.
+        """
+        cursor = row.get("cursor") or {}
+        if not cursor:
+            return True
+        try:
+            seen = max(0, int(cursor.get("messages") or 0))
+        except (TypeError, ValueError):
+            seen = 0
+        try:
+            total = max(0, int(row.get("n") or 0))
+        except (TypeError, ValueError):
+            total = 0
+        if total > seen:
+            return True
+        cursor_last = str(cursor.get("last_at") or "")
+        return bool(cursor_last) and str(row.get("last_at") or "") > cursor_last
+
+    def pending_sessions(self, limit: int = 4, *, min_messages: int = 4) -> List[Dict[str, Any]]:
+        """Return sessions with no digest or with a stale digest, newest first."""
+        limit = max(1, min(500, int(limit)))
+        minimum = max(1, int(min_messages))
+        # Over-fetch: staleness needs the cursor parsed in Python (it is JSON),
+        # so the SQL LIMIT would otherwise drop eligible sessions.
+        window = min(2_000, max(64, limit * 8))
         with self.ledger._reading() as conn:
             rows = conn.execute(
-                "SELECT memory_id, role, content, created_at FROM memories "
-                "WHERE raw_chat=1 AND session_id=? AND content!='' "
-                "ORDER BY created_at ASC LIMIT ?",
-                (session_id, MAX_MESSAGES_PER_SESSION)).fetchall()
+                "SELECT m.session_id, m.scope, m.source_agent, COUNT(*) n, MIN(m.created_at) first_at, "
+                "MAX(m.created_at) last_at, MAX(m.project) project, MAX(m.task_id) task_id, "
+                "COALESCE(c.cursor, CASE WHEN cl.metadata_json IS NULL OR "
+                "COALESCE(json_extract(cl.metadata_json, '$.scope'), m.scope) = m.scope "
+                "THEN cl.cursor ELSE NULL END) cursor "
+                "FROM memories m "
+                "LEFT JOIN source_cursors c ON c.source_id = 'digest:' || m.scope || ':' || m.session_id "
+                "LEFT JOIN source_cursors cl ON cl.source_id = 'digest:' || m.session_id "
+                "WHERE m.raw_chat=1 AND m.session_id!='' "
+                "GROUP BY m.session_id, m.scope HAVING n >= ? "
+                "ORDER BY last_at DESC LIMIT ?", (minimum, window)).fetchall()
+        pending: List[Dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["cursor"] = self._parse_cursor(item.pop("cursor", ""))
+            if not self._digest_stale(item):
+                continue
+            pending.append(item)
+            if len(pending) >= limit:
+                break
+        return pending
+
+    def _messages(self, session_id: str, *, scope: str = "") -> List[Dict[str, Any]]:
+        """Newest MAX_MESSAGES_PER_SESSION messages, returned oldest first.
+
+        The cap must select the *tail*, not the head: a long session that keeps
+        growing would otherwise digest only its first messages forever, and the
+        new message that made the session stale would never enter the summary.
+        """
+        scope_filter = " AND scope=?" if scope else ""
+        params: Tuple[Any, ...] = (session_id, scope, MAX_MESSAGES_PER_SESSION) if scope else (session_id, MAX_MESSAGES_PER_SESSION)
+        with self.ledger._reading() as conn:
+            rows = conn.execute(
+                "SELECT memory_id, role, content, created_at FROM ("
+                " SELECT memory_id, role, content, created_at FROM memories"
+                " WHERE raw_chat=1 AND session_id=?" + scope_filter + " AND content!=''"
+                " ORDER BY created_at DESC, memory_id DESC LIMIT ?"
+                ") ORDER BY created_at ASC, memory_id ASC",
+                params).fetchall()
         return [dict(row) for row in rows]
 
     @staticmethod
@@ -194,15 +264,28 @@ class SessionDigester:
 
     # -- extraction -------------------------------------------------------
     def _claims(self, summary: SessionSummary) -> Tuple[List[Dict[str, Any]], str]:
-        from .distill import Candidate  # local import keeps the module graph flat
+        from .distill import Candidate, DistillEngine  # local import keeps the module graph flat
 
+        source_scope = str(getattr(summary, "scope", "") or "shared")
         candidate = Candidate("", "task", summary.digest, summary.agent,
                               summary.project, summary.task_id, summary.session_id,
-                              summary.last_at, {})
+                              summary.last_at, {}, source_scope)
         if getattr(self.extractor, "available", False):
-            claims = self.extractor.extract([candidate])
+            helper = DistillEngine(self.ledger, extractor=None)
+            if isinstance(self.extractor, ClaudeExtractor):
+                claims = self.extractor.extract(
+                    [candidate], known_slots=helper._active_slots([candidate])
+                )
+            else:
+                claims = self.extractor.extract([candidate])
             if claims:
-                return claims, getattr(self.extractor, "name", "llm")
+                filtered = [c for c in claims if str(c.get("op") or "").strip().upper() != "NOOP"]
+                if filtered:
+                    subject_map = helper._active_subject_map()
+                    return (
+                        helper._canonicalize_claims(filtered, source_scope, subject_map),
+                        getattr(self.extractor, "name", "llm"),
+                    )
         # Deterministic fallback: keep the digest itself as one factual claim.
         return ([{"subject": summary.task_id or summary.session_id,
                   "predicate": "会话摘要",
@@ -212,15 +295,40 @@ class SessionDigester:
 
     def _record(self, summary: SessionSummary, claims: Sequence[Mapping[str, Any]],
                 extractor_name: str) -> Dict[str, Any]:
-        values = ["%s %s=%s" % (item.get("subject", ""), item.get("predicate", ""),
-                                item.get("value", "")) for item in claims]
+        from .distill import classify_claim_value
+
+        source_scope = str(getattr(summary, "scope", "") or "").strip() or "shared"
+        deduped: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        for item in claims:
+            subject = str(item.get("subject", "") or "").strip()
+            predicate = str(item.get("predicate", "") or "").strip()
+            slot_key = str(item.get("slot_key", "") or "").strip()
+            value = str(item.get("value", "") or "").strip()
+            if not subject or not predicate or not slot_key or not value:
+                continue
+            if classify_claim_value(slot_key, predicate, value):
+                continue
+            confidence = float(item.get("confidence", 0.6) or 0.6)
+            key = (subject, predicate, slot_key)
+            prev = deduped.get(key)
+            if prev is None or confidence > float(prev.get("confidence", 0.0)):
+                deduped[key] = {
+                    "subject": subject,
+                    "predicate": predicate,
+                    "slot_key": slot_key,
+                    "value": value,
+                    "confidence": confidence,
+                }
+        gated_claims = list(deduped.values())
+        values = ["%s %s=%s" % (item["subject"], item["predicate"], item["value"])
+                  for item in gated_claims]
         body = "会话摘要（%s，%s 条消息）：%s" % (
             summary.agent or "unknown", summary.messages, _clean(summary.digest, 1_600))
         return {
-            "content": (body + "\n" + "；".join(v for v in values if v))[:2_400],
+            "content": (body + ("\n" + "；".join(v for v in values if v) if values else ""))[:2_400],
             "kind": "semantic",
             "source_agent": "hippomind-digest",
-            "scope": "shared",
+            "scope": source_scope,
             "task_id": summary.task_id or summary.session_id,
             "project": summary.project,
             "session_id": summary.session_id,
@@ -233,42 +341,100 @@ class SessionDigester:
             "importance": 7,
             "metadata": {"digested": True, "extractor": extractor_name,
                          "messages": summary.messages,
-                         "first_at": summary.first_at, "last_at": summary.last_at},
-            "claims": [{"subject": str(item.get("subject", "")),
-                        "predicate": str(item.get("predicate", "")),
-                        "slot_key": str(item.get("slot_key", "")),
-                        "value": str(item.get("value", "")),
-                        "confidence": float(item.get("confidence", 0.6) or 0.6)}
-                       for item in claims],
+                         "first_at": summary.first_at, "last_at": summary.last_at,
+                         "source_scope": source_scope,
+                         "derived_from_raw_chat": True,
+                         "untrusted_source": True},
+            "claims": gated_claims,
         }
 
     def _mark(self, session_id: str, messages: int, memory_id: str = "",
-              error: str = "") -> None:
-        self.ledger.set_cursor(CURSOR_PREFIX + session_id,
-                               json.dumps({"memory_id": memory_id, "messages": messages},
-                                          separators=(",", ":")),
+              last_at: str = "", error: str = "", *, scope: str = "shared") -> None:
+        payload = {"messages": int(messages), "last_at": str(last_at or ""),
+                   "memory_id": str(memory_id or ""), "scope": str(scope or "shared")}
+        norm_scope = str(scope or "shared").strip() or "shared"
+        use_legacy = (norm_scope == "shared")
+        if not use_legacy:
+            with self.ledger._reading() as conn:
+                scope_cnt = int(conn.execute(
+                    "SELECT COUNT(DISTINCT scope) FROM memories WHERE raw_chat=1 AND session_id=?",
+                    (session_id,),
+                ).fetchone()[0])
+                existing_scoped = conn.execute(
+                    "SELECT 1 FROM source_cursors WHERE source_id=?",
+                    (CURSOR_PREFIX + norm_scope + ":" + session_id,),
+                ).fetchone()
+                existing_legacy = conn.execute(
+                    "SELECT metadata_json FROM source_cursors WHERE source_id=?",
+                    (CURSOR_PREFIX + session_id,),
+                ).fetchone()
+            if scope_cnt <= 1 and existing_scoped is None:
+                if existing_legacy is None:
+                    use_legacy = True
+                else:
+                    try:
+                        legacy_meta = json.loads(str(existing_legacy["metadata_json"] or "{}"))
+                    except (TypeError, ValueError):
+                        legacy_meta = {}
+                    legacy_scope = str(legacy_meta.get("scope") or "").strip() if isinstance(legacy_meta, dict) else ""
+                    if not legacy_scope or legacy_scope == norm_scope:
+                        use_legacy = True
+        cursor_id = (CURSOR_PREFIX + session_id if use_legacy
+                     else CURSOR_PREFIX + norm_scope + ":" + session_id)
+        self.ledger.set_cursor(cursor_id,
+                               json.dumps(payload, separators=(",", ":")),
                                error=error,
-                               metadata={"kind": "session-digest", "at": utc_now()})
+                               metadata={"kind": "session-digest", "scope": norm_scope, "at": utc_now()})
+
+    def _supersede_previous(self, old_memory_id: str, new_memory_id: str) -> bool:
+        """Retire the digest a newer summary replaces.
+
+        A re-digested session must not leave two active summaries describing
+        the same conversation: the old row is superseded so recall cannot
+        return stale progress as current.
+        """
+        if not old_memory_id or not new_memory_id or old_memory_id == new_memory_id:
+            return False
+        with self.ledger._reading() as conn:
+            row = conn.execute("SELECT lifecycle FROM memories WHERE memory_id=?",
+                               (old_memory_id,)).fetchone()
+        if row is None or str(row["lifecycle"]) != "active":
+            return False
+        try:
+            return bool(self.ledger.supersede(old_memory_id, new_memory_id,
+                                              source_agent="hippomind-digest"))
+        except (LedgerError, ValueError):
+            return False
 
     def run(self, *, limit: int = 4, dry_run: bool = False,
             min_messages: int = 4) -> Dict[str, Any]:
         started = time.time()
         sessions = self.pending_sessions(limit, min_messages=min_messages)
-        summary = {"sessions": len(sessions), "digested": 0, "skipped": 0,
-                   "errors": 0, "claims": 0, "messages": 0,
+        summary = {"sessions": len(sessions), "digested": 0, "superseded": 0,
+                   "skipped": 0, "errors": 0, "claims": 0, "messages": 0,
                    "extractor": "none", "elapsed_ms": 0.0}
         for row in sessions:
             session_id = str(row.get("session_id") or "")
             if not session_id:
                 continue
-            messages = self._messages(session_id)
+            scope = str(row.get("scope") or "shared").strip() or "shared"
+            cursor = row.get("cursor") if isinstance(row.get("cursor"), Mapping) else {}
+            previous_id = str(cursor.get("memory_id") or "")
+            messages = self._messages(session_id, scope=scope)
+            # Freshness is measured on the whole session, not on the bounded
+            # digest window: recording len(messages) would re-queue any session
+            # longer than MAX_MESSAGES_PER_SESSION on every pass.
+            total = max(len(messages), int(row.get("n") or 0))
+            last_at = str(row.get("last_at") or "")
             summary["messages"] += len(messages)
             digest = self.build_digest(messages)
             if not digest or not _informative(digest):
                 summary["skipped"] += 1
                 if not dry_run:
-                    self._mark(session_id, len(messages),
-                               error="empty digest" if not digest else "not informative")
+                    self._mark(session_id, total, memory_id=previous_id,
+                               last_at=last_at,
+                               error="empty digest" if not digest else "not informative",
+                               scope=scope)
                 continue
             item = SessionSummary(
                 session_id=session_id,
@@ -278,21 +444,33 @@ class SessionDigester:
                 messages=len(messages),
                 digest=digest,
                 first_at=str(row.get("first_at") or ""),
-                last_at=str(row.get("last_at") or ""),
+                last_at=last_at,
+                scope=scope,
             )
             claims, extractor_name = self._claims(item)
             summary["extractor"] = extractor_name
-            summary["claims"] += len(claims)
             if dry_run:
+                summary["claims"] += len(claims)
                 summary["digested"] += 1
                 continue
             try:
-                result = self.ledger.ingest(self._record(item, claims, extractor_name))
-                self._mark(session_id, len(messages), memory_id=result.memory_id)
+                record = self._record(item, claims, extractor_name)
+                if not record.get("claims"):
+                    summary["skipped"] += 1
+                    self._mark(session_id, total, memory_id=previous_id,
+                               last_at=last_at, error="no valid claims", scope=scope)
+                    continue
+                summary["claims"] += len(record["claims"])
+                result = self.ledger.ingest(record)
+                if self._supersede_previous(previous_id, result.memory_id):
+                    summary["superseded"] += 1
+                self._mark(session_id, total, memory_id=result.memory_id,
+                           last_at=last_at, scope=scope)
                 summary["digested"] += 1
             except (LedgerError, ValueError) as exc:
                 summary["errors"] += 1
-                self._mark(session_id, len(messages), error=str(exc)[:300])
+                self._mark(session_id, total, memory_id=previous_id, last_at=last_at,
+                           error=str(exc)[:300], scope=scope)
         summary["elapsed_ms"] = round((time.time() - started) * 1000.0, 1)
         return summary
 
@@ -303,7 +481,7 @@ class SessionDigester:
                 "WHERE raw_chat=1 AND session_id!=''").fetchone()[0])
             digested = int(conn.execute(
                 "SELECT COUNT(*) FROM source_cursors WHERE source_id LIKE 'digest:%'").fetchone()[0])
-            pending = max(0, total - digested)
+            pending = len(self.pending_sessions(limit=500))
         return {"sessions": total, "digested": digested, "pending": pending,
                 "extractor": getattr(self.extractor, "name", "heuristic"),
                 "available": bool(getattr(self.extractor, "available", False))}

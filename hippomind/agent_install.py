@@ -596,6 +596,11 @@ def install_agent(ledger: SQLiteLedger, paths: RuntimePaths, agent_id: str, *,
     managed_paths = [config_path, rule_path, mcp_profile_path]
     if agent == "codex":
         managed_paths.append(codex_hooks_path(home=home))
+    if agent == "claude":
+        # settings.json is a file the *user* also edits.  It is snapshotted
+        # before the write so a failed install can restore it byte for byte
+        # instead of leaving a half-written hooks section behind.
+        managed_paths.append(claude_settings_path(home=home))
     managed_snapshots = [(path, _snapshot_managed_file(path)) for path in managed_paths]
     try:
         write_agent_config(config_path, {
@@ -609,6 +614,8 @@ def install_agent(ledger: SQLiteLedger, paths: RuntimePaths, agent_id: str, *,
         native_context_hook: Optional[Dict[str, Any]] = None
         if agent == "codex":
             native_context_hook = install_codex_user_prompt_hook(package_root, config_path, home=home)
+        if agent == "claude":
+            native_context_hook = install_claude_user_prompt_hook(package_root, config_path, home=home)
         native_dsh_plugin: Optional[Dict[str, Any]] = None
         if agent == "deepseek":
             # The Cordis plugin may be unavailable (DSH not installed, profile not
@@ -617,9 +624,12 @@ def install_agent(ledger: SQLiteLedger, paths: RuntimePaths, agent_id: str, *,
         if agent == "cursor":
             _prepare_cursor_rule(rule_path)
         native_hook_runtime = native_context_hook.get("runtime", {}) if native_context_hook else {}
+        # Claude's hook has no trust handshake to verify (settings.json is read
+        # directly), so a successful write *is* the readiness signal there.
         native_codex_hook = bool(
             isinstance(native_hook_runtime, Mapping) and native_hook_runtime.get("ready")
-        )
+        ) or (agent == "claude" and bool(native_context_hook
+                                          and native_context_hook.get("installed")))
         native_deepseek_plugin = bool(
             isinstance(native_dsh_plugin, Mapping) and native_dsh_plugin.get("installed")
         )
@@ -734,3 +744,139 @@ def agent_install_status(ledger: SQLiteLedger, paths: RuntimePaths, agents: Iter
             item["config_error"] = str(exc)
         result.append(item)
     return result
+
+# ---------------------------------------------------------------------------
+# Claude Code UserPromptSubmit hook
+#
+# Claude Code reads hooks from ~/.claude/settings.json (a file the user also
+# owns and edits), so the installer must be surgical: replace exactly the one
+# handler whose command contains this module and this marker, and leave every
+# other handler - and every other settings key - byte-identical.
+#
+# Claude's payload is *not* Codex's: it carries session_id and transcript_path
+# in addition to prompt/cwd.  The parsing lives in hippomind.claude_hook; only
+# the file shapes are shared with the Codex installer, and they differ enough
+# (settings.json vs hooks.json) that duplicating the ~40 lines is clearer than
+# a parameterised abstraction over both.
+# ---------------------------------------------------------------------------
+
+CLAUDE_HOOK_MODULE = "hippomind.claude_hook"
+CLAUDE_HOOK_TIMEOUT_SECONDS = 12
+
+
+def claude_settings_path(*, home: Optional[Path] = None) -> Path:
+    root = Path(home).expanduser() if home else Path.home()
+    return root / ".claude" / "settings.json"
+
+
+def _load_claude_settings(path: Path) -> Tuple[Dict[str, Any], str]:
+    """Load the user-owned Claude settings document without normalising it."""
+    try:
+        if path.stat().st_size > 1_000_000:
+            raise LedgerError("Claude settings.json 超过 1 MiB 安全上限")
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}, ""
+    except OSError as exc:
+        raise LedgerError(f"无法读取 Claude settings.json: {path}") from exc
+    if not raw.strip():
+        return {}, raw
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        raise LedgerError(f"Claude settings.json 不是有效 JSON: {path}") from exc
+    if not isinstance(data, dict):
+        raise LedgerError("Claude settings.json 根节点必须是对象")
+    hooks = data.get("hooks", {})
+    if not isinstance(hooks, dict):
+        raise LedgerError("Claude settings.json.hooks 必须是对象")
+    return data, raw
+
+
+def _managed_claude_hook_command(package_root: Path, agent_config: Path) -> str:
+    """Delegate to the hook module so installer and repairer cannot drift.
+
+    They used to build the command independently, and the repairer added a
+    PYTHONPATH the installer did not.  The result was that a correct install
+    was reported as "needs repair" on every audit - the classic ratchet that
+    teaches an operator to ignore the tool.
+    """
+    from .claude_hook import managed_command
+    return managed_command(package_root=package_root, agent_config=agent_config,
+                           python=sys.executable)
+
+
+def _is_managed_claude_hook(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    command = value.get("command")
+    return (value.get("type") == "command" and isinstance(command, str)
+            and CLAUDE_HOOK_MODULE in command and CODEX_HOOK_MARKER in command)
+
+
+def install_claude_user_prompt_hook(package_root: Path, agent_config: Path, *,
+                                    home: Optional[Path] = None) -> Dict[str, Any]:
+    """Insert exactly one HippoMind UserPromptSubmit hook into Claude settings.
+
+    Idempotent: a second call rewrites the same single handler and reports
+    changed=False.  Duplicates (the observed failure mode of the earlier
+    string-patching repair) are collapsed to one rather than appended to.
+    """
+    path = claude_settings_path(home=home)
+    document, raw = _load_claude_settings(path)
+    hooks = dict(document.get("hooks", {}))
+    groups = hooks.get(CODEX_HOOK_EVENT, [])
+    if not isinstance(groups, list):
+        raise LedgerError("Claude settings.json.hooks.UserPromptSubmit 必须是列表")
+    managed = {
+        "type": "command",
+        "command": _managed_claude_hook_command(package_root, agent_config),
+        "timeout": CLAUDE_HOOK_TIMEOUT_SECONDS,
+    }
+    updated_groups: List[Dict[str, Any]] = []
+    installed = False
+    removed_duplicates = 0
+    for raw_group in groups:
+        if not isinstance(raw_group, Mapping):
+            raise LedgerError("Claude settings.json 的 UserPromptSubmit 项必须是对象")
+        group = dict(raw_group)
+        handlers = group.get("hooks", [])
+        if not isinstance(handlers, list):
+            raise LedgerError("Claude UserPromptSubmit 的 hooks 必须是列表")
+        updated_handlers: List[Any] = []
+        for handler in handlers:
+            if _is_managed_claude_hook(handler):
+                if not installed:
+                    updated_handlers.append(managed)
+                    installed = True
+                else:
+                    removed_duplicates += 1
+            else:
+                updated_handlers.append(handler)
+        group["hooks"] = updated_handlers
+        updated_groups.append(group)
+    if not installed:
+        updated_groups.append({"hooks": [managed]})
+    hooks[CODEX_HOOK_EVENT] = updated_groups
+    document["hooks"] = hooks
+    rendered = json.dumps(document, ensure_ascii=False, indent=2, sort_keys=False) + chr(10)
+    changed = rendered != raw
+    if changed:
+        _atomic_text(path, rendered)
+    return {"path": str(path), "changed": changed, "installed": True,
+            "removed_duplicates": removed_duplicates}
+
+
+def claude_user_prompt_hook_status(*, home: Optional[Path] = None) -> Dict[str, Any]:
+    """Inspect only HippoMind-owned Claude hook entries; never reveal secrets."""
+    path = claude_settings_path(home=home)
+    try:
+        document, _raw = _load_claude_settings(path)
+        groups = document.get("hooks", {}).get(CODEX_HOOK_EVENT, [])
+        count = sum(
+            1 for group in groups if isinstance(group, Mapping)
+            for handler in group.get("hooks", []) if _is_managed_claude_hook(handler)
+        ) if isinstance(groups, list) else 0
+        return {"path": str(path), "installed": count == 1, "count": count}
+    except LedgerError as exc:
+        return {"path": str(path), "installed": False, "count": 0, "error": str(exc)}

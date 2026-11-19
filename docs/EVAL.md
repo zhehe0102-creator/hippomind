@@ -11,8 +11,17 @@ questions the keyword set cannot: the same facts, worded differently. That set
 reports **recall@8 ≈ 0.24**, which is the honest size of the current gap and the
 number semantic work should move.
 
-Owned files: `scripts/eval_memory.py`, `tests/test_eval_memory.py`, this document.
-Core, daemon, transcripts, distill and GUI code are not modified by the eval.
+A third capability is measured by its own script because it has no recall
+metric: **refusal** — when the ledger cannot answer, does it return nothing, or
+does it hand back a plausible-looking neighbour? `scripts/eval_refusal.py`
+runs 38 questions the ledger provably cannot answer and gates on zero leakage
+(measured 0/38 on the production ledger). `tests/test_knowledge_update.py`
+covers the other untested capability from LongMemEval, knowledge update.
+
+Owned files: `scripts/eval_memory.py`, `scripts/eval_refusal.py`,
+`tests/test_eval_memory.py`, `tests/test_eval_refusal.py`,
+`tests/test_knowledge_update.py`, this document. Core, daemon, transcripts,
+distill and GUI code are not modified by the eval.
 
 ## Quick start
 
@@ -46,6 +55,13 @@ python3 scripts/eval_memory.py --set all --dump-queries /tmp/all.json
 
 # Include ledger size/claim counts in the report (adds one ~250 ms stats pass).
 python3 scripts/eval_memory.py --ledger-stats --json
+
+# Refusal: questions the ledger cannot answer must come back empty.
+# Separate script because refusal has no recall denominator (see below).
+python3 scripts/eval_refusal.py
+python3 scripts/eval_refusal.py --gate
+python3 scripts/eval_memory.py --set refusal                 # same, delegated
+python3 scripts/eval_memory.py --set all --include-refusal   # three sets, one gate
 ```
 
 Exit codes: `0` gate passed, `1` gate failed, `2` usage/input error (bad query
@@ -90,6 +106,11 @@ two different capabilities and are reported separately on purpose.
 `--set all` prints both sets, prints a `combined` summary, and passes only if
 **both** gates pass; failures are prefixed with the set name so a passing set
 cannot mask a failing one.
+
+A third set — `refusal` — exists but is **not** in `SET_ORDER`, because it has
+no recall metric and would make the combined report incomparable. Run it with
+`--set refusal` (delegates to `scripts/eval_refusal.py`) or fold it into
+`--set all` with `--include-refusal`. See "Refusal set" below.
 
 ### keyword set (46 queries)
 
@@ -334,6 +355,327 @@ Baseline artifacts (local, gitignored):
 - `output/eval/baseline-2026-10-23.json` — keyword-set JSON report with per-query detail
 - `output/eval/baseline-2026-10-23.txt` — human-readable report
 - `output/eval/labelled-queries.json` — dumped keyword set
+## Refusal set (scripts/eval_refusal.py)
+
+The two labelled sets above measure **recall**: given a memory that answers the
+question, can the retriever find it. Refusal measures the opposite capability,
+and LongMemEval (arXiv 2410.10813) lists it as one of the five long-term-memory
+abilities: **when the ledger cannot answer, does the system return nothing, or
+does it hand back a plausible-looking neighbour?** HippoMind had only three
+manual probes ("今天天气", "1+1") before this; there was no reproducible number.
+
+Refusal lives in its own script, not as a third `--set` in `eval_memory.py`,
+because it has **no recall denominator**: there is no `expect` to hit, only
+`absent_terms` that must not exist. Folding a leak rate into `check_gate`'s
+recall threshold would produce a metric that is 1.0 by construction and can
+never fail.
+
+```bash
+# Report only (never changes the exit code).
+python3 scripts/eval_refusal.py
+
+# Gate: exit 1 on any leak, on a shrunken set, or on an ungrounded label.
+python3 scripts/eval_refusal.py --gate
+
+# Machine-readable, and the same thing through eval_memory.
+python3 scripts/eval_refusal.py --gate --json
+python3 scripts/eval_memory.py --set refusal --gate
+
+# Fold it into the combined gate for a release run.
+python3 scripts/eval_memory.py --set all --include-refusal
+```
+
+Exit codes: `0` report done / gate passed, `1` gate failed (only with
+`--gate`), `2` usage or input error. A missing ledger is never created.
+The ledger is opened **read-only** (`mode=ro` + `PRAGMA query_only=ON`), so
+pointing `--ledger` at the production database cannot modify it.
+
+### Three verdicts, not two
+
+Measured on the 2026-10-25 production ledger: "今天天气怎么样" returns **5
+memories**, the top one scoring **0.394** — above
+`context_pack.MIN_RELIABLE_SCORE` (0.22) — with `fts=0.000` and
+`coverage=0.167`. That 0.39 is entirely recency/touch/weight, i.e. evidence
+unrelated to the query. **A "score below threshold means refused" rule is
+therefore wrong**: an unrelated question has a score floor around 0.37.
+
+What actually decides whether something reaches the model is the gate on the
+automatic-injection path, `context_pack._passes_relevance_gate(candidate,
+min_score)`: first the `min_score` floor (0.20, the same default as
+`auto_context` and the daemon's `/context-pack`), then a hard requirement of
+`fts > 0` **or** `coverage >= 0.6`. Each query is therefore classified into
+one of three states:
+
+| verdict | meaning | counts as |
+| --- | --- | --- |
+| `empty` | `ledger.search` returned nothing | **refused** |
+| `noise` | rows came back, but none passes the injection gate (pack is empty) | **refused** — nothing was invented, low-score neighbours simply sit in the candidate list |
+| `leak` | at least one row passes the injection gate | **failed** — an unrelated question would inject unrelated history |
+
+`refusal_rate = (empty + noise) / n` and the gate requires it to be **1.0**,
+i.e. `leak_rate <= 0.0`. `noise_rate` is reported but is **not** a threshold:
+making it one would demand that the retriever return no candidates at all, which
+is a different (and much more expensive) goal.
+
+### Threshold rationale
+
+| threshold | value | why exactly this |
+| --- | --- | --- |
+| `max_leak_rate` | `0.0` | A leak means an unrelated question injects unrelated history. There is no acceptable rate for that; the capability is binary. Measured 0/38 on the production ledger, repeated runs. |
+| `min_queries` | `20` | HEALTH_REVIEW §6 asks for "20+ and in the gate". Set at the requirement, not at the current count (38), so a deliberate trim is allowed but a silent shrink is not. |
+| `require_grounded` | `True` | Every `absent_terms` entry must have **0 recallable rows**. Without this, a mislabelled term would be reported as a retrieval leak and someone would "fix" the retriever instead of the label. |
+
+There is deliberately **no** `min_recall`, `min_mrr`, `max_noise_rate` or
+latency threshold here. Refusal has no `expect`, so recall and MRR are
+undefined; noise is an accepted form of refusal; and the latency budget is
+already enforced by the keyword/semantic gate on the path that actually injects.
+
+### Composition (38 queries)
+
+| category | n | examples |
+| --- | --- | --- |
+| `fiction` / `nonsense` | 4 | 火星基地的氧气配额, 月球电梯的年度维护预算, 蓝色独角兽的飞行速度 |
+| `everyday` / `arithmetic` | 4 | 今天天气怎么样, 明天会下雨吗, 1+1等于几, 圆周率的第一千位 |
+| `geography` / `history` / `space` | 7 | 澳大利亚的首都, 古罗马帝国灭亡年份, 国际空间站的轨道高度 |
+| `physics` / `biology` / `medical` | 4 | 光速的精确数值, 人类基因组的碱基对总数, 布洛芬的成人单次剂量 |
+| `personal` | 3 | 我的驾驶证号, 我的护照到期时间, 我女儿的生日 |
+| `cooking` / `travel` / `pets` / `plants` / `cars` | 8 | 红烧肉要炖多久, 去冰岛看极光, 养一只柯基, 多肉多久浇水 |
+| `finance` / `law` / `recommendation` | 5 | 明天股市会涨吗, 劳动法规定的年假天数, 推荐一部科幻电影 |
+| `sports` / `music` / `film` / `games` / `language` | 5 | 马拉松世界纪录, 贝多芬第九交响曲首演, 奥斯卡评选规则 |
+
+The spread is deliberate: a set that only asks about one topic would measure "we
+have no corpus for this topic" rather than the ability to refuse. Two categories
+are load-bearing:
+
+* **`medical` and `personal`** — a wrong answer here has real-world
+  consequences, so refusing is the only acceptable behaviour.
+* **`fiction`** — these are the queries most likely to be "answered" by a
+  topically similar neighbour ("火星" does occur in 6 rows of the production
+  ledger, none recallable). They are the canary for the vector channel: if
+  semantic similarity is ever allowed to pass the injection gate on its own, it
+  will show up here first.
+
+### Labelling rules
+
+Each entry carries `id`, `category`, `query`, `absent_terms` and
+`note`. The rules below are enforced by `tests/test_eval_refusal.py` because
+violating any of them makes the metric lie rather than merely score low:
+
+1. **`absent_terms` must have 0 rows in the recallable set.** The recallable
+   predicate mirrors `ledger.search`'s defaults exactly:
+
+   ```sql
+   scope = ?                             -- the query's scope (default shared)
+   AND raw_chat = 0                      -- include_raw_chat=False
+   AND quality_state = 'accepted'
+   AND lifecycle IN ('active','cold')    -- include_cold=True
+   AND evidence_json != '[]'             -- require_evidence=True
+   AND content LIKE '%<absent_term>%'    -- must be 0 rows
+   ```
+
+   This SQL **is** the executable definition of "the ledger does not have it",
+   and `--audit-grounding` (on by default) re-runs it every time. Note the
+   predicate is *not* "the string never appears anywhere": `天气` occurs in 7
+   rows of the production ledger, all of them non-recallable. Requiring 0 rows
+   in the whole table would make most realistic queries unlabelable.
+2. **A term must be a topic word, at least 2 characters, and not a filler
+   word.** `我的`, `多少`, `什么` occur everywhere; using one as an
+   "absent" term fails the audit immediately. Enforced by
+   `test_every_term_is_a_substantive_topic_word` and the 1-character rejection
+   in `validate_refusal_queries`.
+3. **Every query carries a `note`** recording the row count observed at
+   labelling time, so a reviewer can re-derive the label.
+4. **Queries are Chinese.** LongMemEval needs 500 English QA pairs against an
+   English corpus; this ledger belongs to a Chinese personal assistant, so only
+   the capability dimension is borrowed, not the corpus (HEALTH_REVIEW §9.2).
+
+Verification query used for each candidate (run read-only):
+
+```bash
+sqlite3 "file:$HOME/Library/Application Support/HippoMind/hippomind.sqlite?mode=ro" "
+  SELECT count(*) FROM memories
+  WHERE scope='shared' AND raw_chat=0 AND quality_state='accepted'
+    AND lifecycle IN ('active','cold') AND evidence_json!='[]'
+    AND content LIKE '%<absent_term>%';"
+```
+
+### Drift
+
+**`leak` is stable at 0. The `empty`/`noise` split is not.**
+
+Sampling basis (use this as the comparison anchor when re-measuring): **18 runs,
+2026-10-25, production ledger ~267.9k memories / ~12.0k active**. The split moved
+between `empty=22 noise=16` and `empty=29 noise=9`, with `leak=0` in every
+single run, and `max_top_score` moved between 0.377 and 0.394.
+
+The mechanism is worth stating because it is easy to mistake for flakiness in
+the gate: the ledger is live, and `ledger.search` builds its candidate pool
+from FTS/LIKE, whose `coverage` denominators and candidate budgets shift as
+the daemon writes. An unrelated query therefore returns 0 rows on one run and
+1-6 low-score rows on the next. What does **not** move is whether any of those
+rows carries lexical evidence — that is a property of the query, not of the
+ledger, and it stays at zero.
+
+Two consequences:
+
+- The gate pins **only** `leak_rate` (0.0). Pinning `empty`/`noise` would
+  make a query fail because its neighbour list grew by one, which is the ledger
+  growing, not a regression.
+- The baseline records a **range** for the split (`empty 22-29`,
+  `noise 9-16`) for the same reason `SET_BASELINE["semantic"]` records one.
+
+The one legitimate way for `leak` to move is that the ledger learns the fact —
+which is exactly what the grounding audit reports. Treat an audit violation as a
+signal to **replace the query**, never as a reason to loosen the threshold.
+
+### Refreshing the refusal set
+
+1. Pick a topic the ledger genuinely should not know (real-time, personal,
+   external-world, fictional, or a different domain entirely).
+2. Write the question as a user would ask it, in Chinese.
+3. Choose the **topic word** as `absent_terms` and verify it with the SQL
+   above; record the whole-table count in `note`.
+4. Run `python3 scripts/eval_refusal.py --gate` and confirm `grounding: OK`.
+5. Update `REFUSAL_BASELINE` in `scripts/eval_refusal.py` and the baseline
+   table below with the measured `empty`/`noise`/`leak` counts.
+
+### Baseline — 2026-10-25
+
+Production ledger at baseline run: **267,914 memories** (259,409 raw chat),
+11,986 active, 4,771 claims (2,815 active), 2,989 FTS-indexed rows.
+
+```
+set=refusal queries=38 k=8 min_score=0.20 empty=22..29 noise=9..16 leak=0
+refusal_rate=1.000 leak_rate=0.000 max_top_score=0.377..0.394
+p50=75ms p95=125..146ms
+grounding: OK (38 queries, 39 absent_terms 全部 0 行)
+gate: PASS  (max_leak_rate=0.00, min_queries=20, grounded=on)
+```
+
+Representative run (`empty=27 noise=11`):
+
+```
+set=refusal queries=38 k=8 min_score=0.20 empty=27 noise=11 leak=0
+refusal_rate=1.000 noise_rate=0.289 leak_rate=0.000 max_top_score=0.387
+p50=74.9ms p95=135.8ms
+grounding: OK (38 queries, 39 absent_terms 全部 0 行)
+gate: PASS  (max_leak_rate=0.00, min_queries=20, grounded=on)
+```
+
+**0 of 38 leaked.** The rest split between `empty` (nothing came back at all)
+and `noise` (rows came back, none carried lexical evidence, none passed the
+injection gate). The `noise` cases are the honest part of the number:
+`ledger.search` still returns a candidate list for them (highest score 0.39),
+it just never survives the relevance gate. Reporting only the `empty` count
+would overstate the capability.
+
+The queries that consistently produce candidates are the personal ones
+(`我的驾驶证号是多少` returns 4-8 rows, top ~0.35, `coverage<=0.14`): every
+character-level overlap comes from the pronoun `我的`, which is why the label
+uses `驾驶证` as its absent term instead. They are `noise`, not `leak` —
+no row has `fts > 0` or `coverage >= 0.6`.
+
+### Scope: which read path this measures
+
+This set measures the **automatic-injection path** — the one that decides what
+gets put in front of the model without being asked. That is the path where a
+wrong neighbour is actively harmful, and it is the only path with a relevance
+gate.
+
+**Explicit recall (`hippomind_recall`) is deliberately not gated.** It calls
+`ledger.search` directly with `min_score=0`, so for an unanswerable query it
+returns the same low-score candidates the `noise` verdict describes. That is
+the intended contract, not a gap: an explicit call means "show me the candidates
+and I will judge", so it returns **candidates, not assertions**. Applying the
+injection gate there would silently drop the rows the caller asked for.
+
+The two paths therefore answer different questions and are measured separately:
+the gate here covers "what gets injected", and the keyword/semantic sets cover
+"what can be found". A future `--mode recall` could report the explicit path's
+candidate quality, but it would be a different metric (ranking quality, not
+refusal), and averaging it in here would blur exactly the distinction this set
+exists to make.
+
+### Related tests
+
+`tests/test_eval_refusal.py` — 50 tests: the three-verdict classifier
+(including the 0.394-score noise case), query-set validation (1-character and
+filler terms rejected), the grounding audit (quarantine rows do not count as
+present), the read-only ledger (writes rejected at both the transaction and the
+SQLite layer, `touch` is a no-op, source file mtime unchanged), gate verdicts,
+and the CLI exit codes.
+
+## Knowledge-update tests (tests/test_knowledge_update.py)
+
+HEALTH_REVIEW §6 lists knowledge update as the second untested capability: write
+A, then write B into the same slot, ask "what is it now" (must be B) and "what
+was it before" (must be A). It is tested by
+`tests/test_knowledge_update.py` rather than by a script, because it needs a
+controlled ledger (a fresh write ordering and explicit validity windows), not
+the production one.
+
+The file pins **two different code paths** that are easy to conflate:
+
+**Path 1 — claim level (same slot, competing values).** Two memories assert
+different values for the same `(scope, subject, predicate, slot_key)`. On
+ingest, `_insert_claims` compares `confidence * source_trust`: the winner
+stays `active`, the loser's claims become `superseded`, the losing **memory**
+leaves recall (`lifecycle='superseded'`) and points at the winner via
+`superseded_by`. Tests: `test_query_for_the_current_value_returns_b_only`,
+`test_context_pack_for_the_current_value_contains_only_b`,
+`test_lower_confidence_new_value_becomes_a_conflict_not_a_silent_overwrite`,
+`test_close_confidences_put_both_sides_in_conflict`.
+
+**Path 2 — memory level (declared validity windows).** Two memories that do
+**not** compete (their claim windows do not overlap), each carrying
+`valid_from`/`valid_until`. `ledger.search(as_of=T)` evaluates the windows
+at T, so the same query returns A at T-2d and B now. Tests:
+`test_as_of_inside_the_old_window_returns_only_the_old_value`,
+`test_as_of_before_both_windows_returns_nothing`,
+`test_context_pack_as_of_returns_the_historical_fact`.
+
+One subtlety worth recording, because it cost a debugging round: the window must
+be written **inside the claim dict**, not only on the record.
+`_normalise_claims` defaults `claim.valid_until` to `""` rather than
+inheriting the record's value, so a record-level-only window makes both claims
+look windowless — they then compete, A is superseded, and the test silently
+becomes a path-1 test.
+
+**The two paths are not yet connected** (HEALTH_REVIEW §3, T2's job): a
+superseded claim gets no `valid_until`, and a `superseded` memory is excluded
+from the `as_of` branch of `search`. So "what was it before" is answerable
+today **only** on path 2 (explicit windows), not on path 1.
+`KnowledgeUpdateTemporalGapTests` asserts the *consistency* of that state
+rather than the current behaviour: if the claim has no `valid_until`,
+`as_of` must return empty; if it has one, `as_of` must return A. The suite
+therefore stays green both before and after T2 lands, and cannot let a
+half-finished fix through.
+
+## Refusal in the combined gate
+
+`scripts/eval_memory.py` gains two opt-in flags. **Neither changes the existing
+output format or exit codes** — `tests/test_eval_memory.py` pins those, and the
+refusal set is deliberately absent from `SET_ORDER`:
+
+* `--set refusal` delegates to `scripts/eval_refusal.py` (same thresholds,
+  same verdicts, same exit codes). It forwards `--ledger`, `--limit`,
+  `--min-score`, `--queries`, `--json` and `--min-queries`, and turns on
+  the refusal gate unless `--no-gate` is passed. Note the flag naming: in
+  `eval_memory.py` gating is the **default** (there is only `--no-gate`),
+  whereas `eval_refusal.py` has an explicit `--gate` so a plain run is a
+  report. Delegating rather than reimplementing keeps one definition of
+  "refused".
+* `--set all --include-refusal` appends the refusal set to the combined gate.
+  Failures are prefixed `refusal:` like the other sets, and the report gains an
+  `order` key listing all three. Without the flag, `--set all` emits exactly
+  the bytes it emitted before.
+
+```bash
+python3 scripts/eval_memory.py --set refusal                 # refusal only
+python3 scripts/eval_memory.py --set all                     # unchanged
+python3 scripts/eval_memory.py --set all --include-refusal   # three sets
+```
+
 ## Query file schema
 
 `--queries` accepts a JSON array. `id` is optional (defaults to the query text)
@@ -408,19 +750,59 @@ For the semantic set, follow "Refreshing the semantic set" above instead.
   changes. Record `--ledger-stats` when publishing a baseline.
 - **Latency is machine-specific.** The p95 gate guards against gross
   regressions on this Mac; it is not a portable benchmark.
+- **Refusal proves the injection gate, not every read path.** The refusal set
+  measures the automatic-injection relevance gate. An explicit
+  `hippomind_recall` MCP call bypasses it by design (`min_score=0`) and
+  returns the same low-score candidates; that path is not measured here.
+- **Knowledge update is only half-answerable today.** "What was it before" works
+  for memories that declare `valid_from`/`valid_until` windows, but not for
+  claim-level supersession, because a superseded claim gets no `valid_until`
+  yet (HEALTH_REVIEW §3). `tests/test_knowledge_update.py` asserts the
+  *consistency* of that state so a half-finished fix cannot pass.
 - **Not part of CI.** It needs the production ledger, so `tests/test_eval_memory.py`
   covers the metric math, both query sets' labels and the gate combinations with
-  temporary ledgers instead. Run the gate manually before release/refactor steps
-  that touch retrieval, ranking, FTS projection, claims or consolidation.
+  temporary ledgers instead, and `tests/test_eval_refusal.py` does the same for
+  the refusal classifier, grounding audit and read-only ledger. Run the gates
+  manually before release/refactor steps that touch retrieval, ranking, FTS
+  projection, claims or consolidation.
 
 ## Related work
 
 - `tests/test_eval_memory.py` — 39 tests for percentiles, relevance, MRR,
   duplicate rate, query validation, gate verdicts, CLI exit codes, the embedded
   sets, the semantic label rules and `--set` combinations.
+- `scripts/eval_refusal.py` + `tests/test_eval_refusal.py` — the refusal set,
+  its three-verdict classifier and the read-only ledger (see "Refusal set").
+- `tests/test_knowledge_update.py` — 16 tests for claim-level and memory-level
+  knowledge update, plus the temporal-gap consistency guard (see
+  "Knowledge-update tests").
 - `hippomind/retrieval_eval.py` + `tests/test_retrieval_eval.py` — synthetic
   40-case Chinese and 32-case English QA suites. They test retrieval semantics
   in isolation; this production eval tests the real ledger.
 - `REFACTOR_REPORT_ROUND4.md` — original gap: "the 10-query harness is a smoke
   benchmark, not a labelled eval set".
 - `docs/SEMANTIC.md` — the semantic retrieval work this set exists to measure.
+
+## Benchmark fixture gate (2026-11-14)
+
+`scripts/eval_benchmark.py` 把“检索是否有效”变成 release gate 的一步
+（`scripts/release_check.sh` 第 8 步，CI 的 release-gate job 也会跑）。
+它不依赖生产账本：fixture 里同时给出 memories 与 queries，脚本在临时目录建账本、
+一次 ingest 后按类别评测。
+
+- fixture：`tests/fixtures/retrieval/benchmark_zh_v1.json`
+  （64 memories / 48 queries；fact_recall 12、knowledge_update 8、temporal 8、
+  continuity 8、abstention 12）。这是自建、按 LongMemEval 能力维度对齐的回归集，
+  不是官方分数、不能横向比较。
+- 指标：recall@8、MRR、duplicate_rate、update_hit（新值命中且旧值不在 top-k）、
+  abstain_accuracy（自动注入门控下必须空包）、p95 延迟、per-category recall。
+- 阈值：`tests/fixtures/retrieval/benchmark_baseline.json`（recall 0.95 / MRR 0.8722 /
+  update_hit 0.90 / abstain 0.90 / per-category 0.90 / p95 50ms）。
+  阈值 = 实测值 − margin，只允许显式 `--update-baseline` 重写并记录 measured。
+- 官方 LongMemEval 支持：`--format longmemeval --data <file>` 适配可子串验证的子集；
+  仓库不内置官方数据（许可/体积），不可验证的题会报错并给出 schema，不猜答案。
+
+``bash
+PYTHONPATH=$PWD /usr/bin/python3 scripts/eval_benchmark.py --json
+# 默认自建 fixture：48 queries，gate PASS；--format longmemeval --data <file> 跑官方子集
+``

@@ -34,6 +34,7 @@ from ._helpers import (
     _timestamp,
     utc_now,
 )
+from .. import query_expansion
 
 #: RRF 融合常数（Reciprocal Rank Fusion，k=60 是通行取值）。
 #: 之前 fts/like 两个通道的 1/(60+rank) 是硬编码字面量；提成常量后默认值
@@ -44,29 +45,43 @@ _RRF_K = 60.0
 #: 96 来自实测：15 条改写式查询 recall 0.333 -> 0.400，46 条关键词 1.000 -> 0.978。
 _DEFAULT_VECTOR_TOPN = 96
 
+#: 实体通道参与候选生成时取多少条记忆。与向量通道同量级（通道太窄则融合
+#: 没有贡献，太宽则把噪声灌进候选集）；实体命中本来就比向量稀疏，96 已
+#: 覆盖生产库上全部实体命中的绝大多数。
+_DEFAULT_ENTITY_TOPN = 96
+
 
 class SearchMixin:
     """Lexical retrieval: FTS5, LIKE rescue, coverage scoring, ranking, paging."""
 
     def _search_cached(self, key: Tuple[Any, ...]) -> Optional[List[Dict[str, Any]]]:
-        hit = self._search_cache.get(key)
-        if hit is None:
-            return None
-        stamp, rows = hit
-        if time.monotonic() - stamp > self._search_cache_ttl:
-            self._search_cache.pop(key, None)
-            return None
-        return self._copy_rows(rows)
+        with self._search_lock:
+            hit = self._search_cache.get(key)
+            if hit is None:
+                return None
+            stamp, rows = hit
+            if time.monotonic() - stamp > self._search_cache_ttl:
+                self._search_cache.pop(key, None)
+                return None
+            snapshot = list(rows)
+        return self._copy_rows(snapshot)
 
     def _search_store(self, key: Tuple[Any, ...], rows: List[Dict[str, Any]]) -> None:
-        self._search_cache[key] = (time.monotonic(), self._copy_rows(rows))
-        if len(self._search_cache) > 128:
-            oldest = min(self._search_cache.items(), key=lambda kv: kv[1][0])[0]
-            self._search_cache.pop(oldest, None)
+        copied = self._copy_rows(rows)
+        with self._search_lock:
+            self._search_cache[key] = (time.monotonic(), copied)
+            if len(self._search_cache) > 128:
+                oldest = min(self._search_cache.items(), key=lambda kv: kv[1][0])[0]
+                self._search_cache.pop(oldest, None)
 
     @staticmethod
-    def _fts_terms(query: str) -> List[str]:
-        raw_terms = re.findall(r"[a-z0-9_]{2,}|[\u3400-\u9fff]{2,}", query.lower())
+    def _clean_terms_query(query: str) -> str:
+        return re.sub(r"\b__hm_[a-z0-9_]+\b", " ", str(query or ""), flags=re.I)
+
+    @classmethod
+    def _fts_terms(cls, query: str) -> List[str]:
+        cleaned = cls._clean_terms_query(query)
+        raw_terms = re.findall(r"[a-z0-9_]{2,}|[\u3400-\u9fff]{2,}", cleaned.lower())
         terms = [term for term in raw_terms
                  if term not in LOW_SIGNAL_QUERY_TERMS and term not in LOW_SIGNAL_CJK_QUERY_TERMS]
         # A bare product/task name such as ``Memory Hub`` can consist entirely
@@ -88,13 +103,27 @@ class SearchMixin:
         for term in windowed:
             if term not in seen:
                 seen.append(term)
-        return seen[:12]
+        # [:12] 是**原始查询词**的预算，先按原样裁剪，保证关闭扩展时逐字节不变。
+        bounded = seen[:12]
+        # 查询扩展（默认关闭）：扩展词**追加在预算之外**。
+        #
+        # 这里踩过一个坑，别改回去：最初把扩展词 append 进 seen 再一起 [:12]，
+        # 结果是长 CJK 查询的滑动窗口已经把 12 个名额吃满，扩展词一个都进不了
+        # OR 组——功能写了却永远不生效，而单测只要断言 expand() 有返回值就会
+        # "通过"。实测差异：semantic recall 0.6226（被截断）vs 0.7736（不截断）。
+        #
+        # 扩展词只负责"把行放进候选集"与 coverage 的排序乘数，不参与
+        # score_parts 的可靠性判定（见 _prepare_query_coverage 的说明）。
+        for term in (query_expansion.expansion_terms(query) if query else []):
+            if term not in bounded:
+                bounded.append(term)
+        return bounded
 
-    @staticmethod
-    def _expansion_terms(query: str) -> List[str]:
+    @classmethod
+    def _expansion_terms(cls, query: str) -> List[str]:
         """Strongest entity words for the sparse-candidate expansion pass."""
 
-        query = str(query or "").lower()
+        query = cls._clean_terms_query(query).lower()
         words = re.findall(r"[a-z0-9_]{2,}|[\u3400-\u9fff]{2,}", query)
         unique: List[str] = []
         for word in sorted(set(words), key=len, reverse=True):
@@ -102,19 +131,26 @@ class SearchMixin:
                 unique.append(word)
         return unique[:6]
 
-    @staticmethod
-    def _bigram_terms(query: str) -> List[str]:
+    @classmethod
+    def _bigram_terms(cls, query: str) -> List[str]:
         """查询 CJK 段的二元碎片：最后回退通道专用（仅共享短词也能触达）。"""
 
-        text = str(query or "").lower()
+        text = cls._clean_terms_query(query).lower()
+        segments = re.findall(r"[\u3400-\u9fff]{2,}", text)
         terms: List[str] = []
-        for segment in re.findall(r"[\u3400-\u9fff]{2,}", text):
+        for segment in segments:
             if segment in LOW_SIGNAL_CJK_QUERY_TERMS:
                 continue
             for index in range(len(segment) - 1):
                 gram = segment[index:index + 2]
                 if gram not in terms and gram not in LOW_SIGNAL_CJK_QUERY_TERMS:
                     terms.append(gram)
+        if not terms and len(segments) >= 2:
+            for segment in segments:
+                for index in range(max(1, len(segment) - 1)):
+                    gram = segment[index:index + 2] if len(segment) > 2 else segment
+                    if gram not in terms:
+                        terms.append(gram)
         return terms[:12]
 
     @staticmethod
@@ -136,30 +172,58 @@ class SearchMixin:
                 seen.append(term.lower())
         return seen[:6]
 
-    @staticmethod
-    def _like_terms(query: str) -> List[str]:
+    @classmethod
+    def _like_terms(cls, query: str) -> List[str]:
         """Return bounded phrase fragments for the non-FTS CJK candidate path."""
 
-        query = str(query or "").lower()
-        terms: List[str] = re.findall(r"[a-z0-9_]{2,}", query)
-        for segment in re.findall(r"[\u3400-\u9fff]{2,}", query):
-            if segment in LOW_SIGNAL_CJK_QUERY_TERMS:
-                continue
-            if len(segment) < 4:
+        cleaned = cls._clean_terms_query(query).lower()
+        raw_ascii = re.findall(r"[a-z0-9_]{2,}", cleaned)
+        terms: List[str] = [t for t in raw_ascii if t not in LOW_SIGNAL_QUERY_TERMS]
+        cjk_segments = re.findall(r"[\u3400-\u9fff]{2,}", cleaned)
+        kept_cjk = [s for s in cjk_segments if s not in LOW_SIGNAL_CJK_QUERY_TERMS]
+        if not terms and not kept_cjk:
+            # 双低信号词保底，与 _fts_terms 保持一致（如「修复 问题」）。
+            if len(raw_ascii) + len(cjk_segments) >= 2:
+                terms = list(raw_ascii)
+                kept_cjk = list(cjk_segments)
+        for segment in kept_cjk:
+            if len(segment) <= 4:
                 terms.append(segment)
                 continue
-            # 三字碎片已足够判别（如「端口是」「负责人」），四字起会漏掉
-            # 词序不同的自然问句；容量仍受 [:64] 上限约束。
-            for size in range(min(8, len(segment)), 2, -1):
-                terms.extend(segment[index:index + size] for index in range(len(segment) - size + 1))
+            # 先取最具判别力的 3-4 字滑窗，再保留整段，防止长句前面的 6-8 字碎片占满 [:8] 预算。
+            terms.append(segment)
+            for size in (3, 4):
+                for index in range(len(segment) - size + 1):
+                    terms.append(segment[index:index + size])
         seen: List[str] = []
         for term in terms:
             if term and term not in seen:
                 seen.append(term)
-        # LIKE 回退是全库扫描：每个词项都是一行上的 OR 谓词。长窗口判别力
-        # 最高（误报最少），裁剪到前 8 项可把扫描成本近乎减半而不损召回——
-        # 实测 50k 行救援路径 ~160ms，词项数是其主要成本项。
-        return seen[:8]
+        bounded = seen[:8]
+        # 追加查询扩展词（尤其是 <3 字的中文同义词在 trigram FTS 无法命中，必须靠 LIKE）。
+        for term in (query_expansion.expansion_terms(query) if query else []):
+            lowered = term.lower()
+            if lowered and lowered not in bounded:
+                bounded.append(lowered)
+        return bounded
+
+    @staticmethod
+    def _like_match_group(terms: Sequence[str], *, include_structured: bool = True) -> Tuple[str, List[object]]:
+        """构造多字段 LIKE 匹配谓词及对应绑定参数（内容 + 结构化上下文 + task/project）。"""
+        parts: List[str] = []
+        like_params: List[object] = []
+        for term in terms:
+            pattern = "%" + str(term).lower() + "%"
+            if include_structured:
+                parts.append(
+                    "(LOWER(m.content) LIKE ? OR LOWER(COALESCE(json_extract(m.metadata_json, '$.context'), '')) LIKE ? "
+                    "OR LOWER(m.task_id) LIKE ? OR LOWER(m.project) LIKE ?)"
+                )
+                like_params.extend([pattern, pattern, pattern, pattern])
+            else:
+                parts.append("LOWER(m.content) LIKE ?")
+                like_params.append(pattern)
+        return "(" + " OR ".join(parts) + ")", like_params
 
     def _vector_candidates(self, query: str, vector_index, clauses: Sequence[str],
                            params: Sequence[object], *, topn: int = _DEFAULT_VECTOR_TOPN,
@@ -264,6 +328,112 @@ class SearchMixin:
                  if memory_id in claim_of})
 
 
+    def _entity_candidates(self, query: str, entity_index, clauses: Sequence[str],
+                           params: Sequence[object], *,
+                           topn: int = _DEFAULT_ENTITY_TOPN
+                           ) -> Tuple[Dict[str, int], Dict[str, sqlite3.Row],
+                                      Dict[str, float], Dict[str, str]]:
+        """实体候选通道（第三路，默认关闭）：返回 (id->名次, id->行, id->分数, id->实体)。
+
+        与 :meth:`_vector_candidates` 完全同形：索引侧已经做完记忆级去重
+        （``EntityIndex.search_text`` 返回 ``(memory_id, score, entity)``），
+        这里只做**过滤重放**与名次紧凑化，第三元进 ``score_parts["entity"]``
+        供审计「是哪条实体把这条记忆拉上来的」。
+
+        ## 为什么过滤必须在 SQL 里重放
+
+        实体倒排覆盖全库 accepted+active，而本次检索可能带 scope / project /
+        task / 时间窗口 / raw_chat 过滤。只按 memory_id 取行而不重放 clauses，
+        会让跨 scope 的记忆悄悄进入结果——那是越权召回，不是「召回率提升」。
+
+        ## 候选生成是「多条通路」的集合——这里最容易踩的坑
+
+        检索的候选集由**若干条各自独立生成**的通路合并而成：FTS、短语 LIKE、
+        有界 LIKE 救援、2 字回退、向量、以及这里的实体。任何「放宽过滤条件」
+        的改动，如果**不同时**扩候选生成，就不会生效——因为被放宽的行从来
+        没有进入候选集。
+
+        这不是假设，是本仓库真实踩过的坑：``include_cold=True`` 只放宽了 SQL 的
+        ``m.lifecycle IN ('active','cold')``，但 maintain 会把 cold 行从
+        ``memory_fts`` 删掉，而 FTS 是候选生成的主通路——于是 cold 行只有在
+        热行完全没命中时才可达。同一形态的另一个实例是 ``as_of``：它的解法
+        不是继续放宽 clauses，而是让 as_of 查询**绕开**热索引、改由有界 LIKE
+        扫描生成候选（见 ``if terms and not as_of`` 那一段的注释）。
+
+        结论：动这里之前先问一句——「这条新候选通路真的把行放进 candidate_rows
+        了吗，还是只改了 WHERE？」
+
+        ## 永不抛异常
+
+        索引/账本任何失败都返回空，调用方继续走既有通道。检索不能因为可选
+        组件而失败。
+        """
+        if entity_index is None or not str(query or "").strip():
+            return {}, {}, {}, {}
+        try:
+            hits = entity_index.search_text(query, topn=max(1, int(topn)) * 4)
+        except Exception:
+            return {}, {}, {}, {}
+        if not hits:
+            return {}, {}, {}, {}
+        ranked: List[Tuple[str, int]] = []
+        score_of: Dict[str, float] = {}
+        entity_of: Dict[str, str] = {}
+        seen = set()
+        for position, entry in enumerate(hits):
+            try:
+                memory_id = str(entry[0])
+            except (IndexError, TypeError):
+                continue
+            if not memory_id or memory_id in seen:
+                continue
+            seen.add(memory_id)
+            ranked.append((memory_id, position))
+            try:
+                score_of[memory_id] = float(entry[1])
+            except (IndexError, TypeError, ValueError):
+                score_of[memory_id] = 0.0
+            try:
+                entity_of[memory_id] = str(entry[2])
+            except (IndexError, TypeError):
+                pass
+        if not ranked:
+            return {}, {}, {}, {}
+        ids = [memory_id for memory_id, _position in ranked]
+        rows: Dict[str, sqlite3.Row] = {}
+        # SQLite 的变量上限（老版本 999）必须尊重：分批查询而不是一次塞几千个。
+        chunk = 500
+        try:
+            with self._reading() as conn:
+                for start in range(0, len(ids), chunk):
+                    batch = ids[start:start + chunk]
+                    where = ["m.memory_id IN (" + ",".join("?" for _ in batch) + ")",
+                             *clauses]
+                    for row in conn.execute(
+                            "SELECT m.* FROM memories m WHERE " + " AND ".join(where),
+                            (*batch, *params)).fetchall():
+                        rows[row["memory_id"]] = row
+        except sqlite3.DatabaseError:
+            return {}, {}, {}, {}
+        if not rows:
+            return {}, {}, {}, {}
+        # 名次按「过滤后仍然存在」重新紧凑编号：否则被过滤掉的 top 行会留下空洞，
+        # 让 RRF 的 1/(k+rank) 系统性偏小。
+        order: Dict[str, int] = {}
+        kept: Dict[str, sqlite3.Row] = {}
+        for memory_id in ids:
+            row = rows.get(memory_id)
+            if row is None or memory_id in order:
+                continue
+            order[memory_id] = len(order)
+            kept[memory_id] = row
+            if len(order) >= max(1, int(topn)):
+                break
+        return (order, kept,
+                {memory_id: score_of.get(memory_id, 0.0) for memory_id in order},
+                {memory_id: entity_of[memory_id] for memory_id in order
+                 if memory_id in entity_of})
+
     @staticmethod
     def _query_coverage(query: str, corpus: str) -> Tuple[float, bool]:
         """Measure meaningful textual overlap independently of FTS rank.
@@ -278,7 +448,26 @@ class SearchMixin:
 
     @staticmethod
     def _prepare_query_coverage(query: str) -> Dict[str, Any]:
-        """查询侧分析只做一次（多行评分循环外提升，前景轮九性能优化）。"""
+        """查询侧分析只做一次（多行评分循环外提升，前景轮九性能优化）。
+
+        查询扩展（query_expansion，默认关闭）在这里接入，并且**只影响排序**：
+
+        terms / phrase_terms 是**排序**用的覆盖率词表，扩展词追加在其后；
+        gate_terms / gate_phrase_terms 是**原始**词表，只用于写回
+        score_parts["coverage"] 与 ["phrase"]。
+
+        为什么必须分开（这是本仓库真实的安全边界，不是洁癖）：
+        context_pack._passes_relevance_gate 判 fts>0 or coverage>=0.6，
+        ContextPackBuilder._reliable 判 phrase or coverage>=0.35 or ...。
+        如果把扩展词直接算进 score_parts 的 coverage，那么一张写坏的别名表
+        （把「天气」映射到「系统」之类）就能让无关提问**越过注入门控**——那
+        不是召回提升，是把「宁可少注入，也不注入错的」这条约束拆掉了。
+        向量通道已经踩过同一个坑：把「向量名次<20」当相关性证据后，
+        「今天天气怎么样」「1+1等于几」立刻开始被注入。
+
+        因此：扩展词只让**本该被召回的行**在候选池里排上来，不让它变成
+        新的「可靠性证据」。
+        """
 
         query = str(query or "").lower()
         raw_ascii_terms = [
@@ -311,7 +500,22 @@ class SearchMixin:
             # such as "自动上下文" without accepting a lone "上下文" overlap.
             for size in range(min(8, len(segment)), 3, -1):
                 phrase_terms.extend(segment[index:index + size] for index in range(len(segment) - size + 1))
-        return {"terms": terms, "phrase_terms": phrase_terms}
+        gate_terms = list(terms)
+        gate_phrase_terms = list(phrase_terms)
+        # 查询扩展（默认关闭）：只追加到**排序**用词表，门控词表保持原样。
+        # 关闭时 expansion 恒为 []，返回结构与改造前逐字节相同。
+        expansion = query_expansion.expansion_terms(query) if query else []
+        if expansion:
+            for term in expansion:
+                lowered_term = term.lower()
+                if lowered_term not in terms:
+                    terms.append(lowered_term)
+                if lowered_term not in phrase_terms:
+                    phrase_terms.append(lowered_term)
+        return {"terms": terms, "phrase_terms": phrase_terms,
+                "gate_terms": gate_terms,
+                "gate_phrase_terms": gate_phrase_terms,
+                "expansion": expansion}
 
     @staticmethod
     def _apply_query_coverage(prepared: Dict[str, Any], corpus: str) -> Tuple[float, bool]:
@@ -351,7 +555,8 @@ class SearchMixin:
                include_cold: bool = True, limit: int = 80, offset: int = 0,
                embedder=None, as_of: str = "",
                vector_index=None, vector_topn: int = _DEFAULT_VECTOR_TOPN,
-               rrf_k: float = _RRF_K) -> List[Dict[str, Any]]:
+               rrf_k: float = _RRF_K, entity_index=None,
+               entity_topn: int = _DEFAULT_ENTITY_TOPN) -> List[Dict[str, Any]]:
         started = _time_mod.perf_counter()
         try:
             return self._search_impl(
@@ -360,7 +565,8 @@ class SearchMixin:
                 to_time=to_time, include_raw_chat=include_raw_chat,
                 require_evidence=require_evidence, include_cold=include_cold,
                 limit=limit, offset=offset, embedder=embedder, as_of=as_of,
-                vector_index=vector_index, vector_topn=vector_topn, rrf_k=rrf_k)
+                vector_index=vector_index, vector_topn=vector_topn, rrf_k=rrf_k,
+                entity_index=entity_index, entity_topn=entity_topn)
         finally:
             self._record_search_latency(_time_mod.perf_counter() - started)
 
@@ -371,7 +577,9 @@ class SearchMixin:
                      include_cold: bool = True, limit: int = 80, offset: int = 0,
                      embedder=None, as_of: str = "",
                      vector_index=None, vector_topn: int = _DEFAULT_VECTOR_TOPN,
-                     rrf_k: float = _RRF_K) -> List[Dict[str, Any]]:
+                     rrf_k: float = _RRF_K, entity_index=None,
+                     entity_topn: int = _DEFAULT_ENTITY_TOPN
+                     ) -> List[Dict[str, Any]]:
         """embedder：可选向量通道（EmbeddingAdapter）。仅做重排融合，
         不参与候选生成；候选数超过 600 时自动跳过以约束成本。
 
@@ -385,6 +593,11 @@ class SearchMixin:
         **默认关闭**：vector_index=None 时本函数行为与改造前逐字节相同（有测试
         锁定）。索引打不开 / 查询向量为空 / 维度不符时静默退化为纯词法路径，
         绝不抛异常——检索不能因为可选组件而失败。
+
+        entity_index：可选实体倒排（entity_index.EntityIndex），**第三路**候选
+        来源。它与向量通道彼此独立：向量回答「意思像不像」，实体回答「说的是
+        不是同一个东西」。两者都关闭时行为与改造前逐字节相同（channel_count、
+        rrf 公式、score_parts 的键集合全部不变，有测试锁定）。
 
         as_of：双时态历史切片（对齐 zep/Graphiti point-in-time 语义）——
         给定 ISO 时间点时，valid_from/valid_until 窗口按该时刻求值，
@@ -426,16 +639,30 @@ class SearchMixin:
             clauses.append("m.evidence_json!='[]'")
         # Quarantined, conflicting and superseded claims are audit-visible but
         # must not silently enter a normal Context Pack.
-        clauses.append("m.quality_state='accepted'")
-        if include_cold:
+        #
+        # as_of 历史切片是唯一的例外，而且只放宽 superseded 一项：
+        # 「被后来的事实取代」是**时间**语义（当时成立、后来不成立了），
+        # 历史切片必须还能看到它；quarantine（质量不合格）和 conflict
+        # （无法裁决）与时间无关，任何时刻都不该进 Context Pack。
+        if as_of:
+            clauses.append("(m.quality_state='accepted' "
+                           "OR m.quality_state='superseded')")
+        else:
+            clauses.append("m.quality_state='accepted'")
+        # 生命周期条件必须是三选一，不能先按 include_cold 加一条、再给
+        # as_of 追加一条更宽的：两条 AND 在一起时宽的那条永远不起作用，
+        # 历史切片会被窄的那条（'active','cold'）挡死。这个 bug 在 as_of
+        # 上线时就存在，只是当时的测试用例没有跑 maintain()，expired 行
+        # 的 lifecycle 还停在 'active'，所以一直没暴露。
+        if as_of:
+            # point-in-time 语义：维护任务按"现在"把过期事实标为 expired，
+            # 但其窗口可能包含 as_of 时刻——历史切片必须仍可见。superseded
+            # 同理：它按"现在"下线，但 as_of 可能落在它的有效窗口内。
+            clauses.append("m.lifecycle IN ('active','cold','expired','superseded')")
+        elif include_cold:
             clauses.append("m.lifecycle IN ('active','cold')")
         else:
             clauses.append("m.lifecycle='active'")
-        if as_of:
-            # point-in-time 语义：维护任务按"现在"把过期事实标为 expired，
-            # 但其窗口可能包含 as_of 时刻——历史切片必须仍可见
-            # （superseded 属冲突语义，保持排除）。
-            clauses.append("m.lifecycle IN ('active','cold','expired')")
         # Expiry is a recall constraint, not only a maintenance concern.  A
         # daemon can be queried before its next maintenance tick, so a fact
         # with an elapsed validity window must never re-enter a Context Pack.
@@ -455,8 +682,30 @@ class SearchMixin:
                      # fold/hybrid_rerank 开关踩过同一个坑）。
                      id(vector_index) if vector_index is not None else None,
                      int(vector_topn) if vector_index is not None else None,
-                     float(rrf_k) if vector_index is not None else None)
-        cached = self._search_cached(cache_key) if query else None
+                     float(rrf_k) if vector_index is not None else None,
+                     # 实体通道同样必须进缓存键：cache_key 是位置元组，只能
+                     # **追加**在末尾——插入会静默改变所有既有键的语义（旧缓存
+                     # 全部失效且不可解释）。漏掉它的后果与向量通道一样：切换
+                     # 开关时同一 query 命中上一次的缓存页，A/B 对比直接失真。
+                     id(entity_index) if entity_index is not None else None,
+                     int(entity_topn) if entity_index is not None else None)
+        # 查询扩展开启时**绕开**查询缓存。
+        #
+        # 为什么不把扩展身份追加进 cache_key：cache_key 是位置元组，
+        # tests/test_entity_channel.py 用 captured[0][:-2] 断言「实体字段总是
+        # 最后两位、前缀逐字节不变」。追加第三位会打破那条断言，而那个文件
+        # 不在本任务的写范围内。
+        #
+        # 绕开缓存反而更彻底：别名表是人改的文件，任何「键里放 mtime」的方案
+        # 都有窗口（改表后旧键仍可能命中）。直接不读缓存，改表立刻生效，
+        # 也彻底消除「先跑关闭臂把空页写进缓存、开启臂拿到同一条空页」这个
+        # A/B 失真陷阱（向量通道与实体通道都踩过）。
+        #
+        # 代价只落在 opt-in 的开启路径上：多一次全量候选计算（实测 p50
+        # 45ms -> 45ms，缓存本就常在跨 query 时不命中）。默认关闭时
+        # expansion_on 恒为 False，本段与改造前逐字节相同。
+        expansion_on = query_expansion.enabled()
+        cached = (None if expansion_on else self._search_cached(cache_key)) if query else None
         if cached is not None:
             return cached
         terms = self._fts_terms(query)
@@ -466,7 +715,15 @@ class SearchMixin:
         fts_order: Dict[str, int] = {}
         like_order: Dict[str, int] = {}
         candidate_rows: List[sqlite3.Row] = []
-        if terms:
+        # as_of 历史切片跳过热索引。memory_fts 按设计只装「当前可召回」的
+        # 集合（维护会把 cold/superseded 行从索引里删掉），历史切片要的是
+        # 当时的集合，两者不是一回事。留在 FTS 路径上的后果是实测过的：
+        # 败者不在索引里 → 组合查询（A、B 文本都命中）在 as_of=过去 时
+        # 直接返回 []，双时态仍然只在 LIKE 回退路径上成立。
+        # 跳过后的候选由下面 lexical_empty 分支的有界 LIKE 扫描生成
+        # （clauses 已含 as_of 的窗口条件，扫描范围仍受 _LIKE_SCAN_WINDOW
+        # 约束）；as_of 是低频历史查询，这个成本可以接受。
+        if terms and not as_of:
             expression = " OR ".join('"' + term.replace('"', '') + '"' for term in terms)
             try:
                 with self._reading() as conn:
@@ -512,7 +769,10 @@ class SearchMixin:
             phrase_terms = [term for term in like_terms if len(term) >= 3]
             short_terms = [term for term in like_terms if len(term) < 3]
             like_rows: List[sqlite3.Row] = []
-            if phrase_terms:
+            # as_of 下短语 MATCH 必然查不到东西：热索引只装当前可召回集合，
+            # 历史行（superseded/expired/cold）已经被维护删出索引。直接落到
+            # 下面的有界 LIKE 扫描，别再浪费一次注定为空的 FTS 查询。
+            if phrase_terms and not as_of:
                 phrase_expr = " OR ".join(
                     '"' + term.replace('"', '') + '"' for term in phrase_terms)
                 try:
@@ -532,53 +792,67 @@ class SearchMixin:
                         ).fetchall()
                 except sqlite3.DatabaseError:
                     like_rows = []
-            if not like_rows and short_terms and not candidate_rows:
-                like_clauses = [*clauses,
-                                "(" + " OR ".join("LOWER(m.content) LIKE ?"
-                                                  for _ in short_terms) + ")"]
-                like_params: List[object] = [*params,
-                                             *("%" + term + "%" for term in short_terms)]
-                # 有界窗口：只在新度最高的行里救援，最坏成本有上限。
+            # 普通查询只在「短语 MATCH 落空 + 存在 <3 字短词」时才做表扫描；
+            # as_of 没有短语通道可用（见上），所以用完整的 like_terms 兜底。
+            # 内层先按 _LIKE_SCAN_WINDOW 界定扫描范围，外层再施加池上限 LIMIT。
+            scan_terms = like_terms if as_of else short_terms
+            if not like_rows and scan_terms and not candidate_rows:
+                like_group, like_params = self._like_match_group(scan_terms)
+                pool_limit = min(_LIKE_POOL_CEILING, max(limit + offset, limit * 20, 200))
                 with self._reading() as conn:
                     like_rows = conn.execute(
                         "SELECT * FROM ("
-                        "SELECT m.* FROM memories m WHERE " + " AND ".join(like_clauses[:-1]) +
+                        "SELECT m.* FROM memories m WHERE " + " AND ".join(clauses) +
                         " ORDER BY m.updated_at DESC LIMIT ?"
-                        ") AS m WHERE " + like_clauses[-1],
-                        (*params,
-                         min(_LIKE_SCAN_WINDOW,
-                             max(limit + offset, limit * 20, 200)),
-                         *like_params[len(params):]),
+                        ") AS m WHERE " + like_group + " LIMIT ?",
+                        (*params, _LIKE_SCAN_WINDOW, *like_params, pool_limit),
                     ).fetchall()
             present = {row["memory_id"] for row in candidate_rows}
             for position, row in enumerate(like_rows):
-                if row["memory_id"] not in present:
-                    like_order[row["memory_id"]] = position
+                mid = row["memory_id"]
+                like_order.setdefault(mid, position)
+                if mid not in present:
+                    present.add(mid)
                     candidate_rows.append(row)
         # Archived raw chat is deliberately removed from FTS during maintenance.
         # Explicit raw audit must still be complete, so add a scoped LIKE path
-        # without changing the default raw_chat=false safety boundary. Low
-        # signal queries can yield no FTS terms; skip instead of emitting an
-        # invalid empty OR group (the generic LIKE fallback below still runs).
+        # without changing the default raw_chat=false safety boundary.
         if query and include_raw_chat and terms:
-            # raw 归档可能占库容 99%+（本机实测 77 万行）。LIKE 审计通道
-            # 用新度有界窗口（默认最新 5 万行 raw 行），否则一次显式审计
-            # 查询要付出 6-11s 全表扫描；小库（<窗口）行为完全不变。
             raw_like = [*clauses, "m.raw_chat=1"]
-            raw_like_group = "(" + " OR ".join("LOWER(m.content) LIKE ?" for _ in terms) + ")"
-            raw_params: List[object] = [*params, *("%" + term.lower() + "%" for term in terms)]
+            raw_like_group, raw_params = self._like_match_group(terms, include_structured=False)
+            raw_pool = min(_LIKE_POOL_CEILING, max(limit + offset, limit * 20, 400))
             with self._reading() as conn:
                 raw_rows = conn.execute(
                     "SELECT * FROM ("
                     "SELECT m.* FROM memories m WHERE " + " AND ".join(raw_like) +
                     " ORDER BY m.updated_at DESC LIMIT ?"
-                    ") AS m WHERE " + raw_like_group,
-                    (*params,
-                     min(_RAW_LIKE_SCAN_WINDOW, max(limit + offset, limit * 20, 400)),
-                     *raw_params[len(params):]),
+                    ") AS m WHERE " + raw_like_group + " LIMIT ?",
+                    (*params, _RAW_LIKE_SCAN_WINDOW, *raw_params, raw_pool),
                 ).fetchall()
             present = {row["memory_id"] for row in candidate_rows}
             candidate_rows.extend(row for row in raw_rows if row["memory_id"] not in present)
+        # 冷投影兜底通道（include_cold=True 时）：内层窗口 _LIKE_SCAN_WINDOW，外层池上限。
+        if (query and include_cold and like_terms
+                and not any(str(row["lifecycle"]) == "cold"
+                            for row in candidate_rows)):
+            cold_clauses = [*clauses, "m.lifecycle='cold'"]
+            cold_group, cold_like_params = self._like_match_group(like_terms)
+            cold_pool = min(_LIKE_POOL_CEILING, max(limit + offset, limit * 20, 200))
+            try:
+                with self._reading() as conn:
+                    cold_rows = conn.execute(
+                        "SELECT * FROM ("
+                        "SELECT m.* FROM memories m WHERE " + " AND ".join(cold_clauses) +
+                        " ORDER BY m.updated_at DESC LIMIT ?"
+                        ") AS m WHERE " + cold_group + " LIMIT ?",
+                        (*params, _LIKE_SCAN_WINDOW, *cold_like_params, cold_pool),
+                    ).fetchall()
+                present = {row["memory_id"] for row in candidate_rows}
+                for row in cold_rows:
+                    if row["memory_id"] not in present:
+                        candidate_rows.append(row)
+            except sqlite3.DatabaseError:
+                pass
         # 实体扩展二次检索（multi-pass entity-aware retrieval）：主查询候选
         # 稀疏时，用查询中未参与 FTS 的最强实体词补一轮受限 OR 检索；结果
         # 仍要经过同一 coverage/可靠性门槛，不会引入弱相关噪声。
@@ -608,37 +882,34 @@ class SearchMixin:
                     pass
         if query and not candidate_rows:
             # 2 字词回退：主通道（FTS/LIKE≥3字/实体扩展）全部落空时，用查询
-            # CJK 段的二元碎片做最后一次有界尝试——词序不同、仅共享短词的
-            # 自然问句也能触达记忆。候选仍要过评分与可靠性门槛，弱匹配不会
-            # 进入 Context Pack（弃权契约不变）。
+            # CJK 段的二元碎片做最后一次有界尝试；内层使用 _LIKE_SCAN_WINDOW。
             bigram_terms = self._bigram_terms(query)
             if bigram_terms:
-                bg_clauses = [*clauses, "(" + " OR ".join(
-                    "LOWER(m.content) LIKE ?" for _ in bigram_terms) + ")"]
-                bg_params = [*params, *("%" + term + "%" for term in bigram_terms)]
+                bg_group, bg_params = self._like_match_group(bigram_terms)
+                bg_pool = min(_LIKE_POOL_CEILING, max(limit + offset, limit * 8, 100))
                 with self._reading() as conn:
-                    # 有界窗口：二元词精度低、命中面大，全表扫描在 69 万行
-                    # 库上实测 0.5-1s+；只在新度最高的窗口行内尝试，
-                    # 小库（<窗口）行为不变。
                     candidate_rows = conn.execute(
                         "SELECT * FROM ("
-                        "SELECT m.* FROM memories m WHERE " + " AND ".join(bg_clauses[:-1]) +
+                        "SELECT m.* FROM memories m WHERE " + " AND ".join(clauses) +
                         " ORDER BY m.updated_at DESC LIMIT ?"
-                        ") AS m WHERE " + bg_clauses[-1],
-                        (*params,
-                         min(_LIKE_SCAN_WINDOW, max(limit + offset, limit * 8)),
-                         *bg_params[len(params):]),
+                        ") AS m WHERE " + bg_group + " LIMIT ?",
+                        (*params, _LIKE_SCAN_WINDOW, *bg_params, bg_pool),
                     ).fetchall()
-        # 神经向量候选通道（可选，默认关闭）。与 embedder 的"重排"角色不同：
-        # 这里向量**生成候选**，因此词法完全没命中的改写式查询也能被召回。
-        # 实测（docs/SEMANTIC.md「神经向量」）：15 条改写式查询 recall
-        # 0.333 -> 0.400；46 条关键词 1.000 -> 0.978（可接受的轻微下降）。
-        #
-        # 顺序很关键：向量候选在**词法候选生成全部跑完之后**才追加，且下面
-        # 仅剩的词法回退用 lexical_empty（而非 not candidate_rows）判断。
-        # 否则"向量先找到东西"会让 LIKE 救援通道被跳过，开启向量反而改变了
-        # 词法行为——那就不是叠加，而是替换了。
-        lexical_empty = not candidate_rows
+        # 纯词法最后兜底放在向量与实体通道之前：确保「开启向量/实体」不会跳过
+        # 词法 LIKE 回退，且当向量/实体召回非空时不会被空 LIKE 误杀清空。
+        if query and not candidate_rows:
+            terms_like = self._like_terms(query)
+            if terms_like:
+                fb_group, fb_params = self._like_match_group(terms_like)
+                fb_pool = min(5_000, max(limit + offset, limit * 12))
+                with self._reading() as conn:
+                    candidate_rows = conn.execute(
+                        "SELECT * FROM ("
+                        "SELECT m.* FROM memories m WHERE " + " AND ".join(clauses) +
+                        " ORDER BY m.updated_at DESC LIMIT ?"
+                        ") AS m WHERE " + fb_group + " LIMIT ?",
+                        (*params, _LIKE_SCAN_WINDOW, *fb_params, fb_pool),
+                    ).fetchall()
         vector_order: Dict[str, int] = {}
         vector_rows: Dict[str, sqlite3.Row] = {}
         vector_similarity: Dict[str, float] = {}
@@ -652,14 +923,22 @@ class SearchMixin:
                 present = {row["memory_id"] for row in candidate_rows}
                 candidate_rows.extend(row for memory_id, row in vector_rows.items()
                                       if memory_id not in present)
-        if query and lexical_empty:
-            terms_like = self._like_terms(query)
-            if not terms_like:
-                return []
-            clauses.append("(" + " OR ".join("LOWER(m.content) LIKE ?" for _ in terms_like) + ")")
-            params.extend(["%" + term.lower() + "%" for term in terms_like])
+        entity_order: Dict[str, int] = {}
+        entity_rows: Dict[str, sqlite3.Row] = {}
+        entity_score: Dict[str, float] = {}
+        entity_name: Dict[str, str] = {}
+        if query and entity_index is not None:
+            (entity_order, entity_rows, entity_score,
+             entity_name) = self._entity_candidates(
+                query, entity_index, clauses, params, topn=entity_topn)
+            if entity_rows:
+                present = {row["memory_id"] for row in candidate_rows}
+                candidate_rows.extend(row for memory_id, row in entity_rows.items()
+                                      if memory_id not in present)
         if candidate_rows:
             rows = candidate_rows
+        elif query:
+            return []
         else:
             sql = "SELECT m.* FROM memories m WHERE " + " AND ".join(clauses) + " ORDER BY m.updated_at DESC LIMIT ?"
             params.append(min(5_000, max(limit + offset, limit * 12)))
@@ -685,10 +964,23 @@ class SearchMixin:
                 ctokens = _sim_tokens(corpus)
                 union = len(qtokens | ctokens)
                 topic = (len(qtokens & ctokens) / union) if union else 0.0
+                # 排序用覆盖率：含扩展词（qprep 已追加）。
                 coverage, phrase_hit = self._apply_query_coverage(qprep, corpus)
+                # 门控用覆盖率：**只算原始查询词**。扩展词不得成为「这条记忆
+                # 可靠」的新证据，否则别名表就变成了注入开关（详见
+                # _prepare_query_coverage 的注释）。
+                gate_terms = qprep.get("gate_terms")
+                if gate_terms is None:
+                    gate_coverage, gate_phrase = coverage, phrase_hit
+                else:
+                    gate_coverage, gate_phrase = self._apply_query_coverage(
+                        {"terms": gate_terms,
+                         "phrase_terms": qprep.get("gate_phrase_terms") or []},
+                        corpus)
             else:
                 topic = 0.7
                 coverage, phrase_hit = (1.0, True)
+                gate_coverage, gate_phrase = 1.0, True
             fts = fts_scores.get(item["memory_id"], 0.0)
             # Rank selects candidates; coverage prevents a single shared CJK
             # character from being promoted to a full-strength FTS hit.
@@ -697,7 +989,14 @@ class SearchMixin:
             # 归一化后作为小权重信号——两路独立命中的证据更可信。
             # 向量通道加入后归一化分母同步变化：三通道各贡献 1/(k+0)=1/k，
             # 归一化后仍是 0..1，因此既有两通道的相对强弱不被改写。
-            channel_count = 3 if vector_order else 2
+            # 通道计数只在通道**真的有候选**时增加：否则归一化分母会被一个
+            # 空通道抬高，让所有既有通道的 RRF 分数被无端稀释——那等于
+            # 「打开了开关但没命中」反而让排序变差。
+            channel_count = 2
+            if vector_order:
+                channel_count += 1
+            if entity_order:
+                channel_count += 1
             rrf = 0.0
             position = fts_order.get(item["memory_id"])
             if position is not None:
@@ -706,6 +1005,9 @@ class SearchMixin:
             if position is not None:
                 rrf += 1.0 / (rrf_k + position)
             position = vector_order.get(item["memory_id"])
+            if position is not None:
+                rrf += 1.0 / (rrf_k + position)
+            position = entity_order.get(item["memory_id"])
             if position is not None:
                 rrf += 1.0 / (rrf_k + position)
             rrf_norm = min(1.0, rrf / (channel_count / (rrf_k + 1.0)))
@@ -745,7 +1047,12 @@ class SearchMixin:
                      0.05 * rrf_norm + 0.04 * vec_sim + 0.06 * pinned)
             item["score"] = min(1.0, score)
             item["score_parts"] = {"topic": round(topic, 4), "fts": round(fts, 4),
-                                   "coverage": round(coverage, 4), "phrase": phrase_hit,
+                                   # coverage / phrase 写**门控**值（只含原始查询词）：
+                                   # context_pack 的注入可靠性判定读的就是这两个键，
+                                   # 扩展词不得抬高它们。排序用的是含扩展词的
+                                   # coverage，它已经乘进 fts 与 score，无需另存。
+                                   "coverage": round(gate_coverage, 4),
+                                   "phrase": gate_phrase,
                                    "rrf": round(rrf_norm, 4),
                                    "time": round(recency, 4), "touch": round(touch, 4),
                                    "weight": round(float(item["weight"]), 4),
@@ -770,10 +1077,22 @@ class SearchMixin:
                     claim_id = vector_claim.get(item["memory_id"])
                     if claim_id:
                         item["score_parts"]["vec_claim"] = claim_id
+            if entity_order:
+                position = entity_order.get(item["memory_id"])
+                if position is not None:
+                    item["score_parts"]["entity_rank"] = position
+                    # 命中的实体名进 score_parts：审计「是哪个实体把这条记忆
+                    # 拉上来的」。没有它，实体通道的效果只能靠猜。
+                    matched = entity_name.get(item["memory_id"])
+                    if matched:
+                        item["score_parts"]["entity"] = matched
+                    item["score_parts"]["entity_score"] = round(
+                        float(entity_score.get(item["memory_id"], 0.0)), 4)
             results.append(item)
         results.sort(key=lambda item: (item["score"], item.get("created_at", ""), item["updated_at"]), reverse=True)
         page = results[offset:offset + limit]
-        if query:
+        if query and not expansion_on:
+            # 同上：扩展开启时不写缓存，避免把「带扩展的页」留给关闭臂命中。
             self._search_store(cache_key, page)
         return page
 

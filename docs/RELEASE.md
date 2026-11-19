@@ -42,11 +42,11 @@ can never be too new for it.
 - [ ] **`python3 -m hippomind version` passes** and reports the expected
       `schema_version`. The command always emits JSON, so it is scriptable
       today: `python3 -m hippomind version | python3 -c "import json,sys; print(json.load(sys.stdin)['schema_version'])"`.
-      `tests/test_schema_contract.py` pins this contract.
-      **Known gap:** the `--json` flag does not exist yet (`hippomind version
-      --json` exits 2 with `unrecognized arguments`), which is why that test
-      currently *skips* instead of asserting. A release must not rely on the
-      flag until `hippomind/cli.py` accepts it; use the plain command above.
+      `python3 -m hippomind version --json` is supported (the flag is an
+      explicit machine-readable declaration; output is JSON either way), and
+      `tests/test_schema_contract.py` pins both the plain and `--json` forms.
+      Feed it to release automation directly:
+      `python3 -m hippomind version --json | python3 -c "import json,sys; print(json.load(sys.stdin)['schema_version'])"`.
 - [ ] **`hippomind checkup` passes** (`"checkup": "ok"`, exit 0) against a
       disposable ledger, and against a copy of the live ledger when one exists.
 - [ ] **Run the schema-migration drill before tagging:**
@@ -61,6 +61,13 @@ can never be too new for it.
 - [ ] **Back up before upgrading a real installation:**
       `scripts/backup.sh` (consistent SQLite snapshot + `.sha256`), and verify
       it with `scripts/restore.sh --db <copy> <snapshot>` on a throwaway path.
+- [ ] **Run the backup/restore drill (synthetic, no real data):**
+      `bash scripts/backup_restore_drill.sh --json` exits 0.
+      It creates a disposable ledger, snapshots it with `scripts/backup.sh`,
+      mutates the live copy, restores, runs `hippomind checkup`, and
+      verifies a tampered snapshot is refused without touching the live ledger.
+      `scripts/release_check.sh` runs it as step 9 and CI's
+      release-gate job runs it too.
 
 ## Static analysis gate (blocking)
 

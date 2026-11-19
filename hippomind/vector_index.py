@@ -61,6 +61,7 @@ import hashlib
 import json
 import math
 import os
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -310,8 +311,17 @@ class VectorIndex:
         norm = float(np.linalg.norm(vector))
         if norm <= 0.0:
             return []
-        matrix = self.matrix
-        valid = self._valid
+        # Snapshot the parallel arrays under the lock.  remove()/add_many()
+        # rebind all of them, so reading self.ids[i] after computing on an older
+        # matrix either indexes past the end (IndexError) or - worse - returns a
+        # score for the wrong memory.  The matmul itself stays outside the lock:
+        # it only reads this snapshot.  Mutators replace arrays instead of
+        # editing them in place, except _compute_valid zeroing NaN rows, which
+        # runs under the lock on the freshly built array.
+        with self._lock:
+            ids = self.ids
+            matrix = self.matrix
+            valid = self._valid
         if not len(matrix) or not bool(valid.any()):
             return []
         # np.dot 而非 @：numpy 2.0 的 @ 在这块 (6459, 512) 连续矩阵上会伪报
@@ -331,6 +341,7 @@ class VectorIndex:
         # 确定性：同分按矩阵行序（即 memory_id 排序后的稳定顺序）打破平局。
         picked = picked[np.lexsort((picked, -similarities[picked]))]
         out: List[Tuple[str, float]] = []
+        seen_ids = set()
         for index in picked:
             score = float(similarities[int(index)])
             # 有效性掩码外的行（零向量 / 非有限）被压成 -inf，这里必须显式
@@ -338,7 +349,11 @@ class VectorIndex:
             # 让它进候选会让 RRF 给一条毫无依据的记忆分配名次分。
             if not math.isfinite(score):
                 continue
-            out.append((self.ids[int(index)], score))
+            mid = ids[int(index)]
+            if mid in seen_ids:
+                continue
+            seen_ids.add(mid)
+            out.append((mid, score))
         return out
 
     def search_text(self, query: str, topn: int = DEFAULT_TOPN) -> List[Tuple[str, float]]:
@@ -371,23 +386,30 @@ class VectorIndex:
         return (matrix / norms).astype(np.float32)
 
     def add_many(self, items: Sequence[Tuple[str, str]]) -> int:
-        """追加 (memory_id, text)；空文本跳过。返回实际追加条数。"""
+        """追加或覆盖 (memory_id, text)；空文本跳过。返回实际写入条数。"""
         np = _numpy()
         if np is None:
             return 0
-        pairs = [(str(mid), str(text)) for mid, text in items
-                 if str(mid) and str(text or "").strip()]
+        dedup: Dict[str, str] = {}
+        for mid, text in items:
+            key = str(mid)
+            if key and str(text or "").strip():
+                dedup[key] = str(text)
+        pairs = list(dedup.items())
         if not pairs:
             return 0
         matrix = self._encode([text for _mid, text in pairs])
         hashes = np.asarray([content_hash(text) for _mid, text in pairs], dtype=np.uint64)
         ids = [mid for mid, _text in pairs]
+        incoming = set(ids)
         with self._lock:
-            self.ids = self.ids + ids
-            self.matrix = (np.vstack([self.matrix, matrix]) if len(self.matrix)
-                           else matrix)
-            self.hashes = (np.concatenate([self.hashes, hashes]) if len(self.hashes)
-                           else hashes)
+            keep = [idx for idx, existing_id in enumerate(self.ids) if existing_id not in incoming]
+            base_ids = [self.ids[idx] for idx in keep]
+            base_matrix = self.matrix[keep] if keep else self.matrix[:0]
+            base_hashes = self.hashes[keep] if keep else self.hashes[:0]
+            self.ids = base_ids + ids
+            self.matrix = np.vstack([base_matrix, matrix]) if len(base_matrix) else matrix
+            self.hashes = np.concatenate([base_hashes, hashes]) if len(base_hashes) else hashes
             self._valid = self._compute_valid()
         return len(pairs)
 
@@ -424,30 +446,56 @@ class VectorIndex:
             text = text_of({"memory_id": row[0], "content": row[1]})
             if str(text or "").strip():
                 current[str(row[0])] = str(text)
-        existing = set(self.ids)
+        # Snapshot the index generation under the RLock, then reconcile
+        # against the ledger snapshot: mutators replace arrays, so this
+        # snapshot cannot be torn by a concurrent search/remove/add.  The
+        # adds/removes below take the same lock, so racing syncs converge.
+        with self._lock:
+            existing = set(self.ids)
+            snapshot_ids = list(self.ids)
+            snapshot_hashes = [int(value) for value in self.hashes]
         drop: List[str] = []
         pending: List[Tuple[str, str]] = []
         changed = 0
-        for index, memory_id in enumerate(self.ids):
+        for index, memory_id in enumerate(snapshot_ids):
             text = current.get(memory_id)
             if text is None:
                 drop.append(memory_id)
-            elif content_hash(text) != int(self.hashes[index]):
-                drop.append(memory_id)
+            elif content_hash(text) != snapshot_hashes[index]:
                 pending.append((memory_id, text))
                 changed += 1
         for memory_id, text in current.items():
             if memory_id not in existing:
                 pending.append((memory_id, text))
-        removed = self.remove(drop)
-        added = 0
-        if pending:
+        np = _numpy()
+        encoded_matrix = None
+        encoded_hashes = None
+        pending_ids: List[str] = []
+        if pending and np is not None:
             if on_progress is not None:
                 try:
                     on_progress("encoding %d new/changed docs" % len(pending))
                 except Exception:
                     pass
-            added = self.add_many(pending)
+            encoded_matrix = self._encode([text for _mid, text in pending])
+            encoded_hashes = np.asarray([content_hash(text) for _mid, text in pending], dtype=np.uint64)
+            pending_ids = [mid for mid, _text in pending]
+        removed = 0
+        added = 0
+        drop_set = set(drop) | set(pending_ids)
+        with self._lock:
+            if drop_set:
+                keep = [idx for idx, mid in enumerate(self.ids) if mid not in drop_set]
+                removed = len(self.ids) - len(keep)
+                self.ids = [self.ids[idx] for idx in keep]
+                self.matrix = self.matrix[keep] if keep else self.matrix[:0]
+                self.hashes = self.hashes[keep] if keep else self.hashes[:0]
+            if encoded_matrix is not None and pending_ids:
+                self.ids = self.ids + pending_ids
+                self.matrix = np.vstack([self.matrix, encoded_matrix]) if len(self.matrix) else encoded_matrix
+                self.hashes = np.concatenate([self.hashes, encoded_hashes]) if len(self.hashes) else encoded_hashes
+                added = len(pending_ids)
+            self._valid = self._compute_valid()
         if removed or added:
             self.built_at = time.time()
         return {"added": added, "removed": removed, "updated": changed,
@@ -461,26 +509,50 @@ class VectorIndex:
             return None
         target = Path(path).expanduser() if path else (self.path or default_index_path())
         target.parent.mkdir(parents=True, exist_ok=True)
-        temporary = target.with_name(target.name + ".tmp")
+        # Snapshot the generation under the RLock: a concurrent remove/add_many
+        # rebinds the parallel arrays, and a save that mixed arrays from two
+        # generations would serialize a matrix whose row i no longer belongs to
+        # ids[i].  The snapshot is read-only afterwards, so np.savez stays
+        # outside the lock.
+        with self._lock:
+            memory_ids = self.ids
+            matrix = self.matrix
+            hashes = self.hashes
+            fingerprint = self.fingerprint
+            model = self.model
+            built_at = float(self.built_at)
+        temporary = ""
         try:
-            with open(temporary, "wb") as handle:
+            # Unique per call: two writers of the same index must never share
+            # one "*.tmp" path, or one would replace a file the other is still
+            # writing.  mkstemp creates O_EXCL under a fresh name.  os.replace
+            # publishes a *complete* index atomically, so readers see either the
+            # old file or the new one, never a torn one.
+            fd, temporary = tempfile.mkstemp(
+                prefix="." + target.name + ".", suffix=".tmp", dir=str(target.parent))
+            with os.fdopen(fd, "wb") as handle:
                 np.savez(
                     handle,
                     format_version=np.asarray([FORMAT_VERSION], dtype=np.int64),
-                    memory_ids=np.asarray(self.ids, dtype="U64"),
-                    matrix=self.matrix,
-                    hashes=self.hashes,
-                    fingerprint=np.asarray([self.fingerprint], dtype="U64"),
-                    model=np.asarray([self.model], dtype="U64"),
-                    built_at=np.asarray([float(self.built_at)], dtype=np.float64),
+                    memory_ids=np.asarray(memory_ids, dtype=str) if memory_ids else np.asarray([], dtype="U1"),
+                    matrix=matrix,
+                    hashes=hashes,
+                    fingerprint=np.asarray([fingerprint], dtype=str),
+                    model=np.asarray([model], dtype=str),
+                    built_at=np.asarray([built_at], dtype=np.float64),
                 )
+                handle.flush()
+                os.fsync(handle.fileno())
             os.replace(temporary, target)
+            temporary = ""
         except Exception:
-            try:
-                temporary.unlink()
-            except OSError:
-                pass
             return None
+        finally:
+            if temporary:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
         self.path = target
         return target
 
@@ -678,8 +750,14 @@ class ClaimVectorIndex:
         norm = float(np.linalg.norm(vector))
         if norm <= 0.0:
             return []
-        matrix = self.matrix
-        valid = self._valid
+        # Snapshot under the lock; see VectorIndex.search for the full rationale
+        # (parallel arrays must come from the same generation, matmul stays
+        # outside the lock).
+        with self._lock:
+            claim_ids = self.claim_ids
+            memory_ids = self.memory_ids
+            matrix = self.matrix
+            valid = self._valid
         if not len(matrix) or not bool(valid.any()):
             return []
         # np.dot 而非 @：见 VectorIndex.search 的注释（numpy 2.0 的 matmul
@@ -702,11 +780,11 @@ class ClaimVectorIndex:
             # 零向量/非有限行不是弱匹配，是没有信号：丢弃而不是排最后。
             if not math.isfinite(score):
                 continue
-            memory_id = self.memory_ids[int(index)]
+            memory_id = memory_ids[int(index)]
             if memory_id in seen:
                 continue
             seen[memory_id] = len(out)
-            out.append((memory_id, score, self.claim_ids[int(index)]))
+            out.append((memory_id, score, claim_ids[int(index)]))
             if len(out) >= want:
                 break
         return out
@@ -742,24 +820,32 @@ class ClaimVectorIndex:
         return (matrix / norms).astype(np.float32)
 
     def add_many(self, items: Sequence[Tuple[str, str, str]]) -> int:
-        """追加 (claim_id, memory_id, text)；空文本跳过。返回实际追加条数。"""
+        """追加或覆盖 (claim_id, memory_id, text)；空文本跳过。返回实际写入条数。"""
         np = _numpy()
         if np is None:
             return 0
-        triples = [(str(cid), str(mid), str(text)) for cid, mid, text in items
-                   if str(cid) and str(mid) and str(text or "").strip()]
+        dedup: Dict[str, Tuple[str, str]] = {}
+        for cid, mid, text in items:
+            key = str(cid)
+            if key and str(mid) and str(text or "").strip():
+                dedup[key] = (str(mid), str(text))
+        triples = [(cid, val[0], val[1]) for cid, val in dedup.items()]
         if not triples:
             return 0
         matrix = self._encode([text for _cid, _mid, text in triples])
         hashes = np.asarray([content_hash(text) for _cid, _mid, text in triples],
                             dtype=np.uint64)
+        incoming = {cid for cid, _m, _t in triples}
         with self._lock:
-            self.claim_ids = self.claim_ids + [cid for cid, _m, _t in triples]
-            self.memory_ids = self.memory_ids + [mid for _c, mid, _t in triples]
-            self.matrix = (np.vstack([self.matrix, matrix]) if len(self.matrix)
-                           else matrix)
-            self.hashes = (np.concatenate([self.hashes, hashes]) if len(self.hashes)
-                           else hashes)
+            keep = [idx for idx, existing_cid in enumerate(self.claim_ids) if existing_cid not in incoming]
+            base_cids = [self.claim_ids[idx] for idx in keep]
+            base_mids = [self.memory_ids[idx] for idx in keep]
+            base_matrix = self.matrix[keep] if keep else self.matrix[:0]
+            base_hashes = self.hashes[keep] if keep else self.hashes[:0]
+            self.claim_ids = base_cids + [cid for cid, _m, _t in triples]
+            self.memory_ids = base_mids + [mid for _c, mid, _t in triples]
+            self.matrix = np.vstack([base_matrix, matrix]) if len(base_matrix) else matrix
+            self.hashes = np.concatenate([base_hashes, hashes]) if len(base_hashes) else hashes
             self._valid = self._compute_valid()
         return len(triples)
 
@@ -796,33 +882,62 @@ class ClaimVectorIndex:
         rows = _claim_rows(ledger)
         current: Dict[str, Tuple[str, str]] = {
             claim_id: (memory_id, text) for claim_id, memory_id, text in rows}
-        existing = set(self.claim_ids)
+        # Generation snapshot under the RLock; same contract as
+        # VectorIndex.sync (see there).
+        with self._lock:
+            existing = set(self.claim_ids)
+            snapshot_claim_ids = list(self.claim_ids)
+            snapshot_memory_ids = list(self.memory_ids)
+            snapshot_hashes = [int(value) for value in self.hashes]
         drop: List[str] = []
         pending: List[Tuple[str, str, str]] = []
         changed = 0
-        for index, claim_id in enumerate(self.claim_ids):
+        for index, claim_id in enumerate(snapshot_claim_ids):
             entry = current.get(claim_id)
             if entry is None:
                 drop.append(claim_id)
                 continue
             memory_id, text = entry
-            if (content_hash(text) != int(self.hashes[index])
-                    or self.memory_ids[index] != memory_id):
-                drop.append(claim_id)
+            if (content_hash(text) != snapshot_hashes[index]
+                    or snapshot_memory_ids[index] != memory_id):
                 pending.append((claim_id, memory_id, text))
                 changed += 1
         for claim_id, (memory_id, text) in current.items():
             if claim_id not in existing:
                 pending.append((claim_id, memory_id, text))
-        removed = self.remove(drop)
-        added = 0
-        if pending:
+        np = _numpy()
+        encoded_matrix = None
+        encoded_hashes = None
+        pending_cids: List[str] = []
+        pending_mids: List[str] = []
+        if pending and np is not None:
             if on_progress is not None:
                 try:
                     on_progress("encoding %d new/changed claims" % len(pending))
                 except Exception:
                     pass
-            added = self.add_many(pending)
+            encoded_matrix = self._encode([text for _c, _m, text in pending])
+            encoded_hashes = np.asarray([content_hash(text) for _c, _m, text in pending], dtype=np.uint64)
+            pending_cids = [cid for cid, _m, _t in pending]
+            pending_mids = [mid for _c, mid, _t in pending]
+        removed = 0
+        added = 0
+        drop_set = set(drop) | set(pending_cids)
+        with self._lock:
+            if drop_set:
+                keep = [idx for idx, cid in enumerate(self.claim_ids) if cid not in drop_set]
+                removed = len(self.claim_ids) - len(keep)
+                self.claim_ids = [self.claim_ids[idx] for idx in keep]
+                self.memory_ids = [self.memory_ids[idx] for idx in keep]
+                self.matrix = self.matrix[keep] if keep else self.matrix[:0]
+                self.hashes = self.hashes[keep] if keep else self.hashes[:0]
+            if encoded_matrix is not None and pending_cids:
+                self.claim_ids = self.claim_ids + pending_cids
+                self.memory_ids = self.memory_ids + pending_mids
+                self.matrix = np.vstack([self.matrix, encoded_matrix]) if len(self.matrix) else encoded_matrix
+                self.hashes = np.concatenate([self.hashes, encoded_hashes]) if len(self.hashes) else encoded_hashes
+                added = len(pending_cids)
+            self._valid = self._compute_valid()
         if removed or added:
             self.built_at = time.time()
         return {"added": added, "removed": removed, "updated": changed,
@@ -838,27 +953,44 @@ class ClaimVectorIndex:
         target = (Path(path).expanduser() if path
                   else (self.path or default_claim_index_path()))
         target.parent.mkdir(parents=True, exist_ok=True)
-        temporary = target.with_name(target.name + ".tmp")
+        # Generation snapshot under the RLock; see VectorIndex.save.
+        with self._lock:
+            claim_ids = self.claim_ids
+            memory_id_list = self.memory_ids
+            matrix = self.matrix
+            hashes = self.hashes
+            fingerprint = self.fingerprint
+            model = self.model
+            built_at = float(self.built_at)
+        temporary = ""
         try:
-            with open(temporary, "wb") as handle:
+            # Same unique-temp + os.replace contract as VectorIndex.save.
+            fd, temporary = tempfile.mkstemp(
+                prefix="." + target.name + ".", suffix=".tmp", dir=str(target.parent))
+            with os.fdopen(fd, "wb") as handle:
                 np.savez(
                     handle,
                     format_version=np.asarray([CLAIM_FORMAT_VERSION], dtype=np.int64),
-                    claim_ids=np.asarray(self.claim_ids, dtype="U64"),
-                    memory_ids=np.asarray(self.memory_ids, dtype="U64"),
-                    matrix=self.matrix,
-                    hashes=self.hashes,
-                    fingerprint=np.asarray([self.fingerprint], dtype="U64"),
-                    model=np.asarray([self.model], dtype="U64"),
-                    built_at=np.asarray([float(self.built_at)], dtype=np.float64),
+                    claim_ids=np.asarray(claim_ids, dtype=str) if claim_ids else np.asarray([], dtype="U1"),
+                    memory_ids=np.asarray(memory_id_list, dtype=str) if memory_id_list else np.asarray([], dtype="U1"),
+                    matrix=matrix,
+                    hashes=hashes,
+                    fingerprint=np.asarray([fingerprint], dtype=str),
+                    model=np.asarray([model], dtype=str),
+                    built_at=np.asarray([built_at], dtype=np.float64),
                 )
+                handle.flush()
+                os.fsync(handle.fileno())
             os.replace(temporary, target)
+            temporary = ""
         except Exception:
-            try:
-                temporary.unlink()
-            except OSError:
-                pass
             return None
+        finally:
+            if temporary:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
         self.path = target
         return target
 

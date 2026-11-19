@@ -99,6 +99,11 @@ class CursorMessage:
     source: str
     path: Path
     metadata: Mapping[str, Any]
+    #: Stable source event id for identity v3.  Streaming bubbles are
+    #: rewritten in place, so the same id arrives again with longer content;
+    #: the ledger supersedes the older revision instead of co-existing
+    #: with it.  Empty for sources that never revise a record.
+    external_id: str = ""
 
 
 def _iso_timestamp(value: Any) -> str:
@@ -431,8 +436,20 @@ def _clean_content(text: str) -> str:
     return collapsed[:MAX_MESSAGE_CHARS]
 
 
+def _content_revision(content: str) -> str:
+    """Stable per-version marker for a streamed record (audit only).
+
+    The revision is *not* an identity input: identity v3 uses the stable
+    event id plus the content itself.  Recording which content version a
+    row captured keeps the supersede chain explainable after the fact.
+    """
+    payload = str(content or "").encode("utf-8", errors="replace")
+    return hashlib.sha1(payload).hexdigest()[:16]
+
+
 def _record(message: CursorMessage) -> Dict[str, Any]:
-    return {
+    metadata = dict(message.metadata)
+    record: Dict[str, Any] = {
         "content": message.content,
         "kind": "raw_chat",
         "source_agent": "cursor",
@@ -443,8 +460,16 @@ def _record(message: CursorMessage) -> Dict[str, Any]:
         "raw_chat": True,
         "evidence": [message.evidence],
         "timestamp": message.timestamp or utc_now(),
-        "metadata": dict(message.metadata),
+        "metadata": metadata,
     }
+    if message.external_id:
+        # identity v3: the source event id participates in the raw identity
+        # key and is projected into metadata so the next revision of this
+        # same event can find this row and supersede it.
+        record["event_id"] = message.external_id
+        metadata["external_id"] = message.external_id
+        metadata["content_revision"] = _content_revision(message.content)
+    return record
 
 
 def _project_from_transcript_path(path: Path) -> str:
@@ -613,6 +638,10 @@ class CursorComposerScanner:
                 evidence="cursor:bubble:%s:%s" % (composer_id, bubble_id),
                 source="cursor-composer",
                 path=path,
+                # One bubble = one source event: Cursor writes it empty and
+                # fills the text in place while the answer streams, so the
+                # stable id is the (composer, bubble) pair.
+                external_id="cursor:bubble:%s:%s" % (composer_id, bubble_id),
                 metadata={
                     "source": "cursor-composer-bubble",
                     "format": "cursor-state-vscdb",
@@ -695,13 +724,18 @@ class CursorComposerScanner:
             consumed_rowid = after
             try:
                 pending: List[CursorMessage] = []
+                budget_exhausted = False
                 for row, message in parsed:
                     if remaining <= 0:
+                        budget_exhausted = True
                         break
                     consumed_rowid = max(consumed_rowid, int(row["rid"]))
                     if message is not None:
                         pending.append(message)
                         remaining -= 1
+                if not budget_exhausted and high > consumed_rowid:
+                    # Advance watermark past skipped oversized rows in the same window.
+                    consumed_rowid = int(high)
                 if pending:
                     counts = _ingest(self.ledger, pending)
                     for key in counts:
@@ -799,6 +833,9 @@ class CursorTranscriptScanner:
             evidence="cursor:transcript:%s:%d" % (path.stem, line_number),
             source="cursor-transcript",
             path=path,
+            # JSONL lines are append-only; (session file, line) is a stable
+            # id for replay de-duplication and for a rewritten tail.
+            external_id="cursor:transcript:%s:%d" % (path.stem, line_number),
             metadata={"source": "cursor-agent-transcript",
                       "format": "cursor-store-transcript",
                       "transcript_path": str(path),
@@ -846,9 +883,26 @@ class CursorTranscriptScanner:
                         if not raw:
                             break
                         if not raw.endswith(b"\n"):
-                            # Half-written tail: leave the offset so the next
-                            # cycle re-reads the line once it is complete.
-                            break
+                            if len(raw) < MAX_LINE_BYTES:
+                                # Half-written tail: leave the offset so the next
+                                # cycle re-reads the line once it is complete.
+                                break
+                            # Oversized single line (> MAX_LINE_BYTES): skip to newline
+                            # so this file never wedges forever.
+                            skipped = len(raw)
+                            found_nl = False
+                            while skipped < MAX_LINE_BYTES * 8:
+                                chunk = handle.readline(MAX_LINE_BYTES)
+                                if not chunk:
+                                    break
+                                skipped += len(chunk)
+                                if chunk.endswith(b"\n"):
+                                    found_nl = True
+                                    break
+                            consumed += skipped
+                            if found_nl:
+                                line_number += 1
+                            continue
                         consumed += len(raw)
                         line_number += 1
                         parsed = self._parse_line(raw, path, line_number, project)

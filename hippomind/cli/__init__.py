@@ -317,14 +317,15 @@ def _auto_context_request(args) -> str:
     return request
 
 
-def _auto_context_body(args, request: str) -> Dict[str, Any]:
+def _auto_context_body(args, request: str, session_id: str = "") -> Dict[str, Any]:
     requested_chars = max(200, min(AUTO_MAX_CHARS, int(args.max_chars)))
     payload_chars = max(200, requested_chars - len(PROMPT_OPEN) - len(PROMPT_CLOSE) - 2)
-    return {
+    body: Dict[str, Any] = {
         # Every native adapter sends the same marker-selected text. Workspace
         # hints used to differ between Pi and Codex and could reorder otherwise
         # identical shared candidates.
         "query": request,
+        "agent": str(getattr(args, "agent", "") or "")[:64],
         "options": {
             "max_items": max(1, min(AUTO_MAX_ITEMS, int(args.max_items))),
             "max_chars": payload_chars,
@@ -333,15 +334,30 @@ def _auto_context_body(args, request: str) -> Dict[str, Any]:
             "scope": args.scope,
             "project": args.project,
             "task_id": args.task,
+            # WP-M：会话感知 follow-up 锚定的来源会话。旧 CLI / 旧 hook 不传时
+            # 是空串，daemon 按时间窗兜底（行为与此前完全一致）。
+            "session_id": str(session_id or getattr(args, "session_id", "") or "")[:256],
+            "workspace_cwd": str(getattr(args, "cwd", "") or "")[:512],
             "debug": args.debug,
         },
     }
+    if getattr(args, "ab_handled", False):
+        body["ab_handled"] = True
+        ab_arm = str(getattr(args, "ab_arm", "") or "")[:32]
+        if ab_arm:
+            body["ab_arm"] = ab_arm
+    return body
 
 
-def fetch_auto_context(args, request: str) -> Dict[str, Any]:
+def fetch_auto_context(args, request: str,
+                       session_id: str = "") -> Dict[str, Any]:
     """Resolve a strict Context Pack for a current natural-language request.
 
-    This is shared by the CLI and Codex's native UserPromptSubmit hook.
+    This is shared by the CLI and the native UserPromptSubmit hooks (Codex /
+    Claude). session_id is the host-provided conversation id used for WP-M
+    follow-up anchoring; empty string keeps the pre-WP-M behavior exactly
+    (session-less time-window fallback only).
+
     It deliberately keeps the existing fail-closed behavior for a scoped Agent:
     if its daemon credential cannot be used, no offline master-ledger fallback
     is attempted.
@@ -383,7 +399,7 @@ def fetch_auto_context(args, request: str) -> Dict[str, Any]:
     request = decision["query"]
     if not request:
         raise LedgerError("auto-context 需要本轮完整用户要求")
-    body = _auto_context_body(args, request)
+    body = _auto_context_body(args, request, session_id=session_id)
     source = "offline"
     daemon_started = False
     result: Optional[Dict[str, Any]] = None
@@ -433,6 +449,7 @@ def fetch_auto_context(args, request: str) -> Dict[str, Any]:
             SQLiteLedger(paths.ledger_path), request, scope=args.scope, project=args.project,
             task_id=args.task, max_items=args.max_items, max_chars=args.max_chars, debug=args.debug,
             cwd=str(getattr(args, "cwd", "") or ""),
+            session_id=str(session_id or getattr(args, "session_id", "") or ""),
         )
     result["auto_context"] = {
         "agent": args.agent,
@@ -489,6 +506,7 @@ from .cmd_read import (  # noqa: E402  (re-exports follow the helpers they feed)
     cmd_watch as cmd_watch,
 )
 from .cmd_data import cmd_export as cmd_export, cmd_import as cmd_import  # noqa: E402  (re-exports follow the helpers they feed)
+from .cmd_explain import cmd_explain as cmd_explain  # noqa: E402  (re-exports follow the helpers they feed)
 from .cmd_distill import (  # noqa: E402  (re-exports follow the helpers they feed)
     cmd_digest as cmd_digest, cmd_distill as cmd_distill,
     cmd_semantic_build as cmd_semantic_build,

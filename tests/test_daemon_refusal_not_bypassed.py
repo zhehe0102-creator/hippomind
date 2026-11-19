@@ -73,6 +73,9 @@ class RefusingDaemonMixin(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.paths = RuntimePaths.for_ledger(self.root / "h.sqlite", self.root / "rt")
+        # Read-only mode now requires an existing, initialised ledger snapshot:
+        # the served daemon is RO and never bootstraps or migrates the file.
+        SQLiteLedger(self.paths.ledger_path).close()
         self.service = MemoryHubService(self.paths, watch=False, read_only=True)
         self.server = MemoryHubHTTPServer(("127.0.0.1", 0), self.service)
         self.service._server = self.server
@@ -106,10 +109,14 @@ class RefusingDaemonMixin(unittest.TestCase):
                 "--port", str(self.port if port is None else port)]
 
     def seed(self, text: str = "已存在的记忆") -> str:
-        """Pre-load data through the ledger object: the served daemon is RO."""
-        return self.service.ledger.ingest({
-            "content": text, "kind": "fact", "source_agent": "t",
-            "evidence": ["t:seed"]}).memory_id
+        """Pre-load data through a writable handle: the served daemon is RO."""
+        writer = SQLiteLedger(self.paths.ledger_path)
+        try:
+            return writer.ingest({
+                "content": text, "kind": "fact", "source_agent": "t",
+                "evidence": ["t:seed"]}).memory_id
+        finally:
+            writer.close()
 
     def rows(self) -> int:
         return int(SQLiteLedger(self.paths.ledger_path).stats().get("memories", 0))

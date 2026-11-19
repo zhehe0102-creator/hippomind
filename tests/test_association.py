@@ -50,7 +50,11 @@ class AssociationTests(unittest.TestCase):
         connected = ((first.memory_id, second.memory_id) in pairs
                      or (second.memory_id, first.memory_id) in pairs)
         self.assertTrue(connected, pairs)
-        self.assertTrue(all(row["relation_type"] == "related_to" for row in rows))
+        # associate() 的链接依据就是「共享 claim 主语」，按类型词表（task-3）
+        # 应当写 same_subject。断言**具体类型**而不是「属于新词表」：分类一旦
+        # 退化回无差别的 related_to，这条就要红——「只要别是旧值就行」等于没钉住。
+        self.assertEqual({"same_subject"},
+                         {row["relation_type"] for row in rows})
 
     def test_association_is_idempotent(self):
         self._distilled("HippoMind", "a", "t1")

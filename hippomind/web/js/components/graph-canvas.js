@@ -22,16 +22,45 @@ function readTheme() {
     ok: pick("--ok", "#2E6A4D"),
     warn: pick("--warn", "#9A640F"),
     danger: pick("--danger", "#9E2626"),
+    ink2: pick("--ink-2", "#4D483D"),
   };
 }
 
-function relationTone(type, colors) {
+/* Exported so tests can drive the two tier functions directly instead of
+   pattern-matching their source.  A regex on `return [7, 3]` proves the text
+   exists; calling relationDash("same_task") proves it returns a dash. */
+export function relationTone(type, colors) {
   const value = String(type || "");
   if (value.indexOf("contradict") >= 0 || value.indexOf("supersed") >= 0) return colors.danger;
   if (value.indexOf("cause") >= 0) return colors.link;
   if (value.indexOf("support") >= 0 || value.indexOf("confirm") >= 0) return colors.ok;
+  /* Structural tiers added with the relation vocabulary (2026-10-25).
+     same_subject(0.9) is "about the same thing"; same_task(0.7) is the
+     weakest link in the graph.  Both used to fall through to ink3, which
+     drew three different evidence strengths as one colour. */
+  if (value.indexOf("same_subject") >= 0) return colors.ink2;
   return colors.ink3;
 }
+
+/* Dash pattern per relation tier.  Empty array = solid, which keeps every
+   pre-existing relation drawn exactly as before.  same_subject(0.9) and
+   same_task(0.7) are two different evidence strengths that used to share
+   one colour; they are now separable without relying on hue. */
+export function relationDash(type) {
+  const value = String(type || "");
+  if (value.indexOf("same_subject") >= 0) return [7, 3];
+  if (value.indexOf("same_task") >= 0) return [2, 3];
+  return [];
+}
+
+/* Weight each relation carries in associative expansion, mirrored from
+   ledger/graph.py RELATION_WEIGHTS.  Shown in the legend so the reader
+   learns how much the relation actually counts, not just its name. */
+export const RELATION_WEIGHT_HINTS = [
+  { type: "same_subject", weight: 0.9, label: "同主语" },
+  { type: "same_task", weight: 0.7, label: "同任务" },
+  { type: "related_to", weight: 1.0, label: "其他关系" },
+];
 
 export function createGraphCanvas(options = {}) {
   const host = el("div", { class: "vb-graph-canvas" });
@@ -204,10 +233,17 @@ export function createGraphCanvas(options = {}) {
       ctx.strokeStyle = relationTone(edge.relation_type, colors);
       ctx.globalAlpha = active ? 0.28 + (Number(edge.confidence) || 0.5) * 0.42 : 0.08;
       ctx.lineWidth = (0.6 + (Number(edge.confidence) || 0.5) * 1.2) / transform.k;
+      /* Dashes are in device space, so they must scale with the viewport
+         transform or a zoomed-in graph would show one enormous dash. */
+      const dash = relationDash(edge.relation_type);
+      ctx.setLineDash(dash.length
+        ? dash.map((step) => step / transform.k)
+        : []);
       ctx.beginPath();
       ctx.moveTo(from.x, from.y);
       ctx.lineTo(to.x, to.y);
       ctx.stroke();
+      ctx.setLineDash([]);
     }
     ctx.globalAlpha = 1;
 

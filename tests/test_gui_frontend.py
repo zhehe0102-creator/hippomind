@@ -4,7 +4,7 @@
 
 - index.html 引用的每个资源必须存在，且无内联脚本、无 http(s) 外链；
 - hippomind/web/js 下每个 ES 模块必须通过 node --check；
-- registry.js 的 10 个视图 id 与契约一致，每个视图模块导出 meta/render；
+- registry.js 的 11 个视图 id 与契约一致，每个视图模块导出 meta/render；
 - 动态文本不得拼进 innerHTML（只允许无插值的静态字面量）；
 - 无 eval / new Function / 内联事件属性；契约组件导出名齐全；
 - 静态模块图的相对 import 必须能解析到真实文件。
@@ -25,14 +25,14 @@ NODE = shutil.which("node")
 
 VIEW_IDS = [
     "pulse", "archive", "recall", "compose", "graph",
-    "facts", "timeline", "agents", "health", "reference",
+    "facts", "timeline", "agents", "health", "reference", "forgetting",
 ]
 
 VIEW_OWNER = {
     "pulse": "views-a", "timeline": "views-a", "agents": "views-a",
     "health": "views-a", "reference": "views-a",
     "archive": "views-b", "recall": "views-b", "compose": "views-b",
-    "graph": "views-b", "facts": "views-b",
+    "graph": "views-b", "facts": "views-b", "forgetting": "views-b",
 }
 
 REQUIRED_DOM_IDS = [
@@ -147,7 +147,11 @@ DOCUMENTED_ENDPOINTS = {
     "/api/v1/conflicts", "/api/v1/facts", "/api/v1/skills",
     "/api/v1/subjects", "/api/v1/graph", "/api/v1/agents",
     "/api/v1/health", "/api/v1/environment", "/api/v1/events",
-    "/api/v1/pins", "/api/v1/duplicates", "/api/v1/pin",
+    "/api/v1/pins", "/api/v1/duplicates", "/api/v1/forgetting", "/api/v1/pin",
+    # 2026-10-25：R4 任务明确要求「A/B 实验进度」在界面上可见。
+    # 这条白名单的用意是「视图不得调用未登记的端点」，不是「永远不许
+    # 新增端点」——新增端点并同步登记正是它要强制的过程。
+    "/api/v1/injection-ab",
     "/api/v1/feedback", "/api/v1/ui-token", "/api/v1/ui-token/exchange",
 }
 API_PATH_RE = re.compile(r"""["'`](/api/v1/[A-Za-z0-9_\-/]*)""")

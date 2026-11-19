@@ -21,7 +21,7 @@
 
 ```
 采集层   ArchiveWatcher（轮询归档目录，30s）→ 新会话自动入库
-存储层   SQLiteLedger（SQLite/WAL，schema v8，事件溯源：ledger_events 只追加）
+存储层   SQLiteLedger（SQLite/WAL，schema v9，事件溯源：ledger_events 只追加）
 服务层   hippomindd daemon（localhost HTTP + token 鉴权）
 消费层   CLI / MCP 工具 / HTTP API / GUI 工作台 / 自动注入钩子
 ```
@@ -30,7 +30,7 @@
   （`memories` 表）可随时从事件重建——改错可回滚，历史不可篡改。
 - **单文件部署**：整个记忆就是一个 `.sqlite` 文件（+wal/shm），备份=复制文件。
 
-## 3. CLI 全部子命令（43 个）
+## 3. CLI 全部子命令（44 个）
 
 ### 3.1 生命周期
 | 命令 | 干什么 | 典型用法 |
@@ -55,6 +55,7 @@
 ### 3.3 检索与消费
 | 命令 | 干什么 |
 |---|---|
+| `explain` | 解释一次检索：候选/score_parts/过滤原因/选中组/为空原因/注入门控，离线只读，可 `--json`；`--trace N` 看最近注入轨迹 |
 | `context` | **核心命令**：按任务组装最小 Context Pack（分层预算、coverage 门控防误召回、缓存命中 ~0.02ms） |
 | `auto-context` | 同上；v2 默认每轮自动预取（`--trigger-mode always`，无标记），"记忆："仍可强制指定查询；自动路径过 `min_score=0.20` + 词法证据门 |
 | `inject` | 开关下一轮自动注入（采集维护不受影响） |
@@ -105,11 +106,12 @@
 | GET | `/health` | 存活+账本指纹（防 token 拿去操作另一本账） |
 | GET | `/stats` | 账本/归档/来源/缓存命中率统计 |
 | GET | `/graph?subject=&scope=&hops=&limit=` | 实体图谱（缺 subject→400，无 token→401） |
-| GET | `/metrics` | Prometheus 文本（memories/events/claims_active/conflict/pinned/wal/cache） |
+| GET | `/metrics` | Prometheus 文本（memories/events/claims_active/conflict/pinned/wal/cache；需令牌，`/health` 是唯一免鉴权端点） |
 | GET | `/ui` | HippoMind Atlas 静态控制台（同源、零构建；HTML 不含令牌或账本路径） |
 | GET | `/api/v1/*` | 控制台数据面：meta/overview/memories/timeline/claims/conflicts/facts/skills/subjects/graph/agents/health/environment/events/pins/duplicates（管理员令牌） |
 | POST | `/api/v1/pin` · `/api/v1/feedback` · `/api/v1/ui-token` | 置顶/反馈/一次性 UI 登录令牌 |
 | POST | `/ingest` | 批量写入（≤预算，超长 413 且客户端必能读到错误响应） |
+| GET | `/context-pack?query=&...` | 与 POST 同一注入+记账路径（需令牌；空结果也写 trace 对照组） |
 | POST | `/recall` · `/context-pack` · `/feedback` · `/sync` | 对应 CLI 能力 |
 | POST | `/admin/reload` | 热重载归档扫描（SIGHUP 同效） |
 | POST | `/shutdown` | 优雅停机 |

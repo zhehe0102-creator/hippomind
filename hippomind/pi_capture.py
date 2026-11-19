@@ -332,11 +332,35 @@ class PiSessionScanner:
             return ""
         return Path(cwd).name[:200]
 
+    @staticmethod
+    def _external_id(entry: PiEntry) -> str:
+        """Stable source event id for identity v3 (revision chain).
+
+        Pi entry ids are the native event identity; records without one come
+        from append-only JSONL, so (file, line) is stable for them.  The id is
+        not otherwise interpreted: it is hashed into the raw identity key and
+        projected into metadata so a later revision of the same entry
+        supersedes this row instead of co-existing with it.
+        """
+        stem = entry.path.stem
+        if entry.kind == "task":
+            return "pi:compaction:%s:%s" % (
+                entry.session_id or stem, entry.entry_id or entry.line_number)
+        if entry.entry_id:
+            return "pi:message:%s:%s" % (entry.session_id or stem, entry.entry_id)
+        return "pi:message:%s:line-%d" % (stem, entry.line_number)
+
+    @staticmethod
+    def _content_revision(content: str) -> str:
+        """Stable per-version marker for a streamed record (audit only)."""
+        payload = str(content or "").encode("utf-8", errors="replace")
+        return hashlib.sha1(payload).hexdigest()[:16]
+
     def _record(self, entry: PiEntry) -> Dict[str, Any]:
         project = self._project(entry.cwd)
         stem = entry.path.stem
         if entry.kind == "task":
-            return {
+            record: Dict[str, Any] = {
                 "content": entry.content,
                 "kind": "task",
                 "source_agent": "pi",
@@ -358,28 +382,40 @@ class PiSessionScanner:
                     "format": "pi-session",
                 },
             }
-        return {
-            "content": entry.content,
-            "kind": "raw_chat",
-            "source_agent": "pi",
-            "session_id": entry.session_id,
-            "project": project,
-            "role": entry.role,
-            "scope": "agent:pi",
-            "raw_chat": True,
-            "evidence": ["pi:%s:%s" % (stem, entry.line_number)],
-            "timestamp": entry.timestamp or utc_now(),
-            "metadata": {
-                "source": "native-transcript",
-                "transcript_path": str(entry.path),
-                "line": entry.line_number,
-                "cwd": entry.cwd,
-                "session_name": entry.session_name,
-                "parent_session": entry.parent_session,
-                "entry_id": entry.entry_id,
-                "format": "pi-session",
-            },
-        }
+        else:
+            record = {
+                "content": entry.content,
+                "kind": "raw_chat",
+                "source_agent": "pi",
+                "session_id": entry.session_id,
+                "project": project,
+                "role": entry.role,
+                "scope": "agent:pi",
+                "raw_chat": True,
+                "evidence": ["pi:%s:%s" % (stem, entry.line_number)],
+                "timestamp": entry.timestamp or utc_now(),
+                "metadata": {
+                    "source": "native-transcript",
+                    "transcript_path": str(entry.path),
+                    "line": entry.line_number,
+                    "cwd": entry.cwd,
+                    "session_name": entry.session_name,
+                    "parent_session": entry.parent_session,
+                    "entry_id": entry.entry_id,
+                    "format": "pi-session",
+                },
+            }
+        # identity v3: the source event id participates in the raw identity key
+        # and is projected so the next revision of this entry can find this row
+        # and supersede it.
+        external_id = self._external_id(entry)
+        if external_id:
+            record["event_id"] = external_id
+            metadata = dict(record["metadata"])
+            metadata["external_id"] = external_id
+            metadata["content_revision"] = self._content_revision(entry.content)
+            record["metadata"] = metadata
+        return record
 
     # ------------------------------------------------------------------
     # Public sync API
@@ -428,6 +464,36 @@ class PiSessionScanner:
                 continue
             entries, context = self._parse(lines, context, line_number,
                                            min(per_file, remaining), path)
+            deleted_ids: List[str] = []
+            for raw in lines:
+                pl = _json_loads(raw)
+                if pl is not None and pl.get("type") == "deleted":
+                    orig = str(pl.get("originalEntryId") or "")
+                    if orig:
+                        deleted_ids.append(orig)
+            if deleted_ids:
+                ext_candidates: List[str] = []
+                sess = context.get("session_id") or ""
+                stem = path.stem
+                for orig in deleted_ids:
+                    if sess:
+                        ext_candidates.append(f"pi:message:{sess}:{orig}")
+                    ext_candidates.append(f"pi:message:{stem}:{orig}")
+                if ext_candidates:
+                    marks = ",".join("?" for _ in ext_candidates)
+                    with self.ledger._reading() as conn:
+                        dead_rows = conn.execute(
+                            "SELECT memory_id FROM memories "
+                            "WHERE scope='agent:pi' AND lifecycle='active' "
+                            "AND json_extract(metadata_json, '$.external_id') IN (" + marks + ")",
+                            tuple(ext_candidates),
+                        ).fetchall()
+                    dead_ids = [str(r["memory_id"]) for r in dead_rows if str(r["memory_id"] or "")]
+                    if dead_ids:
+                        try:
+                            self.ledger.forget(memory_ids=dead_ids, source_agent="pi-capture")
+                        except LedgerError:
+                            pass
             if entries:
                 records = [self._record(entry) for entry in entries]
                 try:

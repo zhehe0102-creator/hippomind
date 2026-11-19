@@ -1,0 +1,76 @@
+{
+  "set_version": "benchmark_zh_v1",
+  "measured": {
+    "queries": 48,
+    "k": 8,
+    "recall_at_k": 1.0,
+    "mrr": 0.9722,
+    "duplicate_rate": 0.0,
+    "update_hit": 1.0,
+    "abstain_accuracy": 1.0,
+    "p95_ms": 10.715,
+    "per_category": {
+      "fact_recall": {
+        "queries": 12,
+        "accuracy": 1.0,
+        "returned": 96,
+        "duplicates": 0,
+        "recall_at_k": 1.0,
+        "mrr": 1.0
+      },
+      "knowledge_update": {
+        "queries": 8,
+        "accuracy": 1.0,
+        "returned": 64,
+        "duplicates": 0,
+        "recall_at_k": 1.0,
+        "mrr": 0.9375,
+        "update_hit": 1.0
+      },
+      "temporal": {
+        "queries": 8,
+        "accuracy": 1.0,
+        "returned": 64,
+        "duplicates": 0,
+        "recall_at_k": 1.0,
+        "mrr": 1.0
+      },
+      "continuity": {
+        "queries": 8,
+        "accuracy": 1.0,
+        "returned": 64,
+        "duplicates": 0,
+        "recall_at_k": 1.0,
+        "mrr": 0.9375
+      },
+      "abstention": {
+        "queries": 12,
+        "accuracy": 1.0,
+        "returned": 0,
+        "duplicates": 0,
+        "abstain_accuracy": 1.0,
+        "recall_at_k": null,
+        "mrr": null
+      }
+    },
+    "fact_recall_accuracy": 1.0,
+    "knowledge_update_accuracy": 1.0,
+    "temporal_accuracy": 1.0,
+    "continuity_accuracy": 1.0
+  },
+  "thresholds": {
+    "min_queries": 48,
+    "min_recall_at_k": 0.95,
+    "min_mrr": 0.8722,
+    "max_duplicate_rate": 0.1,
+    "min_update_hit": 0.9,
+    "min_abstain_accuracy": 0.9,
+    "max_p95_ms": 50.0,
+    "per_category_min_recall": {
+      "fact_recall": 0.9,
+      "knowledge_update": 0.9,
+      "temporal": 0.9,
+      "continuity": 0.9
+    }
+  }
+}

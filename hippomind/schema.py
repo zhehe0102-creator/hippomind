@@ -28,7 +28,7 @@ from .textutil import MAX_TEXT_CHARS
 from .sanitize import MAX_ARCHIVE_MESSAGE_CHARS  # noqa: F401  (re-exported for callers)
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 #: Raw-evidence kinds.  Defined here because the schema's FTS and lifecycle
 #: columns are shaped around them.
@@ -237,6 +237,17 @@ def _migrate_v8(conn: sqlite3.Connection) -> None:
     conn.execute("ANALYZE")
 
 
+def _migrate_v9(conn: sqlite3.Connection) -> None:
+    """图谱边原生双时态窗口（Graphiti 对齐）：为 memory_relations 补齐 valid_from/valid_until。"""
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(memory_relations)").fetchall()}
+    if "valid_from" not in columns:
+        conn.execute("ALTER TABLE memory_relations ADD COLUMN valid_from TEXT NOT NULL DEFAULT ''")
+    if "valid_until" not in columns:
+        conn.execute("ALTER TABLE memory_relations ADD COLUMN valid_until TEXT NOT NULL DEFAULT ''")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_relations_window "
+                 "ON memory_relations(valid_from, valid_until)")
+
+
 def _migrate_v4(conn: sqlite3.Connection) -> None:
     """Add bi-temporal claims and bounded causal edges without rewriting v3 data."""
     columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(ledger_events)").fetchall()}
@@ -294,11 +305,14 @@ def _migrate_v4(conn: sqlite3.Connection) -> None:
             relation_type TEXT NOT NULL DEFAULT 'caused_by',
             confidence REAL NOT NULL DEFAULT 0.5,
             created_at TEXT NOT NULL,
+            valid_from TEXT NOT NULL DEFAULT '',
+            valid_until TEXT NOT NULL DEFAULT '',
             UNIQUE(parent_memory_id,child_memory_id,relation_type),
             CHECK(parent_memory_id != child_memory_id)
         );
         CREATE INDEX IF NOT EXISTS idx_relations_parent ON memory_relations(parent_memory_id);
         CREATE INDEX IF NOT EXISTS idx_relations_child ON memory_relations(child_memory_id);
+        CREATE INDEX IF NOT EXISTS idx_relations_window ON memory_relations(valid_from, valid_until);
     """)
 
 

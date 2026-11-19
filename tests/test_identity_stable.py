@@ -1,4 +1,4 @@
-"""identity key 稳定性回归测试（v2 / 向后兼容 / 双时态）。
+"""identity key 稳定性回归测试（v2/v3 / 向后兼容 / 双时态）。
 
 锁定生产事故的根因与修复，防止回退：
 
@@ -11,6 +11,9 @@
 3. **向后兼容**：旧 v1 行仍被识别为重复（语义探测 + 重建 v1 hash 确认），
    不会因为升级导致全库重新入库。
 4. **双时态不退化**：显式 ``valid_from`` 不同仍是两次观测。
+5. **v3 兼容探测**：上一发布版本（v2）写下的行仍被识别为重复；raw 行升级后
+   补上事件 ID，后续修订可继续 supersede。v3 新增行为见
+   ``tests/test_identity_v3.py``。
 """
 
 from __future__ import annotations
@@ -24,7 +27,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from hippomind.ledger import SQLiteLedger  # noqa: E402
 from hippomind.ledger.identity import (  # noqa: E402
-    IDENTITY_VERSION, IDENTITY_VERSION_KEY, IDENTITY_VERSION_LEGACY, IdentityMixin)
+    IDENTITY_VERSION, IDENTITY_VERSION_KEY, IDENTITY_VERSION_LEGACY,
+    IDENTITY_VERSION_V2, IdentityMixin)
 
 #: 生产事故里的那条内容（141 份重复）。
 GEMINI_CONTENT = (
@@ -192,6 +196,73 @@ class BackwardCompatibilityTests(LedgerCase):
             lambda conn: self.ledger._insert_prepared(conn, legacy))
         return legacy["memory_id"]
 
+    def _write_v2_row(self, record) -> str:
+        """把一条记录以 v2 形态写入账本（模拟上一发布版本的数据）。"""
+        prepared = self.ledger._prepare_ingest(record)
+        v2_hash = prepared["compat_hash"]
+        legacy = dict(prepared)
+        legacy["content_hash"] = v2_hash
+        legacy["event_id"] = "evt_" + v2_hash[:32]
+        legacy["memory_id"] = "mem_" + v2_hash[:32]
+        self.ledger._transaction(
+            lambda conn: self.ledger._insert_prepared(conn, legacy))
+        return legacy["memory_id"]
+
+    def test_v2_row_is_recognised_as_duplicate_after_upgrade(self):
+        """升级不得重灌上一发布版本已经写下的行。"""
+        original = self._write_v2_row(gemini_record("2026-10-24T04:52:22Z", 58))
+        before = self.count()
+        result = self.ledger.ingest(gemini_record("2026-10-25T09:00:00+00:00", 999))
+        self.assertFalse(result.inserted, "v2 行必须被兼容探测识别为重复")
+        self.assertEqual(before, self.count())
+        self.assertEqual(original, result.memory_id)
+
+    def test_v2_row_is_not_merged_with_distinct_content(self):
+        self._write_v2_row(gemini_record("2026-10-24T04:52:22Z", 58))
+        before = self.count()
+        result = self.ledger.ingest({"content": "同一会话里的另一句话", "kind": "task",
+                                       "source_agent": "gemini", "scope": "shared",
+                                       "task_id": CONVERSATION_ID,
+                                       "evidence": ["gemini:other"],
+                                       "timestamp": "2026-10-25T09:00:00Z"})
+        self.assertTrue(result.inserted)
+        self.assertEqual(before + 1, self.count())
+
+    def test_raw_v2_row_is_tagged_with_event_id_and_then_superseded(self):
+        """v2 raw 行没有事件 ID 投影；v3 首次重放要补标签，之后修订才能 supersede。"""
+        base = {"content": "流式回答草稿，第一段已经写好", "kind": "raw_chat",
+                "raw_chat": True, "source_agent": "cursor", "session_id": "s-1",
+                "role": "assistant", "evidence": ["cursor:bubble:s-1:b1"]}
+        original = self._write_v2_row({**base, "timestamp": "2026-05-10T10:30:00Z"})
+        tagged = self.ledger.ingest({**base, "timestamp": "2026-05-10T10:30:00Z",
+                                      "event_id": "cursor:bubble:s-1:b1"})
+        self.assertFalse(tagged.inserted, "同一内容的 v2 行必须被识别为重复")
+        self.assertEqual(original, tagged.memory_id)
+        with self.ledger._reading() as conn:
+            row = conn.execute("SELECT metadata_json FROM memories WHERE memory_id=?",
+                               (original,)).fetchone()
+        self.assertIn("cursor:bubble:s-1:b1", str(row["metadata_json"]),
+                      "重复探测必须把事件 ID 补进 v2 行的投影，否则后续修订找不到它")
+        full = self.ledger.ingest({**base, "content": base["content"] +
+                                  "，第二段完整版本校验通过",
+                                  "timestamp": "2026-05-10T10:31:00Z",
+                                  "event_id": "cursor:bubble:s-1:b1"})
+        self.assertTrue(full.inserted)
+        with self.ledger._reading() as conn:
+            row = conn.execute("SELECT lifecycle, superseded_by FROM memories WHERE memory_id=?",
+                               (original,)).fetchone()
+        self.assertEqual("superseded", row["lifecycle"])
+        self.assertEqual(full.memory_id, row["superseded_by"])
+
+    def test_prepared_record_carries_compat_hash_and_external_id(self):
+        prepared = self.ledger._prepare_ingest({
+            "content": "显式事件消息", "kind": "raw_chat", "raw_chat": True,
+            "source_agent": "cursor", "session_id": "s-1", "role": "user",
+            "evidence": ["cursor:bubble:s-1:b2"], "event_id": "evt-42"})
+        self.assertEqual("evt-42", prepared["identity_external_id"])
+        self.assertNotEqual(prepared["content_hash"], prepared["compat_hash"],
+                            "v3 与 v2 digest 必须不同，否则无法区分两个世代")
+        self.assertIn("evt-42", prepared["metadata_json"])
     def test_legacy_identity_hash_reproduces_a_v1_row(self):
         record = gemini_record("2026-10-24T04:52:22Z", 58)
         memory_id = self._write_v1_row(record)
@@ -306,7 +377,8 @@ class IdentityVersionTests(LedgerCase):
     """版本标记：便于将来演进。"""
 
     def test_version_constants_are_pinned(self):
-        self.assertEqual(2, IDENTITY_VERSION)
+        self.assertEqual(3, IDENTITY_VERSION)
+        self.assertEqual(2, IDENTITY_VERSION_V2)
         self.assertEqual(1, IDENTITY_VERSION_LEGACY)
         self.assertEqual("identity_version", IDENTITY_VERSION_KEY)
 

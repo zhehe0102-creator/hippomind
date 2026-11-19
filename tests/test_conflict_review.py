@@ -559,6 +559,9 @@ class LifecycleHelperTests(LedgerCase):
         result = self.ledger.settle_claim_slot(claim["claim_id"],
                                                winner.memory_id)
         self.assertEqual(result["winner"], winner.memory_id)
+        self.assertEqual([loser.memory_id], result["loser_memories"])
+        self.assertEqual([], result["demoted"],
+                         "败者仍持有 region 槽位，不得整体下线")
         states = self.claim_states()
         self.assertEqual(states[(winner.memory_id, "port")], "active")
         self.assertEqual(states[(loser.memory_id, "port")], "superseded")
@@ -618,16 +621,46 @@ class LifecycleHelperTests(LedgerCase):
         self.assertTrue(types)
 
     def test_existing_resolve_claim_semantics_are_unchanged(self):
-        """The pre-existing memory-wide API must still behave as before."""
+        """Legacy API keeps its shape and ruling power; blast radius is new.
+
+        WP-C made resolve_claim delegate to settle_claim_slot.  The winner is
+        still crowned, a loser with no other facts is still retired as a whole,
+        and the legacy fields (resolved/winner/losers) are still returned.  What
+        changed is scope: the ruling no longer takes the loser's unrelated
+        facts with it.
+        """
+        multi = self.ingest([_claim("port", "5432", 0.50),
+                             _claim("theme", "纸本", 0.90)], "端口与主题")
+        rival = self.ingest([_claim("port", "6432", 0.52)], "端口 6432")
+        claim = next(c for c in self.ledger.list_claims(state="conflict")
+                     if c["memory_id"] == multi.memory_id
+                     and c["slot_key"] == "port")
+        result = self.ledger.resolve_claim(claim["claim_id"], rival.memory_id)
+        self.assertEqual(result["winner"], rival.memory_id)
+        self.assertEqual(result["resolved"], claim["claim_id"])
+        self.assertIn(multi.memory_id, result["losers"])
+        self.assertEqual([multi.memory_id], result["loser_memories"])
+        flags = self.memory_flags()
+        self.assertEqual(flags[rival.memory_id], ("accepted", "active"))
+        # 新语义：无关槽位（theme）保留，整条记忆不因单槽裁决下线。
+        states = self.claim_states()
+        self.assertEqual(states[(rival.memory_id, "port")], "active")
+        self.assertEqual(states[(multi.memory_id, "port")], "superseded")
+        self.assertEqual(states[(multi.memory_id, "theme")], "active",
+                         "无关 claim 被单槽裁决连带下线（爆炸半径回归）")
+        self.assertEqual(flags[multi.memory_id], ("accepted", "active"))
+        self.assertEqual(0, self.ledger.claims_consistency_report()["dangling"])
+
+    def test_resolve_still_retires_a_loser_with_no_other_facts(self):
+        """槽位范围收窄不能改坏「无其它事实的败者整体退出召回」旧语义。"""
         a, b = self.genuine_pair()
         claim = next(c for c in self.ledger.list_claims(state="conflict")
                      if c["memory_id"] == a.memory_id)
         result = self.ledger.resolve_claim(claim["claim_id"], b.memory_id)
-        self.assertEqual(result["winner"], b.memory_id)
-        self.assertIn(a.memory_id, result["losers"])
+        self.assertEqual([a.memory_id], result["demoted"])
         flags = self.memory_flags()
-        self.assertEqual(flags[b.memory_id][0], "accepted")
-        self.assertEqual(flags[a.memory_id][1], "superseded")
+        self.assertEqual(flags[b.memory_id], ("accepted", "active"))
+        self.assertEqual(flags[a.memory_id], ("superseded", "superseded"))
 
 
 class MainCliTests(LedgerCase):

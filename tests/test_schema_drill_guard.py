@@ -32,6 +32,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
 import drill_schema_migration as drill  # noqa: E402
+from hippomind.schema import SCHEMA_VERSION  # noqa: E402
 
 
 def _make_ledger(path: Path, rows: int = 6) -> None:
@@ -39,7 +40,7 @@ def _make_ledger(path: Path, rows: int = 6) -> None:
     try:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-        conn.execute("INSERT INTO schema_meta VALUES('schema_version','8')")
+        conn.execute("INSERT INTO schema_meta VALUES('schema_version', ?)", (str(SCHEMA_VERSION),))
         conn.execute("CREATE TABLE memories (memory_id TEXT PRIMARY KEY)")
         conn.executemany("INSERT INTO memories VALUES(?)",
                          [("m%d" % index,) for index in range(rows)])
@@ -71,7 +72,7 @@ class ReadOnlyProbeTests(unittest.TestCase):
         counts = drill._counts(self.path)
         self.assertEqual(counts["memories"], 6,
                          "a checkpointed WAL file must still be countable")
-        self.assertEqual(drill._recorded_version(self.path), 8)
+        self.assertEqual(drill._recorded_version(self.path), SCHEMA_VERSION)
 
     def test_reads_live_wal_file_that_still_has_sidecars(self):
         _make_ledger(self.path, rows=3)
@@ -102,7 +103,7 @@ class ForwardGuardTests(unittest.TestCase):
         self.drill = drill.Drill("fixtures")
 
     def test_intact_database_passes_the_guard(self):
-        drill._verify_forward_guard(self.drill, self.source, 8, self.home, "ok")
+        drill._verify_forward_guard(self.drill, self.source, SCHEMA_VERSION, self.home, "ok")
         failed = [check["id"] for check in self.drill.checks if not check["ok"]]
         self.assertEqual(failed, [], "an intact future-version db must pass")
         self.assertTrue(self.drill.ok)
@@ -123,7 +124,7 @@ class ForwardGuardTests(unittest.TestCase):
 
         SQLiteLedger.__init__ = destructive_init
         try:
-            drill._verify_forward_guard(self.drill, self.source, 8, self.home, "bad")
+            drill._verify_forward_guard(self.drill, self.source, SCHEMA_VERSION, self.home, "bad")
         finally:
             SQLiteLedger.__init__ = original
 
@@ -152,7 +153,7 @@ class SearchProbeTests(unittest.TestCase):
                 return {"fts": {"drift": False}}
 
             def stats(self):
-                return {"schema_version": 8}
+                return {"schema_version": SCHEMA_VERSION}
 
             def close(self):
                 pass

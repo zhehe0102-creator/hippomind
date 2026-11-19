@@ -22,11 +22,14 @@ def cmd_checkup(args) -> int:
     if getattr(args, "repair", False):
         try:
             report = ledger.fts_sync_report()
-            if report.get("unindexed"):
+            needs_fts = any(report.get(k) for k in ("unindexed", "stale", "orphan", "duplicate_rows"))
+            claims_rep = ledger.repair_claim_states() if hasattr(ledger, "repair_claim_states") else {}
+            if needs_fts:
                 outcome = ledger.repair_fts()
-                repair_note = {"triggered": True, **outcome}
+                repair_note = {"triggered": True, **outcome, "claims_repaired": claims_rep}
             else:
-                repair_note = {"triggered": False, "reason": "FTS 已同步，无需重建"}
+                repair_note = {"triggered": False, "reason": "FTS 已同步，无需重建",
+                               "claims_repaired": claims_rep}
         except Exception as exc:
             repair_note = {"triggered": False, "error": str(exc)[:200]}
     checks: dict = {}

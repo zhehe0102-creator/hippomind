@@ -170,6 +170,82 @@ def repair_codex_hook(path: Path, *, package_root: Path, agent_config: Path,
             "reason": "" if changed else "already current", "_data": updated}
 
 
+def repair_claude_hook(path: Path, *, package_root: Path, agent_config: Path,
+                      python: str, ledger_path: Path) -> Dict[str, Any]:
+    """重写 Claude settings.json 里的 hippomind hook 命令。
+
+    与 repair_codex_hook 的差别只有两处，但两处都很关键：
+
+    1. **文件形状不同**。Claude 把 hook 放在 settings.json，这个文件里还有
+       用户自己的 model / env / permissions——只能就地替换带
+       hippomind.claude_hook 的那条 handler，其它键一个字节都不能动。
+    2. **必须收敛重复**。历史上的正则修补每跑一次就多叠一层坏命令，所以这里
+       保留第一条、删除其余，而不是逐条修补（逐条修只会得到 N 条一样的坏命令）。
+    """
+    data, error = _read_json(path)
+    if data is None:
+        return {"path": str(path), "changed": False, "reason": error or "missing"}
+    if not isinstance(data, Mapping):
+        return {"path": str(path), "changed": False, "reason": "root not object"}
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        return {"path": str(path), "changed": False, "reason": "no hooks"}
+
+    runtime_root = _runtime_package_root(ledger_path, package_root)
+    # 命令形态由 hook 模块自己定义：安装器与修复器必须产出同一个字符串，
+    # 否则每次审计都会把"已经正确"的配置判成需要修复。
+    from .claude_hook import managed_command
+    command = managed_command(package_root=runtime_root, agent_config=agent_config,
+                              python=python)
+    changed = False
+    removed = 0
+    updated_hooks = {}
+    for event, groups in hooks.items():
+        if not isinstance(groups, list):
+            updated_hooks[event] = groups
+            continue
+        new_groups = []
+        for group in groups:
+            if not isinstance(group, Mapping):
+                new_groups.append(group)
+                continue
+            handlers = group.get("hooks")
+            if not isinstance(handlers, list):
+                new_groups.append(group)
+                continue
+            new_handlers = []
+            kept = False
+            for handler in handlers:
+                managed = (isinstance(handler, Mapping)
+                           and isinstance(handler.get("command"), str)
+                           and "hippomind.claude_hook" in handler["command"])
+                if not managed:
+                    new_handlers.append(handler)
+                    continue
+                if kept:
+                    removed += 1
+                    changed = True
+                    continue
+                replacement = dict(handler)
+                replacement["command"] = command
+                replacement.setdefault("timeout", 12)
+                new_handlers.append(replacement)
+                kept = True
+                if handler.get("command") != command:
+                    changed = True
+            new_group = dict(group)
+            new_group["hooks"] = new_handlers
+            new_groups.append(new_group)
+        updated_hooks[event] = new_groups
+    updated = dict(data)
+    updated["hooks"] = updated_hooks
+    if changed and updated == data:
+        changed = False
+    return {"path": str(path), "changed": changed, "command": command,
+            "removed_duplicates": removed,
+            "reason": "" if changed else "already current", "_data": updated}
+
+
 def apply_repairs(repairs: List[Dict[str, Any]], *, dry_run: bool = True
                   ) -> List[Dict[str, Any]]:
     """执行修复。dry_run 时只报告，不写盘。"""

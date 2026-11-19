@@ -332,6 +332,13 @@ class MainEntrypointTests(unittest.TestCase):
             {"id": "pg", "query": "PostgreSQL 主数据库", "expect": ["PostgreSQL"]},
             {"id": "missing", "query": "量子编译器", "expect": ["量子编译器"]},
         ]), encoding="utf-8")
+        self.refusal_path = self.dir / "refusal.json"
+        self.refusal_path.write_text(json.dumps([
+            {"id": "mars", "query": "火星基地的氧气配额是多少",
+             "absent_terms": ["火星基地"]},
+            {"id": "moon", "query": "月球电梯的年度维护预算",
+             "absent_terms": ["月球电梯"]},
+        ], ensure_ascii=False), encoding="utf-8")
 
     def _main(self, argv):
         buffer = io.StringIO()
@@ -525,6 +532,132 @@ class MainEntrypointTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 eval_memory.main(["--set", "nope"])
+
+    # ---- refusal delegation (opt-in; the default output must not change) ----
+
+    def test_main_set_all_without_include_refusal_keeps_the_old_report_shape(self):
+        """--include-refusal 是 opt-in：不开时 --set all 的 JSON 必须一字不多。
+
+        拒答集的指标与 recall 没有共同分母（没有 expect），一旦默认并进
+        combined gate，既有报表的字段和退出码就变了。这条把「默认形状不变」
+        钉死：没有 order 键、没有 refusal 键。
+        """
+        code, output = self._main([
+            "--ledger", str(self.ledger_path),
+            "--set", "all", "--json",
+            "--min-recall", "0.0", "--min-mrr", "0.0",
+            "--max-duplicate-rate", "1.0", "--max-p95-ms", "10000",
+            "--min-queries", "1",
+        ])
+        self.assertEqual(code, 0)
+        payload = json.loads(output)
+        self.assertEqual(set(payload), {"sets", "queries", "k", "mode",
+                                        "ledger", "gate"})
+        self.assertEqual(set(payload["gate"]), {"passed", "failures", "sets"})
+        self.assertEqual(set(payload["sets"]), {"keyword", "semantic"})
+
+    def test_main_set_all_with_include_refusal_adds_the_third_set(self):
+        code, output = self._main([
+            "--ledger", str(self.ledger_path),
+            "--set", "all", "--include-refusal", "--json",
+            "--min-recall", "0.0", "--min-mrr", "0.0",
+            "--max-duplicate-rate", "1.0", "--max-p95-ms", "10000",
+            "--min-queries", "1",
+        ])
+        payload = json.loads(output)
+        self.assertIn("refusal", payload["sets"])
+        self.assertEqual(payload["gate"]["order"],
+                         ["keyword", "semantic", "refusal"])
+        refusal = payload["sets"]["refusal"]
+        self.assertEqual(refusal["set"], "refusal")
+        # 内置拒答集远大于 --min-queries 1，且账本里只有 PostgreSQL 一条记忆，
+        # 因此这一路必须零泄漏、标注审计干净。
+        self.assertEqual(refusal["metrics"]["leak"], 0)
+        self.assertTrue(refusal["grounding"]["clean"])
+        self.assertTrue(refusal["gate"]["passed"])
+        # 合并门禁里三套都要在（退出码仍由 combined 决定）。
+        self.assertEqual(code, 0)
+
+    def test_main_include_refusal_failure_fails_the_combined_gate(self):
+        """拒答集失败必须让合并门禁失败，且失败项带 refusal: 前缀。"""
+        code, output = self._main([
+            "--ledger", str(self.ledger_path),
+            "--set", "all", "--include-refusal", "--json",
+            "--min-recall", "0.0", "--min-mrr", "0.0",
+            "--max-duplicate-rate", "1.0", "--max-p95-ms", "10000",
+            "--min-queries", "1",
+            "--min-queries", "1",
+        ])
+        payload = json.loads(output)
+        self.assertTrue(payload["gate"]["passed"])
+        # 用一条会泄漏的查询单独验证失败路径（不依赖生产账本）。
+        leak_path = self.dir / "leak.json"
+        leak_path.write_text(json.dumps([
+            {"id": "leak", "query": "PostgreSQL 主数据库",
+             "absent_terms": ["PostgreSQL"]},
+        ], ensure_ascii=False), encoding="utf-8")
+        code, output = self._main([
+            "--ledger", str(self.ledger_path), "--queries", str(leak_path),
+            "--set", "refusal", "--json", "--min-queries", "1",
+        ])
+        self.assertEqual(code, 1)
+        payload = json.loads(output)
+        self.assertFalse(payload["gate"]["passed"])
+
+    def test_main_set_refusal_delegates_and_returns_its_exit_code(self):
+        code, output = self._main([
+            "--ledger", str(self.ledger_path),
+            "--set", "refusal", "--json",
+            "--queries", str(self.dir / "refusal.json"),
+            "--min-queries", "2",
+        ])
+        self.assertEqual(code, 0)
+        payload = json.loads(output)
+        self.assertEqual(payload["set"], "refusal")
+        self.assertIn("refusal_rate", payload["metrics"])
+        self.assertNotIn("recall_at_k", payload["metrics"])
+
+    def test_main_set_refusal_gate_failure_exits_one(self):
+        path = self.dir / "bad-refusal.json"
+        path.write_text(json.dumps([
+            {"id": "bad", "query": "数据库选型", "absent_terms": ["PostgreSQL"]},
+            {"id": "ok", "query": "火星基地的氧气配额",
+             "absent_terms": ["火星基地"]},
+        ], ensure_ascii=False), encoding="utf-8")
+        code, output = self._main([
+            "--ledger", str(self.ledger_path), "--set", "refusal",
+            "--queries", str(path), "--json", "--min-queries", "2",
+        ])
+        self.assertEqual(code, 1)
+        self.assertFalse(json.loads(output)["gate"]["passed"])
+        # --no-gate 让同一份数据只报告不判退出码。
+        code, _ = self._main([
+            "--ledger", str(self.ledger_path), "--set", "refusal",
+            "--queries", str(path), "--min-queries", "2", "--no-gate",
+        ])
+        self.assertEqual(code, 0)
+
+    def test_main_rejects_include_refusal_without_set_all(self):
+        code, _ = self._main([
+            "--ledger", str(self.ledger_path),
+            "--queries", str(self.query_path), "--include-refusal",
+        ])
+        self.assertEqual(code, 2)
+
+    def test_main_human_report_for_all_with_refusal_lists_three_sets(self):
+        code, output = self._main([
+            "--ledger", str(self.ledger_path),
+            "--set", "all", "--include-refusal",
+            "--min-recall", "0.0", "--min-mrr", "0.0",
+            "--max-duplicate-rate", "1.0", "--max-p95-ms", "10000",
+            "--min-queries", "1",
+        ])
+        self.assertEqual(code, 0)
+        self.assertIn("== set: keyword ==", output)
+        self.assertIn("== set: semantic ==", output)
+        self.assertIn("== set: refusal ==", output)
+        self.assertIn("== combined ==", output)
+        self.assertIn("keyword, semantic, refusal", output)
 
 
 if __name__ == "__main__":

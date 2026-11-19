@@ -27,6 +27,8 @@ def _pack_body(args) -> Dict[str, Any]:
             "project": args.project, "task_id": args.task, "source_agents": args.source_agent,
             "from_time": args.from_time, "to_time": args.to_time,
             "as_of": getattr(args, "as_of", "") or "",
+            # WP-M：会话感知 follow-up 锚定；旧 CLI 不传时是空串（行为不变）。
+            "session_id": getattr(args, "session_id", "") or "",
             "debug": args.debug,
         },
     }

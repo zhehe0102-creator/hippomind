@@ -96,9 +96,31 @@ def _print_metrics(result) -> None:
     print()
 
 
+def _print_arms(result) -> None:
+    arms = result.get("arms") or {}
+    print("3. 随机分组对照（claude hook，两臂都检索、只差投递）")
+    print("   注入臂 n=%s  对照臂 n=%s  %s" % (
+        arms.get("treatment_n", 0), arms.get("control_n", 0),
+        "（已匹配，可比较）" if arms.get("matched") else "（单臂，不可比较）"))
+    print("   注入臂引用率         %s  95%%CI %s" % (
+        _fmt(arms.get("treatment_citation_rate")), _fmt_ci(arms.get("treatment_ci"))))
+    print("   对照臂引用率         %s  95%%CI %s" % (
+        _fmt(arms.get("control_citation_rate")), _fmt_ci(arms.get("control_ci"))))
+    print("   差值                 %s" % _fmt(arms.get("difference"), "%+.3f"))
+    if not arms.get("matched"):
+        print("   说明                 对照组还没有可用样本；此时任何效果结论都不成立。")
+    elif min(int(arms.get("treatment_n") or 0),
+             int(arms.get("control_n") or 0)) < result["min_samples"]:
+        print("   说明                 单臂样本 %d < 阈值 %d，暂不构成结论。"
+              % (min(int(arms.get("treatment_n") or 0),
+                     int(arms.get("control_n") or 0)), result["min_samples"]))
+    print("   开启实验：HIPPOMIND_INJECTION_AB=1（默认关闭，关闭时全部注入）。")
+    print()
+
+
 def _print_control(result) -> None:
     control = result["control"]
-    print("3. 对照（观察性，非随机分组）")
+    print("4. 观察性对照（旧 trace，非随机分组）")
     print("   模式                 %s" % control["mode"])
     print("   配对数量             %d" % control["pairs"])
     print("   平均 lift            %s   (注入项信号复用率 - 未注入同类记忆)" % _fmt(control["lift_mean"], "%+.3f"))
@@ -110,7 +132,7 @@ def _print_control(result) -> None:
 
 def _print_strata(result) -> None:
     strata = result.get("strata") or {}
-    print("4. 分层")
+    print("5. 分层")
     for dimension, label in (("by_agent", "按 agent"),
                              ("by_items", "按注入条数"),
                              ("by_source", "按来源")):
@@ -145,7 +167,7 @@ def _trace_count(result, dimension, name) -> int:
 def _print_diagnostics(result) -> None:
     diagnostics = result.get("diagnostics") or {}
     agents = diagnostics.get("agents") or {}
-    print("5. 诊断（为什么样本是这个数）")
+    print("6. 诊断（为什么样本是这个数）")
     print("   账本最近一条 assistant 消息： %s" % (diagnostics.get("ledger_last_assistant_at") or "无"))
     if not agents:
         print("   没有 agent 出现在 trace 里。")
@@ -207,6 +229,30 @@ def _print_details(result, limit=12) -> None:
     print()
 
 
+def _print_ab_control() -> None:
+    """Print the experiment switch and how to change it.
+
+    The switch lives in a file, not the environment: the hook that needs it is
+    spawned by the agent runtime, so an export in a shell profile never reaches
+    it.  Printing the resolved path is the difference between "I turned it on"
+    and "I turned it on and the hook can see it".
+    """
+    from hippomind import injection_ab
+    config = injection_ab.config_path()
+    state = injection_ab.explain()
+    print("7. 实验开关（A/B）")
+    print("   状态                 %s" % ("已开启" if state["enabled"] else "已关闭（全部注入）"))
+    print("   对照比例             %.2f" % state["rate"])
+    print("   配置文件             %s%s" % (config, "" if config.is_file() else "（不存在）"))
+    if not state["enabled"]:
+        print("   开启命令             python3 scripts/ab_control.py on")
+    if state["prompts_needed_for_min_samples"]:
+        print("   凑够 %d 条对照样本约需  %d 条 prompt"
+              % (state["min_samples_for_conclusion"],
+                 state["prompts_needed_for_min_samples"]))
+    print()
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Injection reuse report")
     parser.add_argument("--ledger", default=os.path.expanduser(str(default_ledger_path())))
@@ -239,9 +285,11 @@ def main(argv=None) -> int:
     print("=" * 78)
     _print_sample(result)
     _print_metrics(result)
+    _print_arms(result)
     _print_control(result)
     _print_strata(result)
     _print_diagnostics(result)
+    _print_ab_control()
     _print_verdict(result)
     _print_details(result)
     return 0

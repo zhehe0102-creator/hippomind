@@ -15,19 +15,26 @@ Retrieval quality rules (projection layer):
 
 from __future__ import annotations
 
-import math
-import re
 import copy
 import html
+import json
+import math
+import os
+import re
 import secrets
+import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .textutil import normalise_for_dedup, token_sim, tokenize_multilingual
 from .embeddings import HybridRanker
-from .ledger import CONTEXT_FIELDS, SQLiteLedger
+from .fact_cards import build_fact_cards, render_fact_cards
+from .schema import fts_indexed_predicate
+from . import query_context, query_expansion
+from .ledger import CONTEXT_FIELDS, SQLiteLedger, _timestamp, utc_now
 from .time_parse import parse_temporal_expression
 
 
@@ -125,6 +132,16 @@ class ContextPackOptions:
     # 双时态历史切片（zep/Graphiti point-in-time 语义）：给定 ISO 时间点时
     # valid_from/valid_until 窗口按该时刻求值；空 = 现在。
     as_of: str = ""
+    # 会话感知 follow-up 锚定（WP-M）：session_id 用于把「继续/同上」这类
+    # 无内容查询锚到同一会话的最近真实任务消息；query_context=False 可按
+    # 单次请求关闭（全局开关是 HIPPOMIND_QUERY_CONTEXT）。
+    session_id: str = ""
+    query_context: bool = True
+    # 事实卡注入（WP-Q，opt-in）：默认关闭时 pack 输出与旧版本逐字节相同。
+    # max_fact_card_chars 是卡片块自身的字符上限（常用 200-2000；允许更小值
+    # 以便宿主用极小传输预算验证硬上限）。
+    fact_cards: bool = False
+    max_fact_card_chars: int = 600
     debug: bool = False
     # 分层预算显式化：状态行（最新进度/阻塞/下一步）在每个任务卡中的
     # 预算占比，以及单卡基础字符上限。给集成方调优旋钮，不改默认行为。
@@ -140,6 +157,15 @@ class ContextPackOptions:
     # 自动注入的相关性门控：低于该分数的候选直接丢弃，避免把无关历史塞进
     # 每一轮 prompt。0 表示关闭（显式 API 调用保持旧行为）。
     min_score: float = 0.0
+    # A/B Control 臂或只读模式时设为 False，避免仅做影子检索也写 touch_count。
+    record_touch: bool = True
+    # 已获策略授权的会话锚点查找 scope 列表（供跨 scope 隔离的私聊会话回查自身锚点）。
+    anchor_scopes: Sequence[str] = field(default_factory=tuple)
+    # 调用方当前工作目录：用于轻量 Repo-Aware 文件存在性校验（默认空不启用）。
+    workspace_cwd: str = ""
+    # Letta Core Memory 对齐（opt-in）：显式开启时将同 scope/project 下 pinned=1
+    # 的核心规则常驻置于 Context Pack 首部（不触碰默认关闭路径与拒答基准）。
+    include_pinned: bool = False
 
     def normalise(self) -> "ContextPackOptions":
         self.max_items = max(1, min(16, int(self.max_items)))
@@ -150,8 +176,26 @@ class ContextPackOptions:
         self.scope = str(self.scope or "shared").strip()[:128] or "shared"
         self.project = str(self.project or "").strip()[:512]
         self.task_id = str(self.task_id or "").strip()[:256]
+        self.session_id = str(self.session_id or "").strip()[:256]
+        self.query_context = bool(self.query_context)
+        self.fact_cards = bool(self.fact_cards)
+        try:
+            self.max_fact_card_chars = max(1, min(2_000,
+                                                  int(self.max_fact_card_chars)))
+        except (TypeError, ValueError):
+            self.max_fact_card_chars = 600
         self.source_agents = tuple(str(value).strip()[:128] for value in self.source_agents if str(value).strip())[:64]
         self.roles = tuple(str(value).strip()[:64] for value in self.roles if str(value).strip())[:16]
+        self.record_touch = bool(self.record_touch)
+        self.anchor_scopes = tuple(
+            str(value).strip()[:128] for value in (self.anchor_scopes or ())
+            if str(value).strip()
+        )[:16]
+        self.workspace_cwd = str(self.workspace_cwd or "").strip()[:1024]
+        self.include_pinned = bool(
+            self.include_pinned
+            or os.environ.get("HIPPOMIND_CORE_PLAYBOOK", "").strip().lower() in {"1", "true", "yes", "on"}
+        )
         try:
             self.state_fraction = min(0.9, max(0.30, float(self.state_fraction)))
         except (TypeError, ValueError):
@@ -238,7 +282,10 @@ def parse_entities(query: str) -> Dict[str, Any]:
         candidate = match.group(1).strip()
         if candidate and candidate not in projects:
             projects.append(candidate)
-    keywords = re.findall(r"[a-z0-9_]{2,}|[\u3400-\u9fff]{2,}", query.lower())
+    keywords = [
+        kw for kw in re.findall(r"[a-z0-9_]{2,}|[\u3400-\u9fff]{2,}", query.lower())
+        if not kw.startswith("__hm_")
+    ]
     return {"task_ids": task_ids[:4], "projects": projects[:4], "keywords": list(dict.fromkeys(keywords))[:20]}
 
 
@@ -269,6 +316,44 @@ def _context_values(item: Mapping[str, Any]) -> Dict[str, List[str]]:
     if fallback and content and content not in result[fallback]:
         result[fallback].append(content[:4_000])
     return result
+
+
+def _fact_card_current_text(value: Any) -> str:
+    """事实卡 current_value 的渲染文本（与 fact_cards 的展示口径一致）。"""
+    if isinstance(value, str):
+        text = value
+    elif isinstance(value, (dict, list)):
+        try:
+            text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError):
+            text = str(value)
+    else:
+        text = str(value)
+    return " ".join(text.split())
+
+
+def _visible_at_as_of(item: Mapping[str, Any], as_of: str) -> bool:
+    """Point-in-time & current-time visibility for rows fetched by expansion paths."""
+    quality = str(item.get("quality_state") or "accepted")
+    lifecycle = str(item.get("lifecycle") or "active")
+    reference = str(as_of or "").strip()
+    if not reference:
+        if quality != "accepted" or lifecycle != "active":
+            return False
+        reference = utc_now()
+    else:
+        if quality not in ("accepted", "superseded"):
+            return False
+        if lifecycle not in ("active", "cold", "expired", "superseded"):
+            return False
+    valid_from = str(item.get("valid_from") or "")
+    valid_until = str(item.get("valid_until") or "")
+    # 窗口是半开区间 [valid_from, valid_until)；空串表示该侧不设限。
+    if valid_from and valid_from > reference:
+        return False
+    if valid_until and valid_until <= reference:
+        return False
+    return True
 
 
 def _dedupe(values: Iterable[str], limit: int = 4) -> List[str]:
@@ -320,14 +405,43 @@ def _source_time(item: Mapping[str, Any]) -> str:
     return str(item.get("created_at") or item.get("occurred_at") or item.get("updated_at") or "")
 
 
-def _passes_relevance_gate(candidate: Mapping[str, Any], min_score: float) -> bool:
+def _semantic_signal_passes(candidate: Mapping[str, Any], vec_median: float = 0.0) -> bool:
+    """Calibrated semantic/entity/PPR evidence gate (Phase 2).
+
+    Prevents flat conversational queries ("今天天气怎么样") from sneaking past
+    the relevance gate while rescuing true paraphrase hits with high calibrated
+    cosine margin, rare entity hits, or strong multi-hop PPR resonance.
+    """
+    parts = candidate.get("score_parts")
+    if not isinstance(parts, Mapping):
+        return False
+    try:
+        vec_sim = float(parts.get("vec_sim", parts.get("vec", 0.0)) or 0.0)
+        entity_score = float(parts.get("entity_score", 0.0) or 0.0)
+        rrf = float(parts.get("rrf", 0.0) or 0.0)
+        structured = float(parts.get("structured", 0.0) or 0.0)
+        association = float(parts.get("association", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return False
+    margin = vec_sim - float(vec_median or 0.0)
+    if vec_sim >= 0.72 and margin >= 0.08 and structured >= 1.0:
+        return True
+    if entity_score >= 1.8 and (vec_sim >= 0.48 or rrf >= 0.20):
+        return True
+    if association >= 0.45 and bool(candidate.get("_assoc_verified")):
+        return True
+    return False
+
+
+def _passes_relevance_gate(candidate: Mapping[str, Any], min_score: float,
+                           *, vec_median: float = 0.0) -> bool:
     """Reject candidates that only look good because they are recent.
 
     The blended score includes time/touch terms, so an unrelated question can
     surface a recent memory with score ~0.37 and zero lexical overlap.  For
-    automatic injection we additionally require some lexical evidence: either
-    a real FTS hit, or strong query coverage.  Explicit API/MCP callers keep
-    min_score=0 and are unaffected.
+    automatic injection we require lexical evidence or calibrated semantic/
+    entity consensus. Explicit API/MCP callers keep min_score=0 and are
+    unaffected.
     """
     if float(candidate.get("score", 0.0)) < min_score:
         return False
@@ -337,14 +451,9 @@ def _passes_relevance_gate(candidate: Mapping[str, Any], min_score: float) -> bo
         coverage = float(parts.get("coverage", 0.0) or 0.0)
     except (TypeError, ValueError):
         return True
-    # 这里**不能**加"语义近邻"作为独立证据来源。实测过：把向量名次 <20
-    # 当作通过条件后，"今天天气怎么样""1+1等于几"这类无关提问会立刻开始
-    # 注入（改造前它们被正确拒绝），且注入内容与提问不相关。
-    # 根因是账本里 95% 是重复的 raw 会话，任何短提问都能在向量空间里找到
-    # "话题相近"的邻居——语义近邻证明的是话题相似，不是事实相关。
-    # 因此自动注入的可靠性仍只认词面证据；向量只参与候选生成与排序，
-    # 由它带来的候选照样要过这道词面门。宁可少注入，也不注入错的。
-    return fts > 0.0 or coverage >= 0.6
+    if fts > 0.0 or coverage >= 0.6:
+        return True
+    return _semantic_signal_passes(candidate, vec_median=vec_median)
 
 
 def _jaccard(a: set, b: set) -> float:
@@ -386,17 +495,21 @@ def _temporal_bucket(value: object) -> str:
 
 
 def _parse_iso_epoch(text: str) -> Optional[float]:
-    """解析 ISO-8601 到 epoch 秒；解析失败返回 None（不抛异常）。"""
+    """解析 ISO-8601 到 UTC epoch 秒；解析失败返回 None（不抛异常）。"""
     candidate = str(text or "").strip()
     if not candidate:
         return None
     try:
-        return datetime.fromisoformat(candidate.replace("Z", "+00:00")).timestamp()
+        dt = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
     except (TypeError, ValueError):
         pass
-    # 兼容无时区后缀的写法（仓库里存在 "")
+    # 兼容无时区后缀的写法（统一按 UTC 解析，避免受本机时区影响）。
     try:
-        return datetime.strptime(candidate[:19], "%Y-%m-%dT%H:%M:%S").timestamp()
+        return datetime.strptime(candidate[:19], "%Y-%m-%dT%H:%M:%S").replace(
+            tzinfo=timezone.utc).timestamp()
     except (TypeError, ValueError):
         return None
 
@@ -438,7 +551,8 @@ def _fold_key(item: Mapping[str, Any]) -> Tuple[str, Tuple[str, ...]]:
 class ContextPackBuilder:
     """Hybrid recall, MMR reranking and compact task-oriented formatting."""
 
-    def __init__(self, ledger: SQLiteLedger, embedder=None, vector_index=None):
+    def __init__(self, ledger: SQLiteLedger, embedder=None, vector_index=None,
+                 entity_index=None):
         self.ledger = ledger
         # 可选向量通道（EmbeddingAdapter）：默认关闭；传入即启用重排融合。
         self.embedder = embedder
@@ -448,40 +562,56 @@ class ContextPackBuilder:
         # 则改写式查询 recall 0.200 -> 0.533，关键词集持平（1.000 -> 1.000）。
         # 默认 None：行为与改造前逐字节相同。索引不可用时静默退化为纯词法。
         self.vector_index = vector_index
+        # 可选实体倒排（entity_index.EntityIndex）：**第三路**候选生成，与
+        # 向量通道并列而不是替代——向量回答「意思像不像」，实体回答「说的是
+        # 不是同一个东西」。默认 None：行为与改造前逐字节相同（channel_count、
+        # rrf 公式、score_parts 键集合全部不变，tests/test_entity_channel.py 锁定）。
+        # 只有显式开启（HIPPOMIND_ENTITY_CHANNEL=1）时 auto_context 才会传进来。
+        self.entity_index = entity_index
         self._cache: Dict[Tuple[Any, ...], Tuple[float, Dict[str, Any]]] = {}
         self._cache_ttl = 2.0
+        self._cache_lock = threading.Lock()
         # 命中率观测（迭代30）：daemon 持有单例 builder，计数跨请求累积。
         self._cache_counters = {"hits": 0, "misses": 0, "expired": 0}
+        # 工作区文件存在性 TTL 缓存（Phase 2 Repo-Aware Guard）。
+        self._file_exists_cache: Dict[Tuple[str, str], Tuple[float, bool]] = {}
 
     def cache_stats(self) -> Dict[str, Any]:
         """缓存命中统计：重复查询应近乎零成本（仅 deepcopy）。"""
-        total = self._cache_counters["hits"] + self._cache_counters["misses"] + \
-            self._cache_counters["expired"]
-        rate = (self._cache_counters["hits"] / total) if total else 0.0
-        return {"context_cache_hits": self._cache_counters["hits"],
-                "context_cache_misses": self._cache_counters["misses"],
-                "context_cache_expired": self._cache_counters["expired"],
+        with self._cache_lock:
+            hits = self._cache_counters["hits"]
+            misses = self._cache_counters["misses"]
+            expired = self._cache_counters["expired"]
+        total = hits + misses + expired
+        rate = (hits / total) if total else 0.0
+        return {"context_cache_hits": hits,
+                "context_cache_misses": misses,
+                "context_cache_expired": expired,
                 "context_cache_hit_rate": round(rate, 4)}
 
     def _cached(self, key: Tuple[Any, ...]) -> Optional[Dict[str, Any]]:
-        hit = self._cache.get(key)
-        if hit is None:
-            self._cache_counters["misses"] += 1
-            return None
-        if time.monotonic() - hit[0] > self._cache_ttl:
-            self._cache_counters["expired"] += 1
-            self._cache.pop(key, None)
-            return None
-        self._cache_counters["hits"] += 1
-        return copy.deepcopy(hit[1])
+        with self._cache_lock:
+            hit = self._cache.get(key)
+            if hit is None:
+                self._cache_counters["misses"] += 1
+                return None
+            if time.monotonic() - hit[0] > self._cache_ttl:
+                self._cache_counters["expired"] += 1
+                self._cache.pop(key, None)
+                return None
+            self._cache_counters["hits"] += 1
+            snapshot = copy.deepcopy(hit[1])
+        return snapshot
 
     def _remember(self, key: Tuple[Any, ...], pack: Dict[str, Any]) -> Dict[str, Any]:
-        self._cache[key] = (time.monotonic(), copy.deepcopy(pack))
-        # Keep the cache bounded even when an adapter sends many one-off
-        # natural-language requests.
-        if len(self._cache) > 64:
-            oldest = min(self._cache.items(), key=lambda item: item[1][0])[0]
-            self._cache.pop(oldest, None)
+        stored = copy.deepcopy(pack)
+        with self._cache_lock:
+            self._cache[key] = (time.monotonic(), stored)
+            # Keep the cache bounded even when an adapter sends many one-off
+            # natural-language requests.
+            if len(self._cache) > 64:
+                oldest = min(self._cache.items(), key=lambda item: item[1][0])[0]
+                self._cache.pop(oldest, None)
         return pack
 
     @staticmethod
@@ -503,7 +633,8 @@ class ContextPackBuilder:
         return " ".join(parts)[:20_000]
 
     @staticmethod
-    def _reliable(item: Mapping[str, Any], explicit_filter: bool) -> bool:
+    def _reliable(item: Mapping[str, Any], explicit_filter: bool,
+                  *, vec_median: float = 0.0) -> bool:
         if explicit_filter:
             return True
         parts = item.get("score_parts", {})
@@ -511,16 +642,10 @@ class ContextPackBuilder:
         fts = float(parts.get("fts", 0.0)) if isinstance(parts, Mapping) else 0.0
         coverage = float(parts.get("coverage", 0.0)) if isinstance(parts, Mapping) else 0.0
         phrase = bool(parts.get("phrase", False)) if isinstance(parts, Mapping) else False
-        # A task handoff should not be selected merely because its transcript
-        # shares one common CJK character with the current request. Exact
-        # phrases, broad lexical coverage, independently strong semantic
-        # similarity, or two distinct word-level overlaps (词序不同的自然问句，
-        # 如「业务部署在哪个区域」↔「业务已迁移到华北二区域」) are acceptable;
-        # otherwise return an honest empty pack.
-        # 同上：语义近邻不是可靠性的替代证据，见 _passes_relevance_gate 的说明。
         reliable_text = (phrase or coverage >= 0.35
                          or (topic >= 0.18 and fts >= 0.12)
-                         or (coverage >= 0.25 and topic >= 0.18))
+                         or (coverage >= 0.25 and topic >= 0.18)
+                         or _semantic_signal_passes(item, vec_median=vec_median))
         return float(item.get("score", 0.0)) >= MIN_RELIABLE_SCORE and reliable_text
 
     def _select_groups(self, groups: Mapping[str, Sequence[Mapping[str, Any]]],
@@ -672,6 +797,7 @@ class ContextPackBuilder:
                 embedder=self.embedder if use_embedder else None,
                 as_of=options.as_of,
                 vector_index=self.vector_index,
+                entity_index=self.entity_index,
             )
             if len(deeper) <= len(current):
                 # 已到该查询能返回的上限，继续加深无收益。
@@ -679,50 +805,205 @@ class ContextPackBuilder:
             current = list(deeper)
         return current
 
-    def _associative_candidates(self, candidates: Sequence[Mapping[str, Any]],
-                                options: ContextPackOptions) -> List[Mapping[str, Any]]:
-        """Add a small, bounded associative expansion through claim subjects.
+    def _check_workspace_files(self, workspace_cwd: str, files: Sequence[str]) -> Tuple[int, int]:
+        """Repo-Aware Staleness Guard: 轻量校验工作区文件存在性（带 30s 进程内 TTL 缓存）。"""
+        cwd = str(workspace_cwd or "").strip()
+        if not cwd or not files:
+            return 0, 0
+        root = Path(cwd)
+        try:
+            if not root.is_dir():
+                return 0, 0
+        except OSError:
+            return 0, 0
+        now_mono = time.monotonic()
+        checked = 0
+        missing = 0
+        for raw_path in files[:12]:
+            rel = str(raw_path or "").strip()
+            if not rel or "://" in rel or "\n" in rel or len(rel) > 300:
+                continue
+            # 只检查类似源码/文档相对路径或落在当前 workspace 下的路径
+            if "/" not in rel and "." not in rel:
+                continue
+            cache_key = (cwd, rel)
+            hit = self._file_exists_cache.get(cache_key)
+            if hit is not None and (now_mono - hit[0]) < 30.0:
+                exists = hit[1]
+            else:
+                try:
+                    candidate = Path(rel)
+                    target = candidate if candidate.is_absolute() else (root / candidate)
+                    resolved_root = root.resolve()
+                    resolved_target = target.resolve()
+                    exists = (
+                        (resolved_target == resolved_root or resolved_root in resolved_target.parents)
+                        and target.exists()
+                    )
+                except OSError:
+                    exists = False
+                if len(self._file_exists_cache) > 1024:
+                    self._file_exists_cache.clear()
+                self._file_exists_cache[cache_key] = (now_mono, exists)
+            checked += 1
+            if not exists:
+                missing += 1
+        return checked, missing
 
-        A memory that shares an entity/subject with a strong hit is often the
-        context a human would recall next ("we discussed X, so Y matters").
-        This is deliberately capped at a handful of items and scored below
-        direct hits; it cannot flood a pack, but it gives the graph a role in
-        retrieval instead of being a separate display-only view.
+    def _associative_candidates(self, candidates: Sequence[Mapping[str, Any]],
+                                options: ContextPackOptions,
+                                as_of: str = "",
+                                *, project: str = "",
+                                task_id: str = "") -> List[Mapping[str, Any]]:
+        """2-hop Bipartite + Causal Personalized PageRank (Phase 2 / BUG-03 fix).
+
+        Strictly enforces ``options.scope``, ``options.raw_chat``,
+        ``options.require_evidence``, ``project``, ``task_id`` and bi-temporal
+        visibility before adding any candidate or debug metadata.
         """
-        ids = [str(item.get("memory_id", "")) for item in candidates[:8]
-               if str(item.get("memory_id", ""))]
+        seeds = [item for item in candidates[:8] if str(item.get("memory_id", ""))]
+        ids = [str(item.get("memory_id", "")) for item in seeds]
         if not ids:
             return list(candidates)
+        seed_scores: Dict[str, float] = {}
+        total_seed = 0.0
+        for item in seeds:
+            mid = str(item.get("memory_id", ""))
+            w = max(0.05, float(item.get("score", 0.1) or 0.1))
+            seed_scores[mid] = w
+            total_seed += w
+        if total_seed <= 0.0:
+            return list(candidates)
+        for mid in seed_scores:
+            seed_scores[mid] /= total_seed
+
         placeholders = ",".join("?" for _ in ids)
+        scope_text = str(options.scope or "shared")
+        subject_weights: Dict[str, float] = {}
+        ppr_scores: Dict[str, float] = {}
+        ppr_edges: Dict[str, int] = {}
         try:
             with self.ledger._reading() as conn:
-                rows = conn.execute(
-                    "SELECT DISTINCT subject FROM memory_claims WHERE memory_id IN (" +
-                    placeholders + ") AND state IN ('active','conflict') LIMIT 16",
-                    tuple(ids)).fetchall()
-                subjects = [str(row["subject"]) for row in rows if str(row["subject"] or "")]
-                if not subjects:
-                    return list(candidates)
-                subject_marks = ",".join("?" for _ in subjects)
-                related = conn.execute(
-                    "SELECT memory_id FROM memory_claims WHERE subject IN (" +
-                    subject_marks + ") AND state IN ('active','conflict') "
-                    "AND memory_id NOT IN (" + placeholders + ") "
-                    "GROUP BY memory_id ORDER BY MAX(confidence) DESC LIMIT 8",
-                    tuple(subjects) + tuple(ids)).fetchall()
+                claim_rows = conn.execute(
+                    "SELECT memory_id, subject, confidence FROM memory_claims "
+                    "WHERE scope=? AND memory_id IN (" + placeholders + ") "
+                    "AND state IN ('active','conflict') LIMIT 32",
+                    (scope_text, *ids)).fetchall()
+                for row in claim_rows:
+                    subj = str(row["subject"] or "")
+                    mid = str(row["memory_id"] or "")
+                    if not subj:
+                        continue
+                    conf = max(0.1, float(row["confidence"] or 0.5))
+                    subject_weights[subj] = subject_weights.get(subj, 0.0) + seed_scores.get(mid, 0.0) * conf
+
+                if subject_weights:
+                    top_subjects = sorted(subject_weights, key=subject_weights.get, reverse=True)[:16]
+                    subject_marks = ",".join("?" for _ in top_subjects)
+                    related_claims = conn.execute(
+                        "SELECT memory_id, subject, MAX(confidence) AS conf "
+                        "FROM memory_claims WHERE scope=? AND subject IN (" + subject_marks + ") "
+                        "AND state IN ('active','conflict') "
+                        "AND memory_id NOT IN (" + placeholders + ") "
+                        "GROUP BY memory_id, subject ORDER BY conf DESC LIMIT 32",
+                        (scope_text, *top_subjects, *ids)).fetchall()
+                    for row in related_claims:
+                        mid = str(row["memory_id"] or "")
+                        subj = str(row["subject"] or "")
+                        conf = max(0.1, float(row["conf"] or 0.5))
+                        ppr_scores[mid] = ppr_scores.get(mid, 0.0) + 0.55 * subject_weights.get(subj, 0.0) * conf
+                        ppr_edges[mid] = ppr_edges.get(mid, 0) + 1
+
+                # 同 scope 因果边 1-hop 扩散（parent <-> child，带双时态边窗口检查）
+                ref_time = as_of or datetime.now(timezone.utc).isoformat()
+                rel_rows = conn.execute(
+                    "SELECT parent_memory_id, child_memory_id, confidence, relation_type "
+                    "FROM memory_relations WHERE (parent_memory_id IN (" + placeholders + ") "
+                    "OR child_memory_id IN (" + placeholders + ")) "
+                    "AND (valid_from='' OR valid_from<=?) "
+                    "AND (valid_until='' OR valid_until>?) LIMIT 32",
+                    tuple(ids) + tuple(ids) + (ref_time, ref_time)).fetchall()
+                id_set = set(ids)
+                for row in rel_rows:
+                    p = str(row["parent_memory_id"] or "")
+                    c = str(row["child_memory_id"] or "")
+                    conf = max(0.1, float(row["confidence"] or 0.5))
+                    rtype = str(row["relation_type"] or "related_to")
+                    rw = 1.0 if rtype in ("supersedes", "caused_by", "related_to") else 0.75
+                    if p in id_set and c not in id_set:
+                        ppr_scores[c] = ppr_scores.get(c, 0.0) + 0.45 * seed_scores.get(p, 0.0) * conf * rw
+                        ppr_edges[c] = ppr_edges.get(c, 0) + 1
+                    elif c in id_set and p not in id_set:
+                        ppr_scores[p] = ppr_scores.get(p, 0.0) + 0.45 * seed_scores.get(c, 0.0) * conf * rw
+                        ppr_edges[p] = ppr_edges.get(p, 0) + 1
+                # 2-hop 因果边扩散（从 1-hop 关联节点再扩散 1 跳）
+                hop1_ids = sorted(
+                    (mid for mid in ppr_scores if mid not in id_set),
+                    key=lambda mid: ppr_scores[mid],
+                    reverse=True,
+                )[:8]
+                if hop1_ids:
+                    h1_marks = ",".join("?" for _ in hop1_ids)
+                    h1_set = set(hop1_ids)
+                    hop2_rows = conn.execute(
+                        "SELECT parent_memory_id, child_memory_id, confidence, relation_type "
+                        "FROM memory_relations WHERE (parent_memory_id IN (" + h1_marks + ") "
+                        "OR child_memory_id IN (" + h1_marks + ")) "
+                        "AND (valid_from='' OR valid_from<=?) "
+                        "AND (valid_until='' OR valid_until>?) LIMIT 32",
+                        tuple(hop1_ids) + tuple(hop1_ids) + (ref_time, ref_time)).fetchall()
+                    for row in hop2_rows:
+                        p = str(row["parent_memory_id"] or "")
+                        c = str(row["child_memory_id"] or "")
+                        conf = max(0.1, float(row["confidence"] or 0.5))
+                        rtype = str(row["relation_type"] or "related_to")
+                        rw = 1.0 if rtype in ("supersedes", "caused_by", "related_to") else 0.75
+                        if p in h1_set and c not in id_set and c not in h1_set:
+                            ppr_scores[c] = ppr_scores.get(c, 0.0) + 0.35 * ppr_scores[p] * conf * rw
+                            ppr_edges[c] = ppr_edges.get(c, 0) + 1
+                        elif c in h1_set and p not in id_set and p not in h1_set:
+                            ppr_scores[p] = ppr_scores.get(p, 0.0) + 0.35 * ppr_scores[c] * conf * rw
+                            ppr_edges[p] = ppr_edges.get(p, 0) + 1
         except Exception:
             return list(candidates)
+
+        if not ppr_scores:
+            return list(candidates)
+        ranked_related = sorted(ppr_scores.items(), key=lambda kv: kv[1], reverse=True)[:8]
+        max_ppr = max((s for _m, s in ranked_related), default=1.0) or 1.0
         seen = set(ids)
         output = list(candidates)
-        for row in related:
-            memory_id = str(row["memory_id"])
+        req_agents = set(options.source_agents)
+        req_roles = set(options.roles)
+        for memory_id, raw_ppr in ranked_related:
             if memory_id in seen:
                 continue
             memory = self.ledger.get_memory(memory_id)
-            if not memory or memory.get("lifecycle") != "active" or memory.get("quality_state") != "accepted":
+            if not memory:
                 continue
-            memory["score"] = 0.35
-            memory["score_parts"] = {"association": 0.35}
+            # 严格校验全部策略边界，绝不跨 scope / raw_chat / require_evidence 泄漏
+            if str(memory.get("scope") or "shared") != scope_text:
+                continue
+            if not options.raw_chat and int(memory.get("raw_chat", 0) or 0):
+                continue
+            if options.require_evidence and not (memory.get("evidence") or []):
+                continue
+            if project and str(memory.get("project") or "") != project:
+                continue
+            if task_id and str(memory.get("task_id") or "") != task_id:
+                continue
+            if req_agents and str(memory.get("source_agent") or "") not in req_agents:
+                continue
+            if req_roles and str(memory.get("role") or "") not in req_roles:
+                continue
+            if not _visible_at_as_of(memory, as_of):
+                continue
+            norm_ppr = min(1.0, raw_ppr / max_ppr)
+            assoc_score = round(min(0.48, 0.30 + 0.18 * norm_ppr), 4)
+            memory["score"] = assoc_score
+            memory["score_parts"] = {"association": assoc_score}
+            if ppr_edges.get(memory_id, 0) >= 2 and norm_ppr >= 0.75:
+                memory["_assoc_verified"] = True
             output.append(memory)
             seen.add(memory_id)
         return output
@@ -879,12 +1160,21 @@ class ContextPackBuilder:
 
     def _compact_item(self, group: Sequence[Mapping[str, Any]], budget: int,
                       seen_values: Optional[set] = None,
-                      state_fraction: float = 0.64) -> Tuple[Dict[str, Any], str, List[str], Dict[str, Any]]:
+                      state_fraction: float = 0.64,
+                      workspace_cwd: str = "") -> Tuple[Dict[str, Any], str, List[str], Dict[str, Any]]:
         freshest = sorted(group, key=_record_rank, reverse=True)
         if not freshest or budget <= 0:
             return {}, "", [], {"budget": budget, "latest": {}}
         task = str(freshest[0].get("task_id", "")).strip() or "未标注任务"
         fields = self._field_entries(group)
+        stale_file_note = ""
+        if workspace_cwd and fields.get("related_files"):
+            checked, missing = self._check_workspace_files(
+                workspace_cwd, [val for val, _rec in fields["related_files"]]
+            )
+            if checked > 0 and missing == checked:
+                if not any(str(r.get("kind") or "") == "decision" for r in freshest[:3]):
+                    stale_file_note = " [工作区路径已变更]"
         seen_values = seen_values if seen_values is not None else set()
         item: Dict[str, Any] = {"task": task}
         lines: List[str] = []
@@ -896,7 +1186,8 @@ class ContextPackBuilder:
         # The task anchor is part of the handoff contract. Reserve it before
         # state/background fields so a tiny transport budget cannot erase the
         # identity of the work being continued.
-        header = self._trim("任务：" + task, min(remaining, 128))
+        header_text = ("任务：" + task + stale_file_note)
+        header = self._trim(header_text, min(remaining, 148))
         if header:
             lines.append(header)
             remaining -= len(header) + 1
@@ -1007,7 +1298,13 @@ class ContextPackBuilder:
             rendered = "；".join(entry["ref"] for entry in evidence)
             text = self._trim(rendered, max(0, remaining - len(prefix) - 1))
             if text:
-                item["evidence"] = [entry for entry in evidence if entry["ref"] in text]
+                raw_no_dots = text[:-3] if text.endswith("...") else text
+                kept_ev = [
+                    entry for entry in evidence
+                    if entry["ref"] in text
+                    or (raw_no_dots and entry["ref"].startswith(raw_no_dots))
+                ]
+                item["evidence"] = kept_ev or evidence[:1]
                 lines.append(prefix + text)
                 remaining -= len(prefix) + len(text) + 1
                 for entry in item["evidence"]:
@@ -1022,43 +1319,246 @@ class ContextPackBuilder:
             "state_reservation": state_budget,
         }
 
+    @staticmethod
+    def _card_already_in_text(card: Mapping[str, Any], lowered_text: str) -> bool:
+        current = _fact_card_current_text(card.get("current_value"))
+        if not current:
+            return False
+        needle = current.lower()
+        if len(needle) >= 4:
+            if needle.isascii():
+                return re.search(r"(?<![0-9a-z_])" + re.escape(needle) + r"(?![0-9a-z_])",
+                                 lowered_text) is not None
+            return needle in lowered_text
+        # 极短值（如 1/0/on/v1）只在同文本出现对应 subject 或 slot_key 时才算已存在，
+        # 避免因日期/编号碰巧包含 "1" 或 "on" 而误杀事实卡。
+        subj = str(card.get("subject") or "").lower()
+        slot = str(card.get("slot_key") or "").lower()
+        has_anchor = (subj and subj in lowered_text) or (slot and slot in lowered_text)
+        if not has_anchor:
+            return False
+        return re.search(r"(?<![0-9a-z_])" + re.escape(needle) + r"(?![0-9a-z_])",
+                         lowered_text) is not None
+
+    def _inject_fact_cards(self, rendered_text: str,
+                           touched_ids: Sequence[str],
+                           options: ContextPackOptions,
+                           as_of_iso: str) -> Tuple[str, Dict[str, Any]]:
+        """把实际渲染命中的记忆当前事实卡前置到 pack 文本（WP-Q + token 预算守卫）。"""
+        memory_ids: List[str] = []
+        seen = set()
+        for mid in touched_ids:
+            value = str(mid or "")
+            if value and value not in seen:
+                seen.add(value)
+                memory_ids.append(value)
+        meta: Dict[str, Any] = {"text": "", "count": 0,
+                                "skipped_duplicates": 0, "chars": 0}
+        if not memory_ids:
+            return rendered_text, meta
+        cards = build_fact_cards(self.ledger, scope=options.scope,
+                                 memory_ids=memory_ids, as_of=as_of_iso,
+                                 history_limit=2)
+        lowered = rendered_text.lower()
+        kept: List[Dict[str, Any]] = []
+        skipped = 0
+        for card in cards:
+            if self._card_already_in_text(card, lowered):
+                skipped += 1
+                continue
+            kept.append(card)
+        meta["skipped_duplicates"] = skipped
+        if not kept:
+            return rendered_text, meta
+        label = "当前事实卡："
+        remaining = (int(options.max_chars) - len(rendered_text)
+                     - len(label) - 1)
+        budget = min(int(options.max_fact_card_chars), max(0, remaining))
+        # 同时受 max_tokens 限制：避免注入卡片导致 pack 总 token 突破预算。
+        remaining_tokens = int(options.max_tokens) - estimate_tokens(rendered_text) - 1
+        if remaining_tokens <= estimate_tokens(label) or budget <= len(label):
+            return rendered_text, meta
+        card_text = render_fact_cards(kept, max_chars=budget - len(label))
+        if not card_text:
+            return rendered_text, meta
+        block = label + card_text
+        if estimate_tokens(block) > remaining_tokens:
+            # 逐步缩小字符上限直到同时满足 max_tokens。
+            shrunk = trim_to_token_budget(card_text, max_chars=budget - len(label),
+                                          max_tokens=max(0, remaining_tokens - estimate_tokens(label)))
+            card_text = shrunk.rstrip(". ")
+            if not card_text:
+                return rendered_text, meta
+            block = label + card_text
+        final_text = block + "\n" + rendered_text
+        if len(final_text) > options.max_chars:
+            available = max(0, int(options.max_chars) - len(rendered_text) - 1)
+            block = block[:available]
+            if not block:
+                return rendered_text, meta
+            final_text = block + "\n" + rendered_text
+        rendered_lines = [line for line in card_text.split("\n")
+                          if line and not line.startswith("…")]
+        meta.update({
+            "text": block[len(label):] if block.startswith(label) else block,
+            "count": len(rendered_lines),
+            "chars": len(block),
+        })
+        return final_text, meta
+
+    def _pinned_playbook(self, options: ContextPackOptions, project: str,
+                         as_of_iso: str, exclude_ids: Sequence[str] = ()
+                         ) -> Tuple[List[Dict[str, Any]], str, List[str]]:
+        """Letta Core Memory 对齐：提取当前 scope/project 下已置顶的常驻规范。"""
+        if not options.include_pinned:
+            return [], "", []
+        ref_time = as_of_iso or datetime.now(timezone.utc).isoformat()
+        clauses = [
+            fts_indexed_predicate("m"),
+            "m.pinned=1",
+            "m.scope=?",
+            "(m.valid_from='' OR m.valid_from<=?)",
+            "(m.valid_until='' OR m.valid_until>?)",
+        ]
+        params: List[Any] = [options.scope, ref_time, ref_time]
+        if not options.raw_chat:
+            clauses.append("m.raw_chat=0")
+        if options.require_evidence:
+            clauses.append("m.evidence_json!='[]'")
+        if project:
+            clauses.append("(m.project='' OR m.project=?)")
+            params.append(project)
+        try:
+            with self.ledger._reading() as conn:
+                rows = conn.execute(
+                    "SELECT m.memory_id, m.kind, m.content, m.project, m.task_id, "
+                    "m.source_agent, m.evidence_json, m.updated_at "
+                    "FROM memories m WHERE " + " AND ".join(clauses) + " "
+                    "ORDER BY m.importance DESC, m.confidence DESC, m.updated_at DESC LIMIT 6",
+                    tuple(params),
+                ).fetchall()
+        except Exception:
+            return [], "", []
+        seen = set(exclude_ids)
+        lines: List[str] = []
+        items: List[Dict[str, Any]] = []
+        ids: List[str] = []
+        for row in rows:
+            mid = str(row["memory_id"] or "")
+            if not mid or mid in seen:
+                continue
+            text = " ".join(str(row["content"] or "").split()).strip()
+            if not text:
+                continue
+            seen.add(mid)
+            ids.append(mid)
+            snippet = self._trim(text, 220)
+            lines.append("- " + snippet)
+            items.append({
+                "memory_id": mid,
+                "kind": str(row["kind"] or "fact"),
+                "task_id": str(row["task_id"] or ""),
+                "project": str(row["project"] or ""),
+                "summary": snippet,
+                "pinned": True,
+            })
+            if len(lines) >= 4:
+                break
+        if not lines:
+            return [], "", []
+        block = "[核心置顶]\n" + "\n".join(lines)
+        return items, block, ids
+
     def build(self, query: str, options: Optional[ContextPackOptions] = None) -> Dict[str, Any]:
         options = (options or ContextPackOptions()).normalise()
-        query = str(query or "").strip()[:4_000]
+        original_query = str(query or "").strip()[:4_000]
+        as_of_iso = _timestamp(options.as_of) if options.as_of else ""
+        # -- WP-M：会话感知 follow-up 锚定 ---------------------------------
+        # 普通查询（is_followup=False）不产生任何额外查询：anchor 恒为 None，
+        # 检索调用与输出和改造前逐字节相同（缓存键新增字段只影响键，不影响
+        # 结果）。历史切片（as_of）不做锚定：锚点来自「现在」的会话，
+        # 把它注入点时间查询会破坏历史语义。
+        anchor: Optional[Dict[str, Any]] = None
+        anchor_followup = (bool(options.query_context) and query_context.enabled()
+                           and not as_of_iso
+                           and query_context.is_followup(original_query))
+        anchor_debug: Dict[str, Any] = {}
+        if anchor_followup:
+            anchor = query_context.anchor_context(
+                self.ledger, original_query, scope=options.scope,
+                session_id=options.session_id,
+                scopes=list(options.anchor_scopes) if options.anchor_scopes else None)
+            if anchor is None:
+                anchor_debug = {"applied": False, "reason": "no_anchor",
+                                "source_memory_ids": [], "anchor_chars": 0,
+                                "guard_dropped": 0}
+            else:
+                anchor_debug = {
+                    "applied": True, "reason": "followup",
+                    "source_memory_ids": list(anchor["source_memory_ids"]),
+                    "anchor_chars": len(anchor["anchor_text"]),
+                    "guard_dropped": 0,
+                }
+        search_query = str(anchor["query"]) if anchor is not None else original_query
         # 时间短语解析（提前于缓存键）：「昨天/上周/最近N天」→ from/to 约束。
-        # 仅在调用方未显式给时间、也没有来源过滤时生效。
+        # as_of 存在时以 as_of 作为参考时刻，避免「as_of=去年 + 昨天」相互冲突。
         eff_from = options.from_time
         eff_to = options.to_time
         temporal_applied = False
         if not eff_from and not eff_to and not options.source_agents:
-            parsed_from, parsed_to = parse_temporal_expression(query)
+            ref_dt = None
+            if as_of_iso:
+                try:
+                    ref_dt = datetime.fromisoformat(as_of_iso.replace("Z", "+00:00"))
+                    if ref_dt.tzinfo is None:
+                        ref_dt = ref_dt.replace(tzinfo=timezone.utc)
+                except ValueError:
+                    ref_dt = None
+            parsed_from, parsed_to = parse_temporal_expression(original_query, now=ref_dt)
             if parsed_from or parsed_to:
                 eff_from, eff_to = parsed_from, parsed_to
                 temporal_applied = True
-        cache_key = (self.ledger.generation, query, options.max_items, options.max_chars, options.max_tokens,
+        cache_key = (self.ledger.generation, original_query, options.max_items, options.max_chars, options.max_tokens,
                      options.raw_chat, options.require_evidence, options.scope, options.project,
                      options.task_id, tuple(options.source_agents), tuple(options.roles),
                      options.from_time, options.to_time, eff_from, eff_to,
                      options.as_of,
                      options.debug, options.state_fraction,
                      options.max_block_chars,
-                     # 折叠/混合重排开关必须进缓存键：否则同一 query 在两种配置
-                     # 之间切换时会命中上一次的缓存包，A/B 对比直接失真
-                     # （实测会把 fold=False 的结果当成 fold=True 返回）。
                      options.fold_duplicates, options.hybrid_rerank, options.min_score,
-                     id(self.embedder) if self.embedder is not None else None)
+                     id(self.embedder) if self.embedder is not None else None,
+                     id(self.vector_index) if self.vector_index is not None else None,
+                     id(self.entity_index) if self.entity_index is not None else None,
+                     query_expansion.enabled(),
+                     bool(options.record_touch), tuple(options.anchor_scopes),
+                     options.workspace_cwd,
+                     options.session_id, bool(options.query_context),
+                     query_context.anchor_digest(anchor["anchor_text"])
+                     if anchor is not None else "",
+                     bool(options.fact_cards), int(options.max_fact_card_chars),
+                     bool(options.include_pinned))
         cached = self._cached(cache_key)
         if cached is not None:
             return cached
-        entities = parse_entities(query)
+        entities = parse_entities(original_query)
         task_id = options.task_id or (entities["task_ids"][0] if entities["task_ids"] else "")
         project = options.project or (entities["projects"][0] if entities["projects"] else "")
+        anchor_entities = (parse_entities(anchor["anchor_text"]) if anchor is not None
+                           else {"task_ids": [], "projects": [], "keywords": []})
+        # 实体解析优先原 query；原 query 没有任何任务/项目线索、且调用方没有
+        # 显式过滤时，才用锚点文本兜底（例如「继续」本身不含任何实体）。
+        if anchor is not None and not (task_id or project or options.source_agents
+                                       or eff_from or eff_to):
+            if not task_id and anchor_entities["task_ids"]:
+                task_id = anchor_entities["task_ids"][0]
+            if not project and anchor_entities["projects"]:
+                project = anchor_entities["projects"][0]
         # 任务/项目过滤已足够收窄时撤销时间短语叠加，避免过度收窄。
         if temporal_applied and (task_id or project):
             eff_from, eff_to = options.from_time, options.to_time
             temporal_applied = False
         explicit_filter = bool(task_id or project or options.source_agents or eff_from or eff_to)
-        if not query and not explicit_filter:
+        if not original_query and not explicit_filter:
             pack: Dict[str, Any] = {"items": [], "text": "未找到有证据且相关的记忆。"}
             if options.debug:
                 pack["debug"] = {"entities": entities, "candidates": [], "filtered": [],
@@ -1067,55 +1567,109 @@ class ContextPackBuilder:
                                                  "require_evidence": options.require_evidence,
                                                  "reason": "缺少查询关键词或结构化过滤"}}
             return self._remember(cache_key, pack)
+        query_keywords = entities["keywords"][:12]
+        if anchor is not None and not query_keywords:
+            # 纯延续（「继续」）自身没有关键词，分组选择用锚点关键词兜底。
+            query_keywords = anchor_entities["keywords"][:12]
         # 候选取数深度：max_items*12（下限 48）在"内容不重复"的语料上够用，但在
         # 线上那种 95% 冗余的分布上会把候选池整个烧在重复行上。实测（10 个不同
         # 事实 × 30 份重复副本）：limit=48 → 只 2 条不同内容；limit=96 → 4 条；
         # limit=240 → 8 条。也就是说固定深度 96 连"8 个不同结论"都凑不齐。
         # 折叠生效时按需加深取数，直到"折叠后不同候选数 ≥ max_items"或触顶。
         initial_limit = max(options.max_items * 12, 48)
-        # When hybrid rerank is on, the embedder is applied once to the final
-        # candidate set instead of to every row during scoring.  Scoring with
-        # the vector channel cost ~800ms extra per pack on the production
-        # ledger (past DSH's 700ms injection timeout) and did not change the
-        # labelled recall; the rerank stage is where it actually helps.
-        candidates = self.ledger.search(
-            query, scope=options.scope, task_id=task_id, project=project,
-            source_agents=options.source_agents, roles=options.roles,
-            from_time=eff_from, to_time=eff_to,
-            include_raw_chat=options.raw_chat, require_evidence=options.require_evidence,
-            limit=initial_limit,
-            embedder=None if options.hybrid_rerank else self.embedder,
-            as_of=options.as_of,
-            vector_index=self.vector_index,
-        )
-        # Resolve shared task titles before grouping. This is intentionally a
-        # second, narrow query: it prevents host-specific directory hints or
-        # hot unrelated summaries from changing a handoff's task workspace.
-        task_anchor_allowed = not (options.source_agents or project or eff_from or eff_to)
-        task_anchor = "" if task_id or not task_anchor_allowed else self._resolve_task_anchor(candidates)
-        if task_anchor:
-            task_id = task_anchor
-            explicit_filter = True
-            candidates = self.ledger.search(
-                query, scope=options.scope, task_id=task_id, project=project,
+
+        def _retrieve(search_text: str, task_filter: str,
+                      project_filter: str) -> Tuple[List[Mapping[str, Any]], str]:
+            """一次完整的有界候选获取：主检索 + task 锚点重检索 + 加深 + 关联。"""
+            # When hybrid rerank is on, the embedder is applied once to the final
+            # candidate set instead of to every row during scoring.  Scoring with
+            # the vector channel cost ~800ms extra per pack on the production
+            # ledger (past DSH's 700ms injection timeout) and did not change the
+            # labelled recall; the rerank stage is where it actually helps.
+            found = self.ledger.search(
+                search_text, scope=options.scope, task_id=task_filter, project=project_filter,
                 source_agents=options.source_agents, roles=options.roles,
                 from_time=eff_from, to_time=eff_to,
                 include_raw_chat=options.raw_chat, require_evidence=options.require_evidence,
-                limit=initial_limit, as_of=options.as_of,
+                limit=initial_limit,
+                embedder=None if options.hybrid_rerank else self.embedder,
+                as_of=options.as_of,
                 vector_index=self.vector_index,
+                entity_index=self.entity_index,
             )
-        # 自适应加深：重复密度高时增加取数深度，直到折叠后凑够不同候选。
-        if options.fold_duplicates and candidates:
-            candidates = self._deepen_until_distinct(
-                query, candidates, options, task_id=task_id, project=project,
-                eff_from=eff_from, eff_to=eff_to, initial_limit=initial_limit,
-                use_embedder=bool(task_anchor),
-            )
-        if candidates:
-            candidates = self._associative_candidates(candidates, options)
+            # Resolve shared task titles before grouping. This is intentionally a
+            # second, narrow query: it prevents host-specific directory hints or
+            # hot unrelated summaries from changing a handoff's task workspace.
+            task_anchor_value = ""
+            task_anchor_allowed = not (options.source_agents or project_filter
+                                       or eff_from or eff_to)
+            if not task_filter and task_anchor_allowed:
+                task_anchor_value = self._resolve_task_anchor(found)
+            if task_anchor_value:
+                found = self.ledger.search(
+                    search_text, scope=options.scope, task_id=task_anchor_value,
+                    project=project_filter,
+                    source_agents=options.source_agents, roles=options.roles,
+                    from_time=eff_from, to_time=eff_to,
+                    include_raw_chat=options.raw_chat, require_evidence=options.require_evidence,
+                    limit=initial_limit,
+                    embedder=None if options.hybrid_rerank else self.embedder,
+                    as_of=options.as_of,
+                    vector_index=self.vector_index,
+                    entity_index=self.entity_index,
+                )
+            # 自适应加深：重复密度高时增加取数深度，直到折叠后凑够不同候选。
+            if options.fold_duplicates and found:
+                found = self._deepen_until_distinct(
+                    search_text, found, options,
+                    task_id=task_anchor_value or task_filter, project=project_filter,
+                    eff_from=eff_from, eff_to=eff_to, initial_limit=initial_limit,
+                    use_embedder=(self.embedder is not None and not options.hybrid_rerank),
+                )
+            if found:
+                found = self._associative_candidates(
+                    found, options, as_of=as_of_iso,
+                    project=project_filter,
+                    task_id=task_anchor_value or task_filter)
+            return list(found), task_anchor_value
+
+        candidates, task_anchor = _retrieve(search_query, task_id, project)
+        guard_terms = (query_context.content_terms(original_query)
+                       if anchor is not None else [])
+        if anchor is not None and len(guard_terms) >= 1:
+            # original-overlap 守卫：「再优化 GUI」这类有内容词的短查询，锚点
+            # 只允许扩展检索面，不能替换原查询语义。候选必须至少命中一个原
+            # 查询词；整池都不命中说明锚点跑到了无关任务上，直接丢弃锚点、
+            # 用原查询重跑（宁可不救，也不能注入无关记忆）。
+            kept = [candidate for candidate in candidates
+                    if query_context.original_overlap(candidate, original_query)]
+            anchor_debug["guard_dropped"] = len(candidates) - len(kept)
+            if kept:
+                candidates = kept
+            else:
+                anchor_debug["applied"] = False
+                anchor_debug["reason"] = "guard_empty_fallback"
+                anchor = None
+                search_query = original_query
+                task_id = options.task_id or (
+                    entities["task_ids"][0] if entities["task_ids"] else "")
+                project = options.project or (
+                    entities["projects"][0] if entities["projects"] else "")
+                if temporal_applied and (task_id or project):
+                    eff_from, eff_to = options.from_time, options.to_time
+                    temporal_applied = False
+                candidates, task_anchor = _retrieve(search_query, task_id, project)
+
+        vec_sims = sorted(
+            float((c.get("score_parts") or {}).get("vec_sim",
+                  (c.get("score_parts") or {}).get("vec", 0.0)) or 0.0)
+            for c in candidates if isinstance(c.get("score_parts"), Mapping)
+        )
+        vec_median = vec_sims[len(vec_sims) // 2] if vec_sims else 0.0
         if options.min_score > 0 and candidates:
             candidates = [candidate for candidate in candidates
-                          if _passes_relevance_gate(candidate, options.min_score)]
+                          if _passes_relevance_gate(candidate, options.min_score,
+                                                    vec_median=vec_median)]
         candidate_debug = [{
             "memory_id": str(candidate.get("memory_id", "")),
             "kind": str(candidate.get("kind", "")),
@@ -1138,7 +1692,7 @@ class ContextPackBuilder:
             candidates, fold_notes, fold_stats = self._fold_duplicate_candidates(candidates)
         hybrid_stats: Dict[str, Any] = {"applied": False}
         if options.hybrid_rerank and self.embedder is not None and candidates:
-            reranked = self._hybrid_reranker().rank(query, candidates)
+            reranked = self._hybrid_reranker().rank(search_query, candidates)
             hybrid_stats = {"applied": True, "before": len(candidates),
                             "after": len(reranked),
                             "weights": self._hybrid_reranker().weights.as_dict(),
@@ -1151,7 +1705,7 @@ class ContextPackBuilder:
         kept_contents: List[str] = []
         kept_token_sets: List[set] = []
         for candidate in candidates:
-            if not self._reliable(candidate, explicit_filter):
+            if not self._reliable(candidate, explicit_filter, vec_median=vec_median):
                 filtered.append({"memory_id": candidate["memory_id"],
                                  "reason": "低相关性或无可靠文本命中",
                                  "score": round(float(candidate.get("score", 0.0)), 4),
@@ -1189,8 +1743,28 @@ class ContextPackBuilder:
         # 当前任务优先：无显式任务过滤时，从候选集推断主任务并给其分组加分。
         dominant_task = self._infer_dominant_task(candidates) if not explicit_filter else ""
         selected = self._select_groups(groups, options.max_items, dominant_task=dominant_task,
-                                       query_keywords=entities["keywords"][:12])
+                                       query_keywords=query_keywords)
         if not selected:
+            if options.include_pinned:
+                pin_items, pin_block, pin_ids = self._pinned_playbook(options, project, as_of_iso)
+                if pin_block:
+                    rendered_pin = trim_to_token_budget(
+                        pin_block, max_chars=options.max_chars, max_tokens=options.max_tokens
+                    )
+                    if pin_ids and options.record_touch and not getattr(self.ledger, "read_only", False):
+                        self.ledger.touch(pin_ids)
+                    pack = {"items": pin_items, "text": rendered_pin}
+                    if options.debug:
+                        pack["debug"] = {
+                            "entities": entities, "candidates": candidate_debug,
+                            "filtered": filtered, "selected": [],
+                            "pinned_playbook": pin_ids,
+                            "constraints": {"raw_chat": options.raw_chat,
+                                            "require_evidence": options.require_evidence,
+                                            "scope": options.scope, "task_id": task_id,
+                                            "project": project},
+                        }
+                    return self._remember(cache_key, pack)
             pack: Dict[str, Any] = {"items": [], "text": "未找到有证据且相关的记忆。"}
             if options.debug:
                 reason = ("没有满足当前 scope/任务/项目/时间过滤条件的候选"
@@ -1210,6 +1784,10 @@ class ContextPackBuilder:
                                                  "require_evidence": options.require_evidence,
                                                  "scope": options.scope, "task_id": task_id,
                                                  "project": project}}
+                if anchor_followup:
+                    # WP-M：只有 follow-up 路径才写这个块；普通查询的 debug
+                    # 载荷因此与改造前逐字节相同（开启/关闭锚定都一致）。
+                    pack["debug"]["query_context"] = dict(anchor_debug)
             return self._remember(cache_key, pack)
         # A relevant task is the unit of handoff. Once its task card has won
         # the relevance/MMR pass, include its other structured evidence so a
@@ -1220,24 +1798,34 @@ class ContextPackBuilder:
             if not key.startswith("task:"):
                 expanded_selected.append((key, group))
                 continue
+            # 任务状态展开必须和主检索看到同一个时间切片：漏传 as_of 会让
+            # 历史包把 as_of 之后才登记的进度/决定一并注入，双时态在
+            # 「任务卡补充检索」这条通路上又变成假的。
             task_rows = self.ledger.search(
                 "", scope=options.scope, task_id=key[5:], project=project,
                 source_agents=options.source_agents, roles=options.roles,
                 from_time=eff_from, to_time=eff_to,
                 include_raw_chat=options.raw_chat, require_evidence=options.require_evidence,
-                limit=48, embedder=self.embedder,
+                limit=48, embedder=self.embedder, as_of=as_of_iso,
             )
             seen_ids = {str(item.get("memory_id", "")) for item in group}
             merged_group = list(group)
-            merged_group.extend(row for row in task_rows
-                                if str(row.get("memory_id", "")) not in seen_ids)
+            for row in task_rows:
+                mid = str(row.get("memory_id", ""))
+                if mid and mid not in seen_ids:
+                    seen_ids.add(mid)
+                    merged_group.append(row)
             causal_rows = self.ledger.causal_ancestors(
                 list(seen_ids), max_depth=2, limit=8, scope=options.scope,
                 require_evidence=options.require_evidence,
                 include_raw_chat=options.raw_chat,
+                as_of=as_of_iso,
             )
-            merged_group.extend(row for row in causal_rows
-                                if str(row.get("memory_id", "")) not in seen_ids)
+            for row in causal_rows:
+                mid = str(row.get("memory_id", ""))
+                if mid and mid not in seen_ids:
+                    seen_ids.add(mid)
+                    merged_group.append(row)
             expanded_selected.append((key, merged_group))
         selected = expanded_selected
         # 展开（任务补充检索/因果祖先）可能带回被裁剪的旧结论或冲突结论，再裁一次。
@@ -1270,7 +1858,8 @@ class ContextPackBuilder:
         for index, (_key, group) in enumerate(selected):
             item, block, ids, compact_debug = self._compact_item(
                 group, block_budgets[index], rendered_values,
-                state_fraction=options.state_fraction)
+                state_fraction=options.state_fraction,
+                workspace_cwd=options.workspace_cwd)
             if not block:
                 continue
             items.append(item)
@@ -1281,15 +1870,31 @@ class ContextPackBuilder:
                                    "score_parts": winner.get("score_parts", {}),
                                    "reason": "结构化过滤 + 混合评分 + MMR 多样性 + 最新状态保留",
                                    "compact": compact_debug})
-        if touched:
-            # Only memories that actually reached the model are recalled.
-            # Expanding a task to inspect its evidence must not keep every old
-            # row artificially hot forever.
-            self.ledger.touch(touched)
+        pin_items, pin_block, pin_ids = self._pinned_playbook(
+            options, project, as_of_iso, exclude_ids=touched
+        )
+        all_touched = list(touched)
+        for pid in pin_ids:
+            if pid not in all_touched:
+                all_touched.append(pid)
+        if all_touched and options.record_touch and not getattr(self.ledger, "read_only", False):
+            # Only memories that actually reached the model are recalled,
+            # and never in read-only or A/B control withholding paths.
+            self.ledger.touch(all_touched)
+        if pin_block:
+            items = list(pin_items) + items
+            text_blocks = [pin_block] + text_blocks
         rendered_text = trim_to_token_budget("\n\n".join(text_blocks),
                                              max_chars=options.max_chars,
                                              max_tokens=options.max_tokens)
+        fact_cards_meta: Optional[Dict[str, Any]] = None
+        if options.fact_cards:
+            rendered_text, fact_cards_meta = self._inject_fact_cards(
+                rendered_text, touched, options, as_of_iso)
         pack = {"items": items, "text": rendered_text}
+        if fact_cards_meta is not None:
+            # 只有 fact_cards 开启时才出现该键；关闭时 pack 字节不变。
+            pack["fact_cards"] = dict(fact_cards_meta)
         if options.debug:
             pack["debug"] = {
                 "entities": entities,
@@ -1311,6 +1916,12 @@ class ContextPackBuilder:
                                 "raw_chat": options.raw_chat, "require_evidence": options.require_evidence,
                                 "scope": options.scope, "task_id": task_id, "project": project},
             }
+            if anchor_followup:
+                # 与空包路径同一形状；anchor 生效/未生效都能从 debug 判断。
+                pack["debug"]["query_context"] = dict(anchor_debug)
+            if fact_cards_meta is not None:
+                # debug 同步一份（内容与顶层 fact_cards 相同，便于 A/B 分析）。
+                pack["debug"]["fact_cards"] = dict(fact_cards_meta)
         return self._remember(cache_key, pack)
 
 

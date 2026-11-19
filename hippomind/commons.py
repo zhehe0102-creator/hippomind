@@ -14,6 +14,7 @@ import math
 import os
 import re
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,6 +27,10 @@ MAX_SHARED_CONTENT_CHARS = 12_000
 MAX_SHARED_REFS = 64
 MAX_SHARED_TAGS = 32
 MAX_SHARED_METADATA_CHARS = 32_000
+#: 对账分桶名（顺序即报告顺序）。
+RECONCILE_BUCKETS: Sequence[str] = (
+    "missing_in_ledger", "missing_in_commons", "stale", "window_mismatch")
+DEFAULT_RECONCILE_SAMPLES = 10
 _SOURCE_REF_RE = re.compile(
     r"^[a-z][a-z0-9_-]{0,31}:[A-Za-z0-9._:-]{1,240}$", re.IGNORECASE)
 
@@ -282,6 +287,8 @@ class MemoryCommons:
         self.archive_root = self._resolve_archive(archive)
         self.chat_db = self.archive_root / "index/index.sqlite"
         self.shared_db = self.archive_root / "index/hippomind-commons.sqlite"
+        # 最近一次对账摘要（仅内存；stats() 暴露，不引入任何额外 IO）。
+        self._last_reconcile: Optional[Dict[str, object]] = None
         if not self.chat_db.exists():
             raise FileNotFoundError(f"Agent 聊天索引不存在: {self.chat_db}")
 
@@ -302,7 +309,8 @@ class MemoryCommons:
         attempted = ", ".join(str(p) for p in candidates)
         raise FileNotFoundError(f"未找到 Agent-Chat-Archive，已检查: {attempted}")
 
-    def _chat_connection(self) -> sqlite3.Connection:
+    @contextmanager
+    def _chat_connection(self):
         conn = sqlite3.connect(f"file:{self.chat_db}?mode=ro", uri=True, timeout=5.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA query_only=ON")
@@ -310,9 +318,14 @@ class MemoryCommons:
             conn.execute("PRAGMA trusted_schema=OFF")
         except sqlite3.DatabaseError:
             pass
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
-    def _shared_connection(self, write: bool = False) -> sqlite3.Connection:
+    @contextmanager
+    def _shared_connection(self, write: bool = False):
         if not write and not self.shared_db.exists():
             raise FileNotFoundError(self.shared_db)
         if write:
@@ -326,7 +339,11 @@ class MemoryCommons:
             conn.execute("PRAGMA trusted_schema=OFF")
         except sqlite3.DatabaseError:
             pass
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _shared_journal_mode(self) -> str:
         return "DELETE" if str(self.shared_db).startswith("/Volumes/") else "WAL"
@@ -384,12 +401,19 @@ class MemoryCommons:
         if self.shared_db.exists():
             with self._shared_connection() as conn:
                 shared = conn.execute("SELECT COUNT(*) FROM shared_memories").fetchone()[0]
+        last_reconcile = None
+        if isinstance(self._last_reconcile, dict):
+            last_reconcile = dict(self._last_reconcile)
+            if isinstance(last_reconcile.get("counts"), dict):
+                last_reconcile["counts"] = dict(last_reconcile["counts"])
         return {
             "archive": str(self.archive_root),
             "agents": agents,
             "messages": sum(v["messages"] for v in agents.values()),
             "sessions": sum(v["sessions"] for v in agents.values()),
             "shared_memories": shared,
+            # 仅内存摘要：本进程最近一次 compare/repair 的计数（进程重启即清空）。
+            "last_reconcile": last_reconcile,
         }
 
     def search_messages(self, query: str, limit: int = 10,
@@ -669,7 +693,7 @@ class MemoryCommons:
             if row is None:
                 return False
             utility = 0.8 * _finite_float(row["utility"], 0.0, -1.0, 1.0) + 0.2 * signal
-            success = int(row["success_count"]) + (1 if signal >= 0 else 0)
+            success = int(row["success_count"]) + (1 if signal > 0 else 0)
             failure = int(row["failure_count"]) + (1 if signal < 0 else 0)
             conn.execute(
                 "UPDATE shared_memories SET utility=?,success_count=?,failure_count=?,"
@@ -694,6 +718,26 @@ class MemoryCommons:
             )
             conn.commit()
         return cur.rowcount > 0
+
+    def compare_shared_with_ledger(self, ledger, *, scope: str = "",
+                                   sample_limit: int = DEFAULT_RECONCILE_SAMPLES
+                                   ) -> Dict[str, object]:
+        """对账并把紧凑摘要记到内存，供 stats()/看板读取（不落盘）。"""
+        report = compare_shared_with_ledger(
+            ledger, commons_db=self.shared_db, scope=scope,
+            sample_limit=sample_limit)
+        self._last_reconcile = _reconcile_summary(report, mode="compare")
+        return report
+
+    def repair_shared_with_ledger(self, ledger, *, scope: str = "",
+                                  sample_limit: int = DEFAULT_RECONCILE_SAMPLES,
+                                  dry_run: bool = False) -> Dict[str, object]:
+        """把 ledger 的窗口字段同步到 commons，并把摘要记到内存。"""
+        report = repair_shared_with_ledger(
+            ledger, commons_db=self.shared_db, scope=scope,
+            sample_limit=sample_limit, dry_run=dry_run)
+        self._last_reconcile = _reconcile_summary(report, mode="repair")
+        return report
 
     def promote_to(self, mind, hit: CommonsHit, importance: int = 5) -> int:
         """把一次真正有用的共通召回提升到当前 Agent 的活跃海马体。"""
@@ -743,6 +787,429 @@ class MemoryCommons:
                 memory_id="shared:" + _digest(source_agent, source_session, memory.rule),
             ))
         return published
+
+
+# ---------------------------------------------------------------------------
+# 双存储对账：commons shared_memories <-> ledger memories
+# ---------------------------------------------------------------------------
+# 设计契约：
+#   * 两侧以 memory_id 为唯一连接键（双存储同步必须保留该 id，否则无法对账）；
+#   * 只读默认：compare 只用 mode=ro/query_only 连接，不写任何文件；WAL 库在无
+#     sidecar 时用 immutable 快照打开，连 -shm 都不会创建；
+#   * 分桶互斥：missing_in_ledger / missing_in_commons 先按集合差判定；两侧都在
+#     时 **window_mismatch 优先于 stale** —— 窗口漂移是双存储分叉的强证据且是
+#     唯一可自动修复的桶，若与 stale 重叠它必须先出现，否则 --repair 前后计数
+#     无法收敛；
+#   * repair 只同步 superseded_by/valid_until（不删行、不改 content/updated_at），
+#     一次 BEGIN IMMEDIATE 事务完成，计划为空时根本不打开写连接 -> 重复执行幂等。
+
+def default_commons_db_path(archive: Optional[str] = None) -> Path:
+    """commons 库默认位置：显式 archive > 环境变量 > 已知归档根。"""
+    if archive:
+        return Path(archive).expanduser() / "index" / "hippomind-commons.sqlite"
+    for name in ("HIPPOMIND_COMMONS", "AGENT_ARCHIVE"):
+        configured = os.environ.get(name, "").strip()
+        if configured:
+            return Path(configured).expanduser() / "index" / "hippomind-commons.sqlite"
+    for candidate in DEFAULT_ARCHIVES:
+        if (candidate / "index").is_dir():
+            return candidate / "index" / "hippomind-commons.sqlite"
+    return DEFAULT_ARCHIVES[0] / "index" / "hippomind-commons.sqlite"
+
+
+def resolve_commons_db(commons_db=None, archive=None) -> Path:
+    """显式 commons 库优先；否则按 archive/环境变量/默认归档根解析。"""
+    if commons_db:
+        return Path(commons_db).expanduser()
+    return default_commons_db_path(archive)
+
+
+def _configure_readonly(conn: sqlite3.Connection) -> None:
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("PRAGMA busy_timeout=5000")
+    except sqlite3.DatabaseError:
+        pass
+    try:
+        conn.execute("PRAGMA trusted_schema=OFF")
+    except sqlite3.DatabaseError:
+        pass
+
+
+def _open_readonly(path: Path) -> sqlite3.Connection:
+    """只读打开；WAL 且无 sidecar 时用 immutable 快照，避免创建 -shm。"""
+    file_path = Path(path)
+    last_error: Optional[sqlite3.Error] = None
+    try:
+        conn = sqlite3.connect(file_path.absolute().as_uri() + "?mode=ro",
+                               uri=True, timeout=5.0)
+        try:
+            _configure_readonly(conn)
+            conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
+        except Exception:
+            conn.close()
+            raise
+        return conn
+    except sqlite3.OperationalError as exc:
+        last_error = exc
+    try:
+        with open(file_path, "rb") as handle:
+            header = handle.read(20)
+    except OSError:
+        raise last_error or sqlite3.OperationalError("unreadable database")
+    wal_mode = len(header) >= 20 and (header[18] == 2 or header[19] == 2)
+    sidecars = [Path(str(file_path) + suffix) for suffix in ("-wal", "-shm")]
+    if not wal_mode or any(item.exists() for item in sidecars):
+        raise last_error or sqlite3.OperationalError("unreadable database")
+    conn = sqlite3.connect(file_path.absolute().as_uri() + "?mode=ro&immutable=1",
+                           uri=True, timeout=5.0)
+    _configure_readonly(conn)
+    conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
+    return conn
+
+
+@contextmanager
+def _ledger_reader(ledger):
+    """账本读取入口：普通/只读 SQLiteLedger 用 _reading()，路径用只读连接。"""
+    reader = getattr(ledger, "_reading", None)
+    if callable(reader):
+        with reader() as conn:
+            yield conn
+        return
+    raw_path = getattr(ledger, "path", None) or ledger
+    conn = _open_readonly(Path(raw_path))
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def _store_rows(path: Path, scope: str, table: str) -> Dict[str, object]:
+    """读取一个 SQLite 表里参与对账的列（不存在时返回结构化错误，不抛）。"""
+    file_path = Path(path)
+    result: Dict[str, object] = {"exists": file_path.is_file(), "table": False,
+                                 "rows": {}, "error": "", "path": str(file_path)}
+    if not result["exists"]:
+        result["error"] = "%s 不存在" % file_path
+        return result
+    try:
+        conn = _open_readonly(file_path)
+    except (sqlite3.Error, OSError) as exc:
+        result["error"] = "%s: %s" % (type(exc).__name__, exc)
+        return result
+    try:
+        names = {str(row[0]) for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        if table not in names:
+            result["error"] = "%s 表不存在" % table
+            return result
+        result["table"] = True
+        sql = ("SELECT memory_id,scope,updated_at,superseded_by,valid_until "
+               "FROM " + table)
+        params: Sequence[object] = ()
+        scope = _short_text(scope, 128)
+        if scope:
+            sql += " WHERE scope=?"
+            params = (scope,)
+        rows: Dict[str, Dict[str, str]] = {}
+        for row in conn.execute(sql, params):
+            memory_id = _short_text(row["memory_id"], 320)
+            if not memory_id:
+                continue
+            rows[memory_id] = {
+                "scope": _short_text(row["scope"], 128),
+                "updated_at": _short_text(row["updated_at"], 64),
+                "superseded_by": _short_text(row["superseded_by"], 320),
+                "valid_until": _short_text(row["valid_until"], 64),
+            }
+        result["rows"] = rows
+        return result
+    except sqlite3.Error as exc:
+        result["error"] = "%s: %s" % (type(exc).__name__, exc)
+        return result
+    finally:
+        conn.close()
+
+
+def _ledger_rows(ledger, scope: str) -> Dict[str, object]:
+    """读取 ledger.memories 的对账列；实例与路径两种传入都支持。"""
+    raw_path = getattr(ledger, "path", None)
+    if raw_path is None and isinstance(ledger, (str, os.PathLike)):
+        raw_path = ledger
+    result: Dict[str, object] = {"exists": True, "rows": {}, "error": "",
+                                 "path": str(raw_path or "")}
+    if raw_path is not None and not Path(raw_path).is_file():
+        result["exists"] = False
+        result["error"] = "账本不存在: %s" % raw_path
+        return result
+    try:
+        with _ledger_reader(ledger) as conn:
+            names = {str(row[0]) for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            if "memories" not in names:
+                result["error"] = "memories 表不存在"
+                return result
+            sql = ("SELECT memory_id,scope,updated_at,superseded_by,valid_until "
+                   "FROM memories WHERE raw_chat=0")
+            params: Sequence[object] = ()
+            scope = _short_text(scope, 128)
+            if scope:
+                sql += " AND scope=?"
+                params = (scope,)
+            rows: Dict[str, Dict[str, str]] = {}
+            for row in conn.execute(sql, params):
+                memory_id = _short_text(row["memory_id"], 320)
+                if not memory_id:
+                    continue
+                rows[memory_id] = {
+                    "scope": _short_text(row["scope"], 128),
+                    "updated_at": _short_text(row["updated_at"], 64),
+                    "superseded_by": _short_text(row["superseded_by"], 320),
+                    "valid_until": _short_text(row["valid_until"], 64),
+                }
+            result["rows"] = rows
+        return result
+    except FileNotFoundError as exc:
+        result["exists"] = False
+        result["error"] = str(exc)
+        return result
+    except (sqlite3.Error, OSError) as exc:
+        result["error"] = "%s: %s" % (type(exc).__name__, exc)
+        return result
+
+
+def _empty_counts() -> Dict[str, int]:
+    counts: Dict[str, int] = {bucket: 0 for bucket in RECONCILE_BUCKETS}
+    counts["in_sync"] = 0
+    return counts
+
+
+def compare_shared_with_ledger(ledger, *, commons_db=None, archive=None,
+                               scope: str = "",
+                               sample_limit: int = DEFAULT_RECONCILE_SAMPLES
+                               ) -> Dict[str, object]:
+    """按 memory_id 比对 commons shared_memories 与 ledger memories。
+
+    分桶（互斥，窗口优先）：
+
+    * ``missing_in_ledger``  -- commons 有、ledger 没有；
+    * ``missing_in_commons`` -- ledger 有、commons 没有；
+    * ``window_mismatch``    -- 两侧都在但 superseded_by/valid_until 不一致
+      （唯一可由 repair 自动收敛的桶，因此优先于 stale 归类）；
+    * ``stale``              -- 两侧都在、窗口一致但 updated_at 不一致（内容/反馈
+      漂移，不是窗口漂移，repair 不碰）。
+
+    ``scope`` 为空串时比较两侧的全部行；显式 scope 时两侧都按该 scope 过滤。
+    返回计数与每桶最多 ``sample_limit`` 条样例，任何一侧缺失/损坏都返回结构化
+    报告而不是抛异常（只读审计不能因为对端不在就崩）。
+    """
+    commons_path = resolve_commons_db(commons_db, archive)
+    limit = _bounded_int(sample_limit, DEFAULT_RECONCILE_SAMPLES, 0, 100)
+    scope_text = _short_text(scope, 128)
+    commons = _store_rows(commons_path, scope_text, "shared_memories")
+    ledger_state = _ledger_rows(ledger, scope_text)
+    commons_rows: Dict[str, Dict[str, str]] = commons["rows"]  # type: ignore[assignment]
+    ledger_map: Dict[str, Dict[str, str]] = ledger_state["rows"]  # type: ignore[assignment]
+    counts = _empty_counts()
+    samples: Dict[str, List[Dict[str, object]]] = {
+        bucket: [] for bucket in RECONCILE_BUCKETS}
+
+    def add_sample(bucket: str, item: Dict[str, object]) -> None:
+        if len(samples[bucket]) < limit:
+            samples[bucket].append(item)
+
+    for memory_id in sorted(commons_rows):
+        stored = commons_rows[memory_id]
+        current = ledger_map.get(memory_id)
+        if current is None:
+            counts["missing_in_ledger"] += 1
+            add_sample("missing_in_ledger", {
+                "memory_id": memory_id,
+                "commons_updated_at": stored["updated_at"],
+                "commons_superseded_by": stored["superseded_by"],
+                "commons_valid_until": stored["valid_until"],
+            })
+            continue
+        if (stored["superseded_by"] != current["superseded_by"]
+                or stored["valid_until"] != current["valid_until"]):
+            counts["window_mismatch"] += 1
+            add_sample("window_mismatch", {
+                "memory_id": memory_id,
+                "commons_updated_at": stored["updated_at"],
+                "ledger_updated_at": current["updated_at"],
+                "commons_superseded_by": stored["superseded_by"],
+                "ledger_superseded_by": current["superseded_by"],
+                "commons_valid_until": stored["valid_until"],
+                "ledger_valid_until": current["valid_until"],
+            })
+        elif stored["updated_at"] != current["updated_at"]:
+            counts["stale"] += 1
+            add_sample("stale", {
+                "memory_id": memory_id,
+                "commons_updated_at": stored["updated_at"],
+                "ledger_updated_at": current["updated_at"],
+            })
+        else:
+            counts["in_sync"] += 1
+    for memory_id in sorted(ledger_map):
+        if memory_id in commons_rows:
+            continue
+        counts["missing_in_commons"] += 1
+        current = ledger_map[memory_id]
+        add_sample("missing_in_commons", {
+            "memory_id": memory_id,
+            "ledger_updated_at": current["updated_at"],
+            "ledger_superseded_by": current["superseded_by"],
+            "ledger_valid_until": current["valid_until"],
+        })
+    counts["drift_total"] = (counts["missing_in_ledger"]
+                             + counts["missing_in_commons"]
+                             + counts["stale"] + counts["window_mismatch"])
+    ok = (counts["drift_total"] == 0 and bool(commons["exists"])
+          and bool(ledger_state["exists"]) and not commons["error"]
+          and not ledger_state["error"])
+    return {
+        "ok": bool(ok),
+        "checked_at": _utcnow(),
+        "scope": scope_text,
+        "commons_db": str(commons_path),
+        "commons_exists": bool(commons["exists"]),
+        "commons_table": bool(commons["table"]),
+        "commons_error": str(commons["error"] or ""),
+        "ledger": str(ledger_state["path"] or ""),
+        "ledger_exists": bool(ledger_state["exists"]),
+        "ledger_error": str(ledger_state["error"] or ""),
+        "commons_rows": len(commons_rows),
+        "ledger_rows": len(ledger_map),
+        "counts": counts,
+        "samples": samples,
+        "sample_limit": limit,
+        "repairable": counts["window_mismatch"],
+    }
+
+
+def _window_repairs(commons_state, ledger_state, limit: int) -> List[Dict[str, object]]:
+    items: List[Dict[str, object]] = []
+    for memory_id in sorted(commons_state["rows"]):
+        current = ledger_state["rows"].get(memory_id)
+        if current is None:
+            continue
+        stored = commons_state["rows"][memory_id]
+        if (stored["superseded_by"] == current["superseded_by"]
+                and stored["valid_until"] == current["valid_until"]):
+            continue
+        items.append({
+            "memory_id": memory_id,
+            "old_superseded_by": stored["superseded_by"],
+            "new_superseded_by": current["superseded_by"],
+            "old_valid_until": stored["valid_until"],
+            "new_valid_until": current["valid_until"],
+        })
+    return items[:limit] if limit else items
+
+
+def repair_shared_with_ledger(ledger, *, commons_db=None, archive=None,
+                              scope: str = "",
+                              sample_limit: int = DEFAULT_RECONCILE_SAMPLES,
+                              dry_run: bool = False) -> Dict[str, object]:
+    """把 ledger 的 superseded_by/valid_until 同步到 commons（默认 dry-run）。
+
+    安全边界：只 UPDATE 这两列，不删行、不改 content/updated_at/feedback；计划为
+    空时根本不打开写连接，所以重复执行幂等，默认模式不产生任何写入。返回
+    ``before``/``after`` 两份完整对账报告、``planned``/``repaired`` 影响面与
+    ``window_resolved`` 收敛判定。
+    """
+    commons_path = resolve_commons_db(commons_db, archive)
+    limit = _bounded_int(sample_limit, DEFAULT_RECONCILE_SAMPLES, 0, 100)
+    scope_text = _short_text(scope, 128)
+    before = compare_shared_with_ledger(
+        ledger, commons_db=commons_path, scope=scope_text, sample_limit=limit)
+    error = ""
+    repairs: List[Dict[str, object]] = []
+    plan: List[Dict[str, str]] = []
+    if not before["commons_exists"]:
+        error = "commons 库不存在，未做任何写入"
+    elif not before["commons_table"]:
+        error = "commons 缺少 shared_memories 表，未做任何写入"
+    elif not before["ledger_exists"]:
+        error = "账本不存在，未做任何写入"
+    else:
+        commons_state = _store_rows(commons_path, scope_text, "shared_memories")
+        ledger_state = _ledger_rows(ledger, scope_text)
+        for memory_id in sorted(commons_state["rows"]):
+            current = ledger_state["rows"].get(memory_id)
+            if current is None:
+                continue
+            stored = commons_state["rows"][memory_id]
+            if (stored["superseded_by"] == current["superseded_by"]
+                    and stored["valid_until"] == current["valid_until"]):
+                continue
+            plan.append({"memory_id": memory_id,
+                         "superseded_by": current["superseded_by"],
+                         "valid_until": current["valid_until"]})
+        repairs = _window_repairs(commons_state, ledger_state, limit)
+    repaired = 0
+    if plan and not dry_run:
+        try:
+            conn = sqlite3.connect(str(commons_path), timeout=10.0)
+            try:
+                conn.execute("PRAGMA busy_timeout=10000")
+                conn.execute("BEGIN IMMEDIATE")
+                for item in plan:
+                    conn.execute(
+                        "UPDATE shared_memories SET superseded_by=?, valid_until=? "
+                        "WHERE memory_id=?",
+                        (item["superseded_by"], item["valid_until"],
+                         item["memory_id"]))
+                    repaired += 1
+                conn.commit()
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            error = "%s: %s" % (type(exc).__name__, exc)
+            repaired = 0
+    after = compare_shared_with_ledger(
+        ledger, commons_db=commons_path, scope=scope_text, sample_limit=limit)
+    window_resolved = after["counts"]["window_mismatch"] == 0
+    return {
+        "mode": "repair",
+        "dry_run": bool(dry_run),
+        "checked_at": _utcnow(),
+        "commons_db": str(commons_path),
+        "ledger": str(before["ledger"] or ""),
+        "before": before,
+        "planned": len(plan),
+        "repaired": repaired,
+        "repairs": repairs,
+        "after": after,
+        "error": error,
+        "ok": bool(after["ok"]),
+        "window_resolved": bool(window_resolved),
+        "changed": bool(repaired),
+    }
+
+
+def _reconcile_summary(report: Dict[str, object],
+                       mode: str = "compare") -> Dict[str, object]:
+    """内存里的最近一次对账摘要（stats 用，不写文件、不做额外 IO）。"""
+    base = report.get("after") if mode == "repair" else report
+    base = base if isinstance(base, dict) else report
+    counts = base.get("counts")
+    if not isinstance(counts, dict):
+        counts = {}
+    window = counts.get("window_mismatch", 0)
+    return {
+        "mode": mode,
+        "checked_at": str(base.get("checked_at") or report.get("checked_at") or ""),
+        "ok": bool(base.get("ok")),
+        "window_resolved": bool(report.get("window_resolved", window == 0)),
+        "repaired": int(report.get("repaired", 0) or 0),
+        "commons_db": str(base.get("commons_db") or report.get("commons_db") or ""),
+        "ledger": str(base.get("ledger") or report.get("ledger") or ""),
+        "counts": dict(counts),
+    }
+
 
 
 def build_parser() -> argparse.ArgumentParser:

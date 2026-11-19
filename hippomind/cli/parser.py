@@ -22,6 +22,7 @@ from .cmd_maintain import (
     cmd_backup, cmd_checkup, cmd_maintain, cmd_recovery_check, cmd_redact_raw, cmd_restore, cmd_scan_raw,
 )
 from .cmd_read import cmd_context, cmd_inject, cmd_sync, cmd_watch
+from .cmd_explain import cmd_explain
 from .cmd_ui import cmd_ui
 from .cmd_write import (
     cmd_conflicts, cmd_facts, cmd_feedback, cmd_forget, cmd_graph, cmd_ingest, cmd_pin, cmd_pins, cmd_resolve,
@@ -104,6 +105,8 @@ def build_parser() -> argparse.ArgumentParser:
     context.add_argument("--to-time", default="")
     context.add_argument("--as-of", default="",
                          help="双时态历史切片：按该 ISO 时间点求值 valid_from/valid_until 窗口")
+    context.add_argument("--session-id", default="",
+                         help="会话 id：follow-up（继续/同上）查询用它锚定同会话的最近任务消息")
     context.add_argument("--max-items", type=int, default=8)
     context.add_argument("--max-chars", type=int, default=DEFAULT_MAX_CHARS)
     context.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
@@ -115,6 +118,28 @@ def build_parser() -> argparse.ArgumentParser:
     context.add_argument("--text-only", action="store_true")
     context.add_argument("--offline", action="store_true")
     context.set_defaults(func=cmd_context)
+
+    explain = sub.add_parser(
+        "explain", help="解释一次 Context Pack 检索：候选/过滤/选中/为空原因/门控（离线只读）")
+    _connection_arguments(explain)
+    explain.add_argument("query", nargs="?", default="",
+                         help="查询文本（也可用 --query 给出）")
+    explain.add_argument("--query", dest="query_text", default="",
+                         help="查询文本（显式形式，与位置参数二选一）")
+    explain.add_argument("--scope", default="shared")
+    explain.add_argument("--project", default="")
+    explain.add_argument("--task", default="")
+    explain.add_argument("--session-id", default="",
+                         help="会话 id：与 context 一致，用于同会话 follow-up 锚定")
+    explain.add_argument("--max-items", type=int, default=8)
+    explain.add_argument("--min-score", type=float, default=0.20,
+                         help="自动注入门控阈值（与 /context-pack、auto_context 默认一致：0.20）")
+    explain.add_argument("--json", action="store_true",
+                         help="与人类输出同源的机器可读 JSON")
+    explain.add_argument("--trace", type=int, default=0, metavar="N",
+                         help="附加最近 N 条 injection_trace 记录（注入/未注入）")
+    explain.add_argument("--agent", default="", help="--trace 时的 agent 过滤")
+    explain.set_defaults(func=cmd_explain)
 
     auto_context = sub.add_parser("auto-context", help="按当前要求构建最小 Context Pack（可使用显式记忆门控）")
     _connection_arguments(auto_context)
@@ -128,6 +153,8 @@ def build_parser() -> argparse.ArgumentParser:
     auto_context.add_argument("--task", default="")
     auto_context.add_argument("--project", default="")
     auto_context.add_argument("--scope", default="shared")
+    auto_context.add_argument("--session-id", default="",
+                              help="宿主会话 id，用于 follow-up 查询的会话锚定")
     auto_context.add_argument("--max-items", type=int, default=AUTO_MAX_ITEMS)
     auto_context.add_argument("--max-chars", type=int, default=AUTO_MAX_CHARS)
     auto_context.add_argument("--trigger-mode", choices=AUTO_TRIGGER_MODES, default="always",

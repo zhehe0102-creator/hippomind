@@ -221,7 +221,7 @@ def gaussian_sim(a: List[float], b: List[float], sigma: float = 1.2) -> float:
 # ``token_sim`` is defined once in :mod:`hippomind.textutil` so the storage layer
 # no longer imports this demonstration module.  Re-exported here for the public
 # API and for backwards compatibility with existing callers and tests.
-from .textutil import token_sim  # noqa: E402  (kept next to its historical home)
+from .textutil import coerce_random_seed, token_sim  # noqa: E402
 
 
 EMOTION_MAX_DIST = math.sqrt(2.0)  # Russell 环形最大欧氏距离
@@ -355,7 +355,7 @@ class Hippocampus:
         return cfg
 
     def __init__(self, seed: Optional[int] = None, **cfg):
-        self.rng = random.Random(seed)
+        self.rng = random.Random(coerce_random_seed(seed))
         self.cfg = self._sanitize_cfg({**self.DEFAULT_CFG, **cfg})
 
         self.time = 0.0                       # 记忆系统内部时钟（秒）
@@ -636,13 +636,18 @@ class Hippocampus:
         peak = top[0][0] if top else 0.0
         for act, m in activated:
             if id(m) not in seen:
+                if getattr(m, "superseded_by", None) is not None:
+                    continue
+                valid_until = getattr(m, "valid_until", None)
+                if valid_until is not None and valid_until <= self.time:
+                    continue
                 direct = direct_scores.get(m.id, 0.0)
-                if direct <= 0:
+                if direct <= 0 and act < self.cfg.get("min_spread_act", 0.25):
                     continue
                 results.append((0.75 * direct + 0.25 * min(1.0, act) * peak, m))
                 seen.add(id(m))
         results.sort(reverse=True, key=lambda t: t[0])
-        return results[: k * 2]
+        return results[:k]
 
     def reinforce(self, memory_id: int, delta: float, note: str = "") -> None:
         """直接对某条记忆升权（delta>0）或降权（delta<0）。属于修改，会刷新 last_active。"""
@@ -959,6 +964,12 @@ class Hippocampus:
         matches = []
         for other in list(self.episodic.values()) + list(self.semantic.values()):
             if other.id == m.id:
+                continue
+            if getattr(other, "superseded_by", None) is not None:
+                continue
+            m_scope = getattr(m, "scope", None)
+            o_scope = getattr(other, "scope", None)
+            if m_scope and o_scope and m_scope != o_scope:
                 continue
             sim = self._memory_similarity(m, other)
             if sim >= th:

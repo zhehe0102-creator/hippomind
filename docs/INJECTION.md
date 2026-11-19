@@ -17,7 +17,7 @@
 
 | 来源 | 内容 | 局限 |
 | --- | --- | --- |
-| `~/Library/Application Support/HippoMind/injection.jsonl` | 每次自动注入一行：agent、来源、query 哈希、条目数、字符数、是否注入、`memory_ids` | 早期版本不写 `memory_ids`；只在真正注入时写，所以**没有"未注入"对照组** |
+| `~/Library/Application Support/HippoMind/injection.jsonl` | 每次注入决策一行：agent、来源、query 哈希、条目数、字符数、是否注入、`memory_ids`、空结果原因、延迟 | 早期版本不写 `memory_ids`。HTTP `/context-pack` 路径现在也记录 `injected=false` 的空结果/失败对照组；原生 Hook/CLI 路径仍只在真正注入时写 |
 | 账本 `memories` 表 | 注入的 memory 原文、以及同一 agent 后续的 `raw_chat=1 AND role='assistant'` 消息 | 会话采集可能停止（本次就是） |
 
 `scripts/injection_report.py` 用 **只读方式**（`mode=ro` + `PRAGMA query_only`）
@@ -112,9 +112,11 @@ token 用 `textutil.tokenize_multilingual`（拉丁词 + CJK 单字/双字）。
 
 ### 4.1 做不了的
 
-生产 Hook **只在真正注入时写 trace**。所以"同一批查询有注入 vs 无注入"
-这种自然实验**通常根本构造不出来**——没有"未注入"的记录可对照。
-报告里的 `control.mode = "none"` 就是如实说这件事，而不是硬凑一个对照。
+原生 Hook 仍只在真正注入时写 trace，但 HTTP `/context-pack` 服务端路径现在
+会同时记录 `injected=false` 的空结果与失败（含 `empty_reason`/`latency_ms`），
+因此服务端调用方向已经能构造“同一查询有注入 vs 空结果”的对照。
+报告里的 `control.mode = "none"` 表示当次数据里对照不足，而不是硬凑一个对照；
+原生 Hook 方向仍如实记为 `none`。
 
 ### 4.2 退一步做的
 
@@ -314,4 +316,112 @@ print(result["sampled"], result["verdict"]["code"])
 - `hippomind/injection_quality.py` — 指标、对照、样本账、只读账本视图
 - `scripts/injection_report.py` — 分层报告 CLI
 - `tests/test_injection_quality.py` — 44 条纯离线测试（fake ledger + fake embedder + 合成游标）
-- `docs/AUTOMATIC_MEMORY.md` §3 — 注入链路与 trace 字段
+- `docs/AUTOMATIC_MEMORY.md` §3 — 注入链路与 trace 字段## 11. 随机分组对照（claude hook，2026-10-25）
+
+### 11.1 为什么必须做这件事
+
+第 9 节列了五条因果边界，最后一条是决定性的：**trace 只在注入成功时写**，
+所以"没注入"的那一半根本不存在，任何比较都只能事后拼凑。§8.4 的下一步写的是
+"换数据源"，本节就是那一步的落地。
+
+Claude 是本机唯一每天都有真实回复的 agent，但它历史上只有 rules + mcp 两个
+**被动**面（拉取式），从来没有被注入过。现在它有了
+`hippomind.claude_hook`（UserPromptSubmit，push 式）。
+
+### 11.2 匹配对照，不是"不检索"
+
+这是本节唯一重要的设计决定：
+
+> **两臂都检索，两臂都记录"本会注入什么"，只有投递与否不同。**
+
+一个跳过检索的对照组不知道它跳过了什么，于是两臂只能在不同查询上比较——
+那正是这次改造要取代的观察性比较。检索是一次本地 SQLite 查询（几十毫秒），
+投递后的模型调用是秒级；多付一次检索换一个**匹配对**是整件事的意义所在。
+
+对照组写 `injected: false`、`items: 0`、`chars: 0`，但 `memory_ids` 保留，
+`arm: "control"`。
+
+### 11.3 分流是确定性的
+
+```
+arm = CONTROL if sha256(agent, query, UTC日期) / 2**64 < rate else TREATMENT
+```
+
+- **确定性**：同一个 (agent, 查询, 日期) 永远落到同一臂，可重放、可审计。
+- **日内稳定**：同一句话当天问两次不会一会儿有记忆一会儿没有——那会被当成 bug，
+  比少一次注入更伤信任。
+- **按天滚动**：每天重新分桶，所以同一句每天问的话最终会落到两臂，这才让
+  "同一查询的组内比较"成为可能。
+- **默认关闭**：`HIPPOMIND_INJECTION_AB` 只有显式 on 值（1/on/true/yes）才生效，
+  其余一律全部注入，行为与改造前逐字节相同。开关关闭时连哈希都不算。
+
+### 11.4 样本量：先把话说在前面
+
+默认对照率 0.20。一天 20 条 prompt 只有约 4 条对照 trace，而
+`injection_quality.MIN_SAMPLES` 是 30。`injection_ab.explain()` 直接把这份
+算术打出来：
+
+```
+prompts_needed_for_min_samples = 30 / rate
+```
+
+写这个函数的理由很实际：否则报告会连续几个月说"证据不足"，却不说为什么、
+也不说还要多久。**"证据不足"必须是可以算出还差多少的。**
+
+### 11.5 报告怎么读
+
+`scripts/injection_report.py` 的第 3 节：
+
+```
+3. 随机分组对照（claude hook，两臂都检索、只差投递）
+   注入臂 n=N  对照臂 n=M  （已匹配，可比较 / 单臂，不可比较）
+   注入臂引用率  x.xxx  95%CI [lo, hi]
+   对照臂引用率  x.xxx  95%CI [lo, hi]
+   差值          +x.xxx
+```
+
+判定规则（`_verdict`）：
+
+| 条件 | code | 是否成结论 |
+| --- | --- | --- |
+| 只有单臂 | `no_control` | 否 |
+| 两臂都有，但任一臂 < 30 | `insufficient_sample` | 否 |
+| 两臂都 ≥ 30，差 > 0 | `arm_positive` | 是（仍标注单账户局限） |
+| 两臂都 ≥ 30，差 ≤ 0 | `arm_no_lift` | 是 |
+
+第 4 节保留旧的**观察性**对照，只用于没有 `arm` 字段的历史 trace。
+
+### 11.6 必须承认的剩余局限
+
+1. 随机分组只解决"候选集不同"这一条，仍**不能**排除时间趋势（单账户）。
+2. 30 分钟窗口里的其他工作照样会稀释或抬高两臂——只是现在两臂被同等稀释。
+3. 用户会察觉对照组：那一轮 agent 确实没有记忆。这是实验的真实代价。
+4. 一条 trace 只有 8 个 memory id，样本单位是"一轮对话"，不是"一条记忆"。
+
+### 11.7 现在能说什么
+
+截至 2026-10-25 00:27 PDT：claude hook 已装、已跑通、已写出第一条
+`claude-hook / treatment / ab_disabled` trace。**实验尚未开启**
+（`HIPPOMIND_INJECTION_AB` 未设），所以两臂都是空的，报告如实显示
+"对照组还没有可用样本；此时任何效果结论都不成立"。
+
+开启方式：
+
+```bash
+# 用户级 env（launchd / shell 都生效）
+export HIPPOMIND_INJECTION_AB=1
+export HIPPOMIND_INJECTION_AB_RATE=0.2   # 可选，默认 0.20，上限 0.5
+```
+
+### 11.8 另一条教训：路径对 ≠ 代码在
+
+hook 装好后第一次真跑，立刻 `No module named hippomind.claude_hook`：
+命令、路径、账本全部正确，但内置盘 runtime 副本是 `rsync --delete` 同步的，
+新模块没进去。而审计当时报的是 **healthy**。
+
+现在 `injection_audit._module_missing()` 会检查命令里 `-m` 的那个模块在它声明的
+根目录下是否真的存在（纯文件系统检查，绝不 import——审计不执行目标代码）。
+缺了就报 `not_synced`。codex hook 有同样的检查，因为它有同样的失败模式。
+
+**"路径能解析"和"模块能导入"是两件事。只查前者的审计会把整类失败报成健康，
+而失败是静默的。**

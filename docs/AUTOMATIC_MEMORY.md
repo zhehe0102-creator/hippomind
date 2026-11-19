@@ -19,12 +19,12 @@ Status: **active** — 本文件是"装完就忘"的自动闭环的运维说明�
 
 | Agent | 本机来源 | 实现 | 增量状态 |
 | --- | --- | --- | --- |
-| Claude Code | `~/.claude/projects/**/*.jsonl` | `transcripts.py` | `source_cursors` 按文件偏移 |
-| Codex CLI | `~/.codex/sessions/**/*.jsonl` | `transcripts.py` | 同上 |
-| Gemini / Antigravity | `conversation_summaries.db`（2 个库） | `gemini_capture.py` | 按 `source_modified_time` 水位 |
+| Claude Code | `~/.claude/projects/**/*.jsonl` | `transcripts.py` | 游标 = 字节偏移 + **绝对行号** + session/cwd |
+| Codex CLI | `~/.codex/sessions/**/*.jsonl` | `transcripts.py` | 同上；`session_meta` 可出现在任意批次，跨批次不会丢 session/project |
+| Gemini / Antigravity | `conversation_summaries.db`（2 个库） | `gemini_capture.py` | 复合 keyset `(last_modified_time, conversation_id)`，同时间戳不会漏采 |
 | Pi / PiDeck | `~/.pi/agent/sessions/**/*.jsonl` | `pi_capture.py` | `transcript:pi:<sha1>` 偏移 + 行号 |
 | DeepSeek Harness | Cordis 插件 | `integrations/dsh-plugin/` | 会话结束按 `seq_span` 写回 |
-| Cursor | 本机未安装、无持久会话库 | **无适配器** | 见 [AGENT_CAPTURE_COVERAGE.md](AGENT_CAPTURE_COVERAGE.md) |
+| Cursor | 条件适配器：3 套本地存储栈（`cursorDiskKV` 等） | `cursor_capture.py` | 按会话 updatedAt/末条 id 增量；本机未安装时显式 `state=not_installed`，不谎报 0 条 |
 
 每轮预算：Claude/Codex `max_messages=100`；Gemini `max_rows=50`；Pi
 `max_messages=100`（每文件每轮 ≤2MB / 40 行，单条消息截断 4000 字符）。
@@ -44,7 +44,9 @@ inserted / duplicate / errors / bytes / elapsed_ms，以及 `gemini`、`pi` 子�
 
 ## 2. 自动提炼（daemon 每 5 分钟一轮）
 
-`start_distill_loop(tick_seconds=300)` 每轮调用 `DistillEngine.run(limit=16)`：
+`start_distill_loop(tick_seconds=300)` 每轮调用 `DistillEngine.run(limit=64)`
+（`HIPPOMIND_DISTILL_LIMIT` 可覆盖；批次大小仍保持 8，放大批次会静默丢条目），
+并在同一轮里跑 `SessionDigester.run(limit=2)` 做会话级摘要：
 
 - **双队列**：一半候选来自结构化投影（task/progress/decision/semantic/fact/
   preference/procedural），一半来自最新 raw chat。纯 `created_at` 排序会让 25 万
@@ -57,6 +59,11 @@ inserted / duplicate / errors / bytes / elapsed_ms，以及 `gemini`、`pi` 子�
 - **产物**：`kind=semantic`、`source_agent=hippomind-distill`、`evidence=["memory:<源>"]`、
   `metadata.source_memory_ids`、随行 claims；同一 subject 的连续提炼自动建
   `related_to` 因果边。`distill:<memory_id>` 游标保证幂等，重复轮次不会重复写。
+- **隔离**：提炼结果继承来源 raw 记忆的 scope（私有 `agent:*` 不会因为提炼就变成 `shared`），
+  并在 metadata 写入 `derived_from_raw_chat=true` / `untrusted_source=true` / `source_scope`；
+  要跨 scope 共享必须走显式提升，而不是靠默认值泄漏。
+- **摘要刷新**：会话摘要游标记录消息数与最后事件时间，会话新增消息会重新排队，
+  新摘要 `supersede` 旧摘要（旧摘要保留谱系），不再出现“摘要永久停在第一版”。
 - **收尾**：每轮结束跑 `resolve_conflicts()` + `repair_claim_states()`，让 claim
   状态与记忆的 quality/lifecycle 收敛。
 
@@ -76,6 +83,25 @@ extractor / conflicts_resolved / elapsed_ms）。
 `记忆：<问题>` 仍保留为**强制指定查询**的入口（`--trigger-mode anywhere` 语义）；
 代码块、引用行、行内代码和空标记不会触发。
 
+
+### 3.1b 短追问消歧（会话锚定）
+
+用户高频输入“继续 / 同上 / 好的，接着弄”时，单句检索没有可用的语义。
+`hippomind/query_context.py` 会把这类查询锚定到**同一会话**最近的真实用户消息
+（最多 2 条、默认 180 分钟窗口），再交给 Context Pack 检索；锚点查询只读
+`memories` 的 raw_chat=user 行，实测 p95 < 1ms，非 follow-up 请求不增加任何查询。
+
+安全边界（默认开启，逐条有测试锁定）：
+
+- 短但有自己的内容词的请求（跑测试 / 部署 / 回滚）**不锚定**；
+- 原查询含 ≥2 个内容词时，候选必须至少命中 1 个原词，否则整池丢弃并回退原查询；
+- session_id 可用时严格按会话隔离；宿主不传时才退化为同 agent + 时间窗；
+- `as_of` 历史切片从不锚定（会话窗口属于“现在”）；
+- 普通查询在开关开/关下 pack JSON 逐字节相等（含 debug 字段）。
+
+关闭方式：进程级 `HIPPOMIND_QUERY_CONTEXT=0`，或请求级 `options.query_context=false`。
+已验证效果（28 条 follow-up 评测夹具）：follow-up 类命中率 5/18 → 18/18，
+safety/normal 类 7 条锚定 0 次、pack 变化 0 条。
 ### 3.2 门控规则
 
 自动路径的 `ContextPackOptions` 固定 `max_items=8`、`max_tokens=6000`、
@@ -96,8 +122,20 @@ extractor / conflicts_resolved / elapsed_ms）。
 
 ```json
 {"at":"2026-10-24T00:16:24-0700","agent":"codex","source":"codex-hook",
- "query_hash":"9e1364431c24c7d5","query_chars":13,"items":1,"chars":629,"injected":true}
+ "query_hash":"9e1364431c24c7d5","query_chars":13,"items":1,"chars":629,"injected":true,
+ "memory_ids":["mem_..."],"latency_ms":42.1,"scope":"shared","task_id":"","empty_reason":""}
 ```
+
+只记 agent、来源、query 的 16 位哈希、条目数、字符数、是否注入、被注入的 memory_id、
+空结果原因与服务端延迟，**不存原文/正文**。HTTP `/context-pack` 路径失败或空结果时
+也会写 `injected=false`，这样“有注入 vs 未注入”才有对照组；`/stats` 的
+`injection_trace` 窗口只读文件尾部 256 KiB（`/api/v1/health` 的 injection 检查同理），
+不随 trace 增长而变慢。文件权限 0600，超过 8 MiB 轮转为 `.1`；
+`HIPPOMIND_INJECTION_TRACE=0` 可关闭。
+
+Trace 还支持按时间保留：`HIPPOMIND_TRACE_RETENTION_DAYS`（默认 30 天，0 关闭），
+每小时最多清理一次，剔除超过保留期的行（坏行/缺 at 行原样保留），
+唯一临时文件 + 原子替换并保持 0600；`.1` 轮转历史不参与清理。
 
 只记 agent、来源、query 的 16 位哈希、条目数、字符数和是否注入，**不存原文**。
 `HIPPOMIND_INJECTION_TRACE=0` 可关闭。`summary()` 被 `/api/v1/health` 的
@@ -207,16 +245,18 @@ daemon 退出。任何一环出问题先看 `/api/v1/health` 对应 check，再�
 
 ## 8. 尚未覆盖（诚实清单）
 
-- **Cursor**：本机未安装，也没有可增量读取的持久会话库，因此没有适配器；
-  证据与补齐条件见 [AGENT_CAPTURE_COVERAGE.md](AGENT_CAPTURE_COVERAGE.md)。
+- **Cursor**：本机未安装，`cursor_capture.py` 已按 3 套公开存储栈实现条件适配器
+  并用合成 fixture 验证；真实 Cursor 端到端仍未实测，证据与补齐条件见
+  [AGENT_CAPTURE_COVERAGE.md](AGENT_CAPTURE_COVERAGE.md)。
 - **语义仍偏词法**：检索主通道是 FTS5/LIKE + 覆盖率/时间/触碰混合分；向量通道
   是可选项且默认关闭（见 [SEMANTIC.md](SEMANTIC.md)）。同义改写、跨语言长问句
   仍可能漏召回。
-- **25 万 raw 未回填完**：提炼吞吐 16 条 / 5 分钟 ≈ 192 条/小时，纯回填需要
-  数周；双队列保证结构化记忆不被饿死，但历史 raw 的会话级摘要仍未完成。
-- **注入效果闭环缺失**：只有 `injection.jsonl`（是否注入、注入多少），没有
-  "注入后是否真的被用上/是否改善结果"的评估。
-- **自动重启验证缺失**：登录自启已实测，但崩溃后自动拉起、长期运行漂移
+- **历史 raw 回填**：不再把 `cold` 归档行算成待办（见 [DISTILL.md](DISTILL.md)）；
+  真实剩余量以 `python3 scripts/distill_status.py` 的 `accepted AND active` 口径为准，
+  双队列 + 会话级摘要保证结构化记忆不被饿死。
+- **注入效果闭环仍不完整**：`injection.jsonl` 现在有是否注入、空结果原因、
+  memory_ids 与服务端延迟，可支撑“有注入 vs 未注入”的对照分析；但“注入后是否
+  真的被用上/是否改善结果”仍只有离线复用率报告，没有线上因果证明。
   还没有自动化验证。
 
 ## 9. 相关文档

@@ -169,8 +169,10 @@ class FtsSyncReportTests(unittest.TestCase):
                 memory_id UNINDEXED, content, task_id, project, source_agent, kind,
                 tokenize='trigram');
             CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            INSERT INTO schema_meta VALUES('schema_version','8');
         """)
+        from hippomind.schema import SCHEMA_VERSION
+        conn.execute("INSERT INTO schema_meta VALUES('schema_version', ?)", (str(SCHEMA_VERSION),))
+        conn.commit()
         total = 50_000
         conn.execute("BEGIN")
         conn.executemany(

@@ -381,7 +381,7 @@ class ArchiveWatcher:
                 "timestamp": row["ts"] if "ts" in row.keys() else "",
                 "role": role,
                 "scope": "shared",
-                "evidence": ["archive:" + (event_id or str(latest))],
+                "evidence": ["archive:" + (event_id or str(rowid))],
                 "metadata": {
                     "archive": str(db_path), "archive_rowid": rowid,
                     "model": row["model"] if "model" in row.keys() else "",

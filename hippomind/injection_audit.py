@@ -37,11 +37,60 @@ WRONG_LEDGER = "wrong_ledger"
 VOLATILE_CWD = "volatile_cwd"
 #: 完全没有这条接入。
 MISSING = "missing"
+#: 配置指向的**模块**在运行时副本里不存在（路径对、代码没同步）。
+#: 这一条是 2026-10-25 新增的：claude hook 装好后命令、路径、账本全部
+#: 正确，审计报 healthy，但真跑起来报 No module named hippomind.claude_hook ——
+#: 因为内置盘 runtime 副本是用 rsync --delete 同步的，新模块没进去。
+#: "路径能解析"和"代码在那儿"是两件事，只查前者会漏掉整类失败。
+NOT_SYNCED = "not_synced"
 #: 存在但无法解析（坏 JSON / 权限不足），不猜测。
 UNREADABLE = "unreadable"
 
 #: 可移动卷挂载前缀。macOS 的 TCC 对后台进程读取这些路径会拒绝。
 VOLATILE_PREFIXES = ("/Volumes/",)
+
+#: 例外：**挂在可移动卷上的磁盘映像**不受同一条 TCC 限制。
+#: 实测（2026-10-26）launchd 后台任务直接读 /Volumes/<外置卷> 会被
+#: Operation not permitted 拒绝，但对同一块盘上 .dmg 挂载出来的卷
+#: 可以正常 open/read/write 甚至跑 SQLite。这使"数据放在外置盘"成为
+#: 可行方案（见 docs/PORTABILITY.md 的 external disk 一节）。
+#: 判据用 hdiutil info 的真实挂载表，不看路径字符串——把映像当成
+#: "可移动卷"是假阳性，会把一个能正常工作的部署判成坏掉。
+_IMAGE_MOUNT_CACHE = None
+_IMAGE_CACHE_TTL = 5.0
+
+
+def _image_mount_points():
+    """当前由磁盘映像挂载出来的卷的挂载点集合（带 5s 缓存）。"""
+    global _IMAGE_MOUNT_CACHE
+    import subprocess
+    import time
+    now = time.monotonic()
+    if _IMAGE_MOUNT_CACHE is not None and now - _IMAGE_MOUNT_CACHE[0] < _IMAGE_CACHE_TTL:
+        return _IMAGE_MOUNT_CACHE[1]
+    points = set()
+    try:
+        out = subprocess.run(["/usr/bin/hdiutil", "info"],
+                             capture_output=True, text=True, timeout=5).stdout
+        for line in out.splitlines():
+            if line.startswith("/dev/"):
+                for part in line.split("	")[1:]:
+                    part = part.strip()
+                    if part.startswith("/Volumes/"):
+                        points.add(part)
+    except Exception:
+        points = set()
+    result = frozenset(points)
+    _IMAGE_MOUNT_CACHE = (now, result)
+    return result
+
+
+def _is_image_mount(value):
+    """这个路径是否落在**由磁盘映像挂载出来的卷**上。"""
+    for point in _image_mount_points():
+        if value == point or value.startswith(point + "/"):
+            return True
+    return False
 
 #: 临时目录前缀。安装期的工作目录一旦落在这些位置，重启后必然失效。
 TEMP_PREFIXES = ("/var/folders/", "/tmp/", "/private/var/folders/", "/private/tmp/")
@@ -70,7 +119,10 @@ def _is_temp(value: str) -> bool:
 
 
 def _is_volatile(value: str) -> bool:
-    return any(value.startswith(prefix) for prefix in VOLATILE_PREFIXES)
+    if not any(value.startswith(prefix) for prefix in VOLATILE_PREFIXES):
+        return False
+    # 磁盘映像挂载出来的卷走的是另一条路径，TCC 不会拒绝（实测）。
+    return not _is_image_mount(value)
 
 
 def _iter_strings(node: Any) -> List[str]:
@@ -217,7 +269,119 @@ def inspect_codex_hook(path: Path, *, ledger_path: Path) -> Finding:
     if missing:
         return Finding("codex", "hook", str(path), STALE_PATH,
                        "agent-config 不存在", missing)
+    absent_root = _module_missing(commands[0], module="hippomind.codex_hook")
+    if absent_root:
+        return Finding("codex", "hook", str(path), NOT_SYNCED,
+                       "运行时副本缺少 hippomind/codex_hook.py，需重新同步 runtime",
+                       [absent_root])
     return Finding("codex", "hook", str(path), HEALTHY)
+
+
+def _module_missing(command: str, *, module: str) -> str:
+    """Return the package root the command runs from when module is absent.
+
+    The check is deliberately filesystem-only: importing the module would
+    execute it, and an audit must never run target code.  A hook command has
+    the shape ``cd <root> && [PYTHONPATH=<root>] <python> -m <module> ...``, so
+    "does <root>/<module path>.py exist" is exactly the question a real
+    invocation would answer with ImportError.
+
+    Returns "" when the module is present (or when the command does not pin a
+    root we can check), otherwise the root that is missing it.
+    """
+    roots: List[str] = []
+    for quoted in re.findall(r"'([^']*)'", command):
+        roots.append(quoted)
+    bare = re.sub(r"'[^']*'", " ", command).split()
+    for index, token in enumerate(bare):
+        if token == "cd" and index + 1 < len(bare):
+            roots.append(bare[index + 1])
+        if token.startswith("PYTHONPATH="):
+            roots.append(token.split("=", 1)[1])
+    relative = module.replace(".", "/") + ".py"
+    for root in roots:
+        if not root.startswith("/"):
+            continue
+        try:
+            if not Path(root).is_dir():
+                continue
+        except OSError:
+            continue
+        if not (Path(root) / relative).is_file():
+            return root
+    return ""
+
+
+def inspect_claude_hook(path: Path, *, ledger_path: Path) -> Finding:
+    """Claude Code settings.json 里 hippomind UserPromptSubmit hook 的可用性。
+
+    判据与 Codex hook 一致：命令里引用的绝对路径必须现在就能解析。
+    区别在于文件形状——Claude 把 hook 放在 settings.json 的 hooks 段里，
+    和用户自己的其它设置同处一个文件，所以这里只读不写，且只关心带
+    hippomind.claude_hook 的那一条 handler。
+
+    这条检查存在的理由：claude 是本机唯一每天都有真实回复的 agent，但它
+    历史上只有 rules + mcp 两个**被动**面（拉取式），从来没有被注入过。
+    没有这条检查，"claude 装了注入"就又是一句无法验证的声明。
+    """
+    if not path.exists():
+        return Finding("claude", "hook", str(path), MISSING, "settings.json 不存在")
+    data, error = _read_json(path)
+    if data is None:
+        return Finding("claude", "hook", str(path), UNREADABLE, error)
+    hooks = data.get("hooks") if isinstance(data, Mapping) else None
+    commands: List[str] = []
+    if isinstance(hooks, Mapping):
+        for groups in hooks.values():
+            if not isinstance(groups, list):
+                continue
+            for group in groups:
+                if not isinstance(group, Mapping):
+                    continue
+                for handler in group.get("hooks") or []:
+                    if not isinstance(handler, Mapping):
+                        continue
+                    command = handler.get("command")
+                    if isinstance(command, str) and "hippomind.claude_hook" in command:
+                        commands.append(command)
+    if not commands:
+        return Finding("claude", "hook", str(path), MISSING,
+                       "未安装 hippomind.claude_hook")
+    if len(commands) > 1:
+        return Finding("claude", "hook", str(path), STALE_PATH,
+                       "存在 %d 条重复的 hippomind hook（历史上字符串修补叠加的产物）"
+                       % len(commands), commands)
+
+    # 与 codex hook 相同的引号感知切分：Application Support 含空格，
+    # 用非空白字符类切分会把路径切成半截，把正常 hook 误报成 stale。
+    referenced: List[str] = []
+    for command in commands:
+        quoted = re.findall(r"'([^']*)'", command)
+        bare = re.sub(r"'[^']*'", " ", command).split()
+        for token in list(quoted) + bare:
+            if "=" in token and not token.startswith("/"):
+                token = token.split("=", 1)[1]
+            if not token.startswith("/") or _is_interpreter(token):
+                continue
+            referenced.append(token)
+
+    status, detail, stale = _classify_paths(referenced, ledger_path=ledger_path,
+                                            require_ledger=False)
+    if status != HEALTHY:
+        return Finding("claude", "hook", str(path), status, detail, stale)
+    missing = [value for value in referenced
+               if value.endswith(".json") and not Path(value).exists()]
+    if missing:
+        return Finding("claude", "hook", str(path), STALE_PATH,
+                       "agent-config 不存在", missing)
+    # 路径都在 ≠ 代码在。内置盘 runtime 是 rsync 出来的副本，新增模块若没同步，
+    # hook 每轮都静默 ImportError，而审计会一直报 healthy。
+    absent_root = _module_missing(commands[0], module="hippomind.claude_hook")
+    if absent_root:
+        return Finding("claude", "hook", str(path), NOT_SYNCED,
+                       "运行时副本缺少 hippomind/claude_hook.py，需重新同步 runtime",
+                       [absent_root])
+    return Finding("claude", "hook", str(path), HEALTHY)
 
 
 def _managed_section(text: str) -> Optional[str]:
@@ -301,6 +465,9 @@ def audit(agents: Sequence[str], *, ledger_path: Path, home: Optional[Path] = No
             findings.append(inspect_codex_hook(
                 codex_hooks or (root / ".codex" / "hooks.json"),
                 ledger_path=ledger_path))
+        if agent == "claude":
+            findings.append(inspect_claude_hook(
+                root / ".claude" / "settings.json", ledger_path=ledger_path))
     return findings
 
 

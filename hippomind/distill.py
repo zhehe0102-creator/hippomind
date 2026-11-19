@@ -18,11 +18,13 @@ no schema migration and every distilled fact remains auditable.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,10 +32,24 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from . import llm_client
 from .ledger import LedgerError, SQLiteLedger, utc_now
+# 关系类型词表只有一处定义（ledger/graph.py）；distill 只 import 它真正写
+# 的类型，避免出现「同名词表两份、各自漂移」。
+from .ledger.graph import RELATION_SAME_SUBJECT, RELATION_SAME_TASK
 from .schema import fts_indexed_predicate
 from .textutil import content_fingerprint, is_noise_text
 
 CURSOR_PREFIX = "distill:"
+#: Cost/latency keys added to every run() summary and returned by cost_stats().
+#: They are observability only: nothing reads them to change extraction, write
+#: back, ordering or the existing summary keys.  Semantics: extractor_calls are
+#: extractor.extract() invocations (0 when no extractor is configured),
+#: extractor_failures are attempts that returned no usable claims or raised,
+#: items_in are candidate rows handed to the boundary, items_out are claims the
+#: boundary returned, and deterministic_fallback_count counts batches served by
+#: the heuristic (extractor unavailable, returned nothing, or not configured).
+COST_FIELDS = ("extractor_calls", "extractor_failures", "extractor_ms",
+               "batch_count", "items_in", "items_out",
+               "deterministic_fallback_count")
 #: Number of candidates sent to one model call.
 #:
 #: Measured on production data with the real backend (2026-10-24), see
@@ -367,6 +383,10 @@ class Candidate:
     session_id: str
     created_at: str
     metadata: Mapping[str, Any]
+    #: Ledger scope of the source memory (agent:claude, shared, ...).  A
+    #: distilled projection is never more visible than the evidence it came
+    #: from; unpinned/legacy sources fall back to shared.
+    scope: str = "shared"
 
 
 class ClaudeExtractor:
@@ -490,7 +510,9 @@ class ClaudeExtractor:
             return None
         return completed.stdout.strip()
 
-    def extract(self, candidates: Sequence[Candidate]) -> Optional[List[Dict[str, Any]]]:
+    def extract(self, candidates: Sequence[Candidate], *,
+                known_slots: Optional[Sequence[Mapping[str, str]]] = None
+                ) -> Optional[List[Dict[str, Any]]]:
         if not self.available or not candidates:
             return None
         snippets = []
@@ -498,18 +520,36 @@ class ClaudeExtractor:
             snippets.append("[%d] agent=%s project=%s task=%s kind=%s\n%s" % (
                 index, item.source_agent or "unknown", item.project or "",
                 item.task_id or "", item.kind, item.content[:MAX_SOURCE_CHARS]))
+        known_block = ""
+        if known_slots:
+            slot_lines = [
+                "- %s | %s | %s = %s" % (
+                    _clean(s.get("subject"), 80),
+                    _clean(s.get("predicate"), 60),
+                    _clean(s.get("slot_key"), 80),
+                    _clean(s.get("value"), 120),
+                )
+                for s in list(known_slots)[:40]
+                if s.get("subject") and s.get("slot_key")
+            ]
+            if slot_lines:
+                known_block = (
+                    "\n已知活跃实体槽位（请优先复用已有规范化 subject 与 slot_key；"
+                    "若新事实与现有槽位完全一致请标 op=\"NOOP\"，更新旧值请标 op=\"SUPERSEDE\"，新增标 op=\"ADD\"）：\n"
+                    + "\n".join(slot_lines) + "\n"
+                )
         prompt = """你是 HippoMind 的记忆提炼器。只输出 JSON，不要解释。
 从下面的会话片段中提取稳定、可复核的事实 claims。每条 claim 必须有：
 subject（实体/项目/主题）、predicate（关系/属性）、slot_key（槽位，稳定小写）、
-value（值）、confidence（0-1）、source（对应片段编号）。
+value（值）、confidence（0-1）、source（对应片段编号）；可选 op（ADD/SUPERSEDE/NOOP）。
 只提取：项目决定、稳定事实、用户偏好、任务状态、可复用步骤。
 不要提取：临时命令输出、密钥、密码、猜测、寒暄、一次性文件路径。
 如果片段没有可提炼内容，claims 返回空数组。
-输出格式：{"claims":[{"subject":"...","predicate":"...","slot_key":"...","value":"...","confidence":0.9,"source":1}]}
-
+输出格式：{"claims":[{"subject":"...","predicate":"...","slot_key":"...","value":"...","confidence":0.9,"source":1,"op":"ADD"}]}
+%s
 片段：
 %s
-""" % "\n\n".join(snippets)
+""" % (known_block, "\n\n".join(snippets))
         text = self._ask(prompt, EXTRACT_MAX_TOKENS)
         if not text:
             return None
@@ -542,9 +582,13 @@ value（值）、confidence（0-1）、source（对应片段编号）。
                 source = int(item.get("source", 0))
             except (TypeError, ValueError):
                 source = 0
+            op = str(item.get("op") or "ADD").strip().upper()
+            if op not in {"ADD", "SUPERSEDE", "NOOP"}:
+                op = "ADD"
             result.append({"subject": subject, "predicate": predicate,
                            "slot_key": slot, "value": value,
-                           "confidence": round(confidence, 3), "source": source})
+                           "confidence": round(confidence, 3), "source": source,
+                           "op": op})
         self._failures = 0
         self._cooldown_until = 0.0
         return result
@@ -557,6 +601,18 @@ class DistillEngine:
 
     def __init__(self, ledger: SQLiteLedger, *, extractor: Any = _DEFAULT):
         self.ledger = ledger
+        #: Cost/latency counters.  run() is single-threaded today; the lock is
+        #: there so a /stats reader on another thread never sees a half-updated
+        #: cumulative dict, and it must not grow into a control path.
+        self._cost_lock = threading.Lock()
+        self._cost: Dict[str, Any] = {
+            "runs": 0, "batches": 0, "batch_count": 0, "extractor_calls": 0,
+            "extractor_failures": 0, "extractor_ms": 0.0,
+            "items_in": 0, "items_out": 0,
+            "deterministic_fallback_count": 0,
+        }
+        self._run_cost: Optional[Dict[str, Any]] = None
+        self._last_run_cost: Dict[str, Any] = {}
         if extractor is not self._DEFAULT:
             self.extractor = extractor
             return
@@ -582,7 +638,7 @@ class DistillEngine:
         structured_limit = limit if not include_raw else max(1, limit // 2)
         raw_limit = 0 if not include_raw else max(1, limit - structured_limit)
         base = ("SELECT m.memory_id,m.kind,m.content,m.source_agent,m.project,m.task_id,"
-                "m.session_id,m.created_at,m.metadata_json FROM memories m "
+                "m.session_id,m.created_at,m.metadata_json,m.scope FROM memories m "
                 "LEFT JOIN source_cursors c ON c.source_id='distill:' || m.memory_id "
                 "WHERE c.source_id IS NULL AND m.quality_state='accepted' "
                 "AND m.lifecycle='active' AND m.source_agent!='hippomind-distill' "
@@ -605,7 +661,8 @@ class DistillEngine:
                                     str(row["source_agent"] or ""), str(row["project"] or ""),
                                     str(row["task_id"] or ""), str(row["session_id"] or ""),
                                     str(row["created_at"] or ""),
-                                    _json_value(row["metadata_json"], {})))
+                                    _json_value(row["metadata_json"], {}),
+                                    str(row["scope"] or "shared")))
         return output
 
     @staticmethod
@@ -633,6 +690,19 @@ class DistillEngine:
                                    "slot_key": candidate.memory_id + ":" + field,
                                    "value": text, "confidence": DEFAULT_CONFIDENCE,
                                    "source": 0})
+        if len(claims) < MAX_CLAIMS_PER_SOURCE and isinstance(context, Mapping):
+            files = context.get("related_files")
+            if isinstance(files, list):
+                cleaned_files = [_clean(f, 200) for f in files[:6] if _clean(f, 200)]
+                if cleaned_files:
+                    claims.append({
+                        "subject": subject,
+                        "predicate": "related_files",
+                        "slot_key": candidate.memory_id + ":related_files",
+                        "value": ", ".join(cleaned_files)[:500],
+                        "confidence": DEFAULT_CONFIDENCE,
+                        "source": 0,
+                    })
         if claims:
             return claims[:MAX_CLAIMS_PER_SOURCE]
         # Raw / unstructured fallback: only decision-like sentences.
@@ -648,16 +718,158 @@ class DistillEngine:
                 break
         return claims
 
+    # -- cost/latency observability (no control flow) ----------------------
+    def _begin_run_cost(self) -> None:
+        with self._cost_lock:
+            self._cost["runs"] = int(self._cost.get("runs", 0)) + 1
+            self._run_cost = {field: 0 for field in COST_FIELDS}
+            self._run_cost["batches"] = 0
+
+    def _record_batch_cost(self, *, extractor_attempted: bool,
+                           extractor_failed: bool, extractor_ms: float,
+                           items_in: int, items_out: int,
+                           deterministic_fallback: bool) -> None:
+        """Accumulate one batch outcome into the instance and current-run dicts.
+
+        Called from _claims_for's finally block, so an extractor that raises is
+        counted before the exception continues to propagate (behaviour
+        unchanged); the batch is still classified as attempted+failed.
+        """
+        with self._cost_lock:
+            buckets = [self._cost]
+            if self._run_cost is not None:
+                buckets.append(self._run_cost)
+            for bucket in buckets:
+                # batch_count is the per-run/summary name; batches stays the
+                # historical cumulative name so both readers keep working.
+                bucket["batch_count"] = int(bucket.get("batch_count", 0)) + 1
+                bucket["batches"] = int(bucket.get("batches", 0)) + 1
+                bucket["items_in"] = int(bucket.get("items_in", 0)) + int(items_in)
+                bucket["items_out"] = int(bucket.get("items_out", 0)) + int(items_out)
+                if extractor_attempted:
+                    bucket["extractor_calls"] = int(bucket.get("extractor_calls", 0)) + 1
+                    bucket["extractor_ms"] = (float(bucket.get("extractor_ms", 0.0))
+                                              + float(extractor_ms))
+                    if extractor_failed:
+                        bucket["extractor_failures"] = (
+                            int(bucket.get("extractor_failures", 0)) + 1)
+                if deterministic_fallback:
+                    bucket["deterministic_fallback_count"] = (
+                        int(bucket.get("deterministic_fallback_count", 0)) + 1)
+
+    def _finish_run_cost(self, elapsed_ms: float) -> Dict[str, Any]:
+        with self._cost_lock:
+            run_cost = dict(self._run_cost or {field: 0 for field in COST_FIELDS})
+            run_cost["extractor_ms"] = round(float(run_cost.get("extractor_ms", 0.0)), 3)
+            snapshot: Dict[str, Any] = {"at": utc_now(),
+                                        "elapsed_ms": round(float(elapsed_ms), 1)}
+            snapshot.update(run_cost)
+            self._last_run_cost = snapshot
+            self._run_cost = None
+            return dict(snapshot)
+
+    def cost_stats(self) -> Dict[str, Any]:
+        """Cumulative extractor cost + the most recent completed run().
+
+        Observability only.  The dict is a copy taken under the counter lock, so
+        a caller (e.g. a future /stats endpoint) can serialise it without
+        racing a running pass.
+        """
+        with self._cost_lock:
+            cumulative = dict(self._cost)
+            last_run = dict(self._last_run_cost)
+        calls = int(cumulative.get("extractor_calls", 0) or 0)
+        extractor_ms = round(float(cumulative.get("extractor_ms", 0.0) or 0.0), 3)
+        cumulative["extractor_ms"] = extractor_ms
+        cumulative["extractor_ms_avg"] = (
+            round(extractor_ms / calls, 3) if calls else 0.0)
+        return {"cumulative": cumulative, "last_run": last_run,
+                "extractor": getattr(self.extractor, "name", "heuristic"),
+                "available": bool(getattr(self.extractor, "available", False)),
+                "transport": getattr(self.extractor, "transport", "") or ""}
+
+    def _active_slots(self, candidates: Sequence[Candidate], limit: int = 40) -> List[Dict[str, str]]:
+        """Mem0 式闭环槽位字典：提取当前批涉及 scope 下的活跃实体槽位供复用/去重。"""
+        scopes = sorted({str(getattr(c, "scope", "") or "shared") for c in candidates})
+        if not scopes:
+            return []
+        marks = ",".join("?" for _ in scopes)
+        rows = []
+        try:
+            with self.ledger._reading() as conn:
+                rows = conn.execute(
+                    "SELECT scope, subject, predicate, slot_key, value_json "
+                    "FROM memory_claims "
+                    "WHERE scope IN (" + marks + ") AND state IN ('active','conflict') "
+                    "AND subject != '' AND slot_key != '' "
+                    "ORDER BY rowid DESC LIMIT ?",
+                    tuple(scopes) + (max(1, int(limit)),),
+                ).fetchall()
+        except Exception:
+            return []
+        slots: List[Dict[str, str]] = []
+        seen: set = set()
+        for row in rows:
+            subj = str(row["subject"] or "").strip()
+            pred = str(row["predicate"] or "").strip()
+            slot = str(row["slot_key"] or "").strip()
+            if not subj or not slot or (subj.lower(), slot) in seen:
+                continue
+            seen.add((subj.lower(), slot))
+            raw_val = str(row["value_json"] or "")
+            try:
+                val = str(json.loads(raw_val)) if raw_val else ""
+            except (TypeError, ValueError):
+                val = raw_val
+            slots.append({
+                "scope": str(row["scope"] or "shared"),
+                "subject": subj,
+                "predicate": pred,
+                "slot_key": slot,
+                "value": val[:160],
+            })
+        return slots
+
     def _claims_for(self, candidates: Sequence[Candidate]) -> Tuple[List[Dict[str, Any]], str]:
-        extracted = None
-        if getattr(self.extractor, "available", False):
-            extracted = self.extractor.extract(candidates)
-        if extracted:
-            return extracted, getattr(self.extractor, "name", "llm")
-        claims: List[Dict[str, Any]] = []
-        for candidate in candidates:
-            claims.extend(self._heuristic(candidate))
-        return claims, "heuristic"
+        """Extract one batch, recording calls/latency/fallback at the boundary."""
+        attempted = bool(getattr(self.extractor, "available", False))
+        extracted: Optional[List[Dict[str, Any]]] = None
+        failed = False
+        extract_ms = 0.0
+        items_out = 0
+        deterministic_fallback = False
+        try:
+            if attempted:
+                extract_started = time.perf_counter()
+                try:
+                    if isinstance(self.extractor, ClaudeExtractor):
+                        known_slots = self._active_slots(candidates)
+                        extracted = self.extractor.extract(candidates, known_slots=known_slots)
+                    else:
+                        extracted = self.extractor.extract(candidates)
+                except BaseException:  # noqa: BLE001 - count, then re-raise as before
+                    failed = True
+                    raise
+                finally:
+                    extract_ms = (time.perf_counter() - extract_started) * 1000.0
+                if not extracted:
+                    failed = True
+            if extracted:
+                claims = extracted
+                extractor_name = getattr(self.extractor, "name", "llm")
+            else:
+                claims = []
+                for candidate in candidates:
+                    claims.extend(self._heuristic(candidate))
+                extractor_name = "heuristic"
+                deterministic_fallback = True
+            items_out = len(claims)
+            return claims, extractor_name
+        finally:
+            self._record_batch_cost(
+                extractor_attempted=attempted, extractor_failed=failed,
+                extractor_ms=extract_ms, items_in=len(candidates),
+                items_out=items_out, deterministic_fallback=deterministic_fallback)
 
     def _record(self, candidate: Candidate, claims: Sequence[Mapping[str, Any]],
                 extractor_name: str, parent_memory_id: str = "",
@@ -670,6 +882,9 @@ class DistillEngine:
             dropped = {}
         gated: List[Mapping[str, Any]] = []
         for item in claims:
+            if str(item.get("op") or "").strip().upper() == "NOOP":
+                dropped["noop"] = dropped.get("noop", 0) + 1
+                continue
             reason = classify_claim_value(str(item.get("slot_key", "")),
                                          str(item.get("predicate", "")),
                                          str(item.get("value", "")))
@@ -694,11 +909,26 @@ class DistillEngine:
         source_text = _clean(candidate.content, 700)
         summary = "；".join(value for value in values if value)[:1_200]
         content = ("提炼（%s）：%s" % (candidate.kind, source_text)) + chr(10) + summary
+        # getattr: tests and adapters pass lightweight candidate objects, so
+        # _record must stay duck-typed like the rest of this method.
+        source_scope = str(getattr(candidate, "scope", "") or "").strip() or "shared"
+        raw_metadata = getattr(candidate, "metadata", {})
+        source_metadata = raw_metadata if isinstance(raw_metadata, Mapping) else {}
+        # A raw row is untrusted by definition (it is someone else's chat).  A
+        # row derived from one stays flagged even when distilled again, so a
+        # downstream reader can keep treating the claim as non-authoritative.
+        derived_from_raw_chat = bool(getattr(candidate, "kind", "") == "raw_chat"
+                                     or source_metadata.get("raw_chat"))
+        untrusted_source = bool(derived_from_raw_chat
+                                or source_metadata.get("untrusted_source"))
         record = {
             "content": content[:2_000],
             "kind": "semantic",
             "source_agent": "hippomind-distill",
-            "scope": "shared",
+            # Inheritance, not promotion: distillation must not widen a private
+            # raw row (scope agent:claude) into shared memory.  Explicit
+            # promotion stays a separate, auditable API (WP-D).
+            "scope": source_scope,
             "task_id": candidate.task_id,
             "project": candidate.project,
             "session_id": candidate.session_id,
@@ -707,14 +937,21 @@ class DistillEngine:
             "confidence": round(sum(float(item.get("confidence", 0.55)) for item in claims) / max(1, len(claims)), 3),
             "metadata": {"distilled": True, "extractor": extractor_name,
                          "source_memory_ids": [candidate.memory_id],
-                         "source_kind": candidate.kind},
+                         "source_kind": candidate.kind,
+                         "source_scope": source_scope,
+                         "derived_from_raw_chat": derived_from_raw_chat,
+                         "untrusted_source": untrusted_source},
             "claims": [{"subject": item["subject"], "predicate": item["predicate"],
                         "slot_key": item["slot_key"], "value": item["value"],
                         "confidence": item.get("confidence", 0.55)} for item in claims],
         }
         if parent_memory_id:
+            # 父节点是「上一批里同 claim 主语的提炼记忆」，关系就是同主语，
+            # 不是无差别的 related_to：类型决定联想扩展权重
+            # （same_subject 0.9 < related_to 1.0），无差别 related_to 会让
+            # 「同主题接续」和「碰巧同批」在图里一样重。
             record["causal_parents"] = [{"memory_id": parent_memory_id,
-                                          "relation_type": "related_to",
+                                          "relation_type": RELATION_SAME_SUBJECT,
                                           "confidence": 0.6}]
         return record
 
@@ -731,6 +968,11 @@ class DistillEngine:
         pass walks recent distilled memories and joins each to a few older
         memories on the same subject, which is what makes the graph and the
         associative retrieval channel useful.
+
+        边类型（task-3）：共享 claim 主语 -> ``same_subject``；同一 task_id
+        但无共享主语 -> ``same_task``（权重更低，只表达「同一件工作里」这层
+        弱关联）。两者都比原来的无差别 ``related_to`` 更可解释，且都只在
+        **新写入**时生效——存量 related_to 不会被本方法改写。
         """
         limit = max(1, min(200, int(limit)))
         per_memory = max(1, min(8, int(per_memory)))
@@ -738,12 +980,13 @@ class DistillEngine:
         scanned = 0
         with self.ledger._reading() as conn:
             rows = conn.execute(
-                "SELECT DISTINCT m.memory_id FROM memories m "
+                "SELECT DISTINCT m.memory_id, m.scope FROM memories m "
                 "JOIN memory_claims c ON c.memory_id = m.memory_id "
                 "WHERE m.source_agent = 'hippomind-distill' AND m.lifecycle = 'active' "
                 "ORDER BY m.created_at DESC LIMIT ?", (limit,)).fetchall()
         for row in rows:
             memory_id = str(row["memory_id"])
+            mem_scope = str(row["scope"] or "shared")
             scanned += 1
             with self.ledger._reading() as conn:
                 subjects = [str(item["subject"]) for item in conn.execute(
@@ -754,15 +997,40 @@ class DistillEngine:
                     continue
                 marks = ",".join("?" for _ in subjects)
                 related = conn.execute(
-                    "SELECT memory_id, MAX(confidence) score FROM memory_claims "
-                    "WHERE subject IN (" + marks + ") AND memory_id != ? "
-                    "AND state IN ('active','conflict') "
-                    "GROUP BY memory_id ORDER BY score DESC LIMIT ?",
-                    tuple(subjects) + (memory_id, per_memory)).fetchall()
+                    "SELECT c.memory_id, MAX(c.confidence) score "
+                    "FROM memory_claims c JOIN memories m ON m.memory_id = c.memory_id "
+                    "WHERE c.subject IN (" + marks + ") AND c.memory_id != ? "
+                    "AND c.state IN ('active','conflict') "
+                    "AND m.scope = ? AND m.quality_state IN ('accepted','conflict') "
+                    "AND m.lifecycle IN ('active','conflict') "
+                    "GROUP BY c.memory_id ORDER BY score DESC LIMIT ?",
+                    tuple(subjects) + (memory_id, mem_scope, per_memory)).fetchall()
+                # 弱关联通道：同 task_id 且同 scope、但没共享主语的记忆。
+                same_task_rows = conn.execute(
+                    "SELECT c.memory_id, MAX(c.confidence) score "
+                    "FROM memory_claims c JOIN memories m ON m.memory_id=c.memory_id "
+                    "JOIN memories me ON me.memory_id=? "
+                    "WHERE me.task_id != '' AND m.task_id = me.task_id "
+                    "AND m.scope = me.scope "
+                    "AND c.memory_id != ? AND c.state IN ('active','conflict') "
+                    "AND m.quality_state='accepted' AND m.lifecycle='active' "
+                    "AND m.source_agent = 'hippomind-distill' "
+                    "GROUP BY c.memory_id ORDER BY score DESC LIMIT ?",
+                    (memory_id, memory_id, per_memory)).fetchall()
             parents = [{"memory_id": str(item["memory_id"]),
-                        "relation_type": "related_to",
+                        "relation_type": RELATION_SAME_SUBJECT,
                         "confidence": round(float(item["score"] or 0.5), 3)}
                        for item in related]
+            seen_parents = {item["memory_id"] for item in parents}
+            for item in same_task_rows:
+                parent_id = str(item["memory_id"])
+                if parent_id in seen_parents:
+                    # 已按同主语连过：同主语是更强的证据，不重复记一条弱边。
+                    continue
+                seen_parents.add(parent_id)
+                parents.append({"memory_id": parent_id,
+                                "relation_type": RELATION_SAME_TASK,
+                                "confidence": round(float(item["score"] or 0.5), 3)})
             if not parents:
                 continue
             try:
@@ -772,44 +1040,67 @@ class DistillEngine:
             created += int(result.get("created", 0) or 0)
         return {"scanned": scanned, "created": created}
 
-    def resolve_conflicts(self, *, limit: int = 200) -> int:
+    def _conflict_scopes(self) -> List[str]:
+        """Scopes that currently hold conflicting claims, shared first.
+
+        Conflicts are scope-local: resolve_claim refuses a winner whose scope
+        differs from the claim's, and the ledger only detects a slot collision
+        inside one scope.  Iterating every scope keeps private (agent:*) claims
+        adjudicable after distillation started inheriting the source scope; the
+        old hardcoded scope=shared scan would leave them in conflict forever.
+        """
+        with self.ledger._reading() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT scope FROM memory_claims WHERE state='conflict' "
+                "ORDER BY scope LIMIT 64").fetchall()
+        scopes = ["shared"]
+        for row in rows:
+            scope = str(row["scope"] or "").strip()
+            if scope and scope not in scopes:
+                scopes.append(scope)
+        return scopes
+
+    def resolve_conflicts(self, *, limit: int = 200,
+                          scopes: Optional[Sequence[str]] = None) -> int:
         if hasattr(self.ledger, "repair_claim_states"):
             self.ledger.repair_claim_states()
-        claims = self.ledger.list_claims(scope="shared", state="conflict", limit=limit)
-        groups: Dict[Tuple[str, str, str], List[Mapping[str, Any]]] = {}
-        for item in claims:
-            key = (str(item.get("subject", "")), str(item.get("predicate", "")),
-                   str(item.get("slot_key", "")))
-            groups.setdefault(key, []).append(item)
+        limit = max(1, min(2_000, int(limit)))
         resolved = 0
-        for group in groups.values():
-            if len(group) < 2:
-                continue
-            ranked = sorted(group, key=lambda item: (
-                float(item.get("confidence", 0) or 0) * float(item.get("source_trust", 0.5) or 0.5),
-                str(item.get("asserted_at", ""))), reverse=True)
-            top = ranked[0]
-            second = ranked[1]
-            top_score = float(top.get("confidence", 0) or 0) * float(top.get("source_trust", 0.5) or 0.5)
-            second_score = float(second.get("confidence", 0) or 0) * float(second.get("source_trust", 0.5) or 0.5)
-            if top_score < second_score + 0.10 and float(top.get("confidence", 0) or 0) < 0.90:
-                # Confidence cannot decide.  Two equally strong (>=0.9)
-                # contradictory claims are a genuine disagreement that needs a
-                # human; anything weaker is treated as an evolving fact, where
-                # the newest assertion wins.  The loser stays as superseded with
-                # superseded_by pointing at the winner, so the decision remains
-                # auditable and reversible.
-                strong = [item for item in group if float(item.get("confidence", 0) or 0) >= 0.90]
-                if len({str(item.get("value_hash", item.get("value_json", ""))) for item in strong}) > 1:
+        for scope in (scopes if scopes is not None else self._conflict_scopes()):
+            claims = self.ledger.list_claims(scope=str(scope), state="conflict", limit=limit)
+            groups: Dict[Tuple[str, str, str], List[Mapping[str, Any]]] = {}
+            for item in claims:
+                key = (str(item.get("subject", "")), str(item.get("predicate", "")),
+                       str(item.get("slot_key", "")))
+                groups.setdefault(key, []).append(item)
+            for group in groups.values():
+                if len(group) < 2:
                     continue
-                top = max(group, key=lambda item: str(item.get("asserted_at", "")))
-            try:
-                self.ledger.resolve_claim(str(top.get("claim_id", "")),
-                                          str(top.get("memory_id", "")),
-                                          source_agent="hippomind-distill")
-                resolved += 1
-            except (LedgerError, ValueError):
-                continue
+                ranked = sorted(group, key=lambda item: (
+                    float(item.get("confidence", 0) or 0) * float(item.get("source_trust", 0.5) or 0.5),
+                    str(item.get("asserted_at", ""))), reverse=True)
+                top = ranked[0]
+                second = ranked[1]
+                top_score = float(top.get("confidence", 0) or 0) * float(top.get("source_trust", 0.5) or 0.5)
+                second_score = float(second.get("confidence", 0) or 0) * float(second.get("source_trust", 0.5) or 0.5)
+                if top_score < second_score + 0.10 and float(top.get("confidence", 0) or 0) < 0.90:
+                    # Confidence cannot decide.  Two equally strong (>=0.9)
+                    # contradictory claims are a genuine disagreement that needs
+                    # a human; anything weaker is treated as an evolving fact, where
+                    # the newest assertion wins.  The loser stays as superseded with
+                    # superseded_by pointing at the winner, so the decision remains
+                    # auditable and reversible.
+                    strong = [item for item in group if float(item.get("confidence", 0) or 0) >= 0.90]
+                    if len({str(item.get("value_hash", item.get("value_json", ""))) for item in strong}) > 1:
+                        continue
+                    top = max(group, key=lambda item: str(item.get("asserted_at", "")))
+                try:
+                    self.ledger.resolve_claim(str(top.get("claim_id", "")),
+                                              str(top.get("memory_id", "")),
+                                              source_agent="hippomind-distill")
+                    resolved += 1
+                except (LedgerError, ValueError):
+                    continue
         return resolved
 
     @staticmethod
@@ -829,104 +1120,96 @@ class DistillEngine:
         groups: Dict[str, List[Candidate]] = {}
         order: List[str] = []
         for candidate in candidates:
-            # Fingerprint the *normalised* body, not the raw one: two rows that
-            # differ only by captured whitespace or a runner wrapper are one
-            # message.  An empty body fingerprints to the digest of "" -- a
-            # constant -- so it has to be excluded explicitly or every blank row
-            # in the queue would collapse into a single group.
-            key = content_fingerprint(candidate.content) if candidate.content.strip() else ""
-            if not key:
+            cand_scope = str(getattr(candidate, "scope", "") or "shared")
+            cand_kind = str(getattr(candidate, "kind", "") or "")
+            raw_fp = content_fingerprint(candidate.content) if candidate.content.strip() else ""
+            if not raw_fp:
                 # An empty/unfingerprintable body must never collapse with
                 # another one; give it a unique key so it stands alone.
-                key = chr(0) + candidate.memory_id
+                key = cand_scope + chr(0) + cand_kind + chr(0) + candidate.memory_id
+            else:
+                # Scope and kind must both participate in the dedupe key so
+                # private raw_chat in agent:claude never shares extraction/dedupe
+                # with shared or another agent's scope.
+                key = cand_scope + chr(0) + cand_kind + chr(0) + raw_fp
             if key not in groups:
                 groups[key] = []
                 order.append(key)
             groups[key].append(candidate)
         return [(groups[key][0], groups[key][1:]) for key in order]
 
-    def _duplicate_index(self) -> Dict[str, str]:
-        """Fingerprint -> memory_id for every live distilled memory.
+    def _active_subject_map(self) -> Dict[str, Dict[str, str]]:
+        """Scope -> {lowercase subject: canonical subject} for entity convergence."""
+        mapping: Dict[str, Dict[str, str]] = {}
+        with self.ledger._reading() as conn:
+            rows = conn.execute(
+                "SELECT scope, subject FROM memory_claims "
+                "WHERE state IN ('active','conflict') AND subject != '' "
+                "ORDER BY rowid DESC LIMIT 500"
+            ).fetchall()
+        for row in rows:
+            sc = str(row["scope"] or "shared")
+            subj = str(row["subject"] or "").strip()
+            if not subj:
+                continue
+            bucket = mapping.setdefault(sc, {})
+            bucket.setdefault(subj.lower(), subj)
+        return mapping
 
-        Built **once per run() pass**, not per write.  A per-write query was the
-        obvious implementation and the wrong one: it re-read and re-fingerprinted
-        the newest 400 rows for every single write, which on a 4,000-row backlog
-        is quadratic *and* still missed anything older than that window -- the
-        measured symptom was 142 duplicate groups surviving the gate.
+    @staticmethod
+    def _canonicalize_claims(claims: Sequence[Mapping[str, Any]], scope: str,
+                             subject_map: Dict[str, Dict[str, str]]) -> List[Dict[str, Any]]:
+        bucket = subject_map.setdefault(scope, {})
+        out: List[Dict[str, Any]] = []
+        for item in claims:
+            copied = dict(item)
+            subj = str(copied.get("subject", "") or "").strip()
+            if subj:
+                canon = bucket.get(subj.lower())
+                if canon:
+                    copied["subject"] = canon
+                else:
+                    bucket[subj.lower()] = subj
+            out.append(copied)
+        return out
 
-        The cache is deliberately NOT keyed on the ledger write generation.
-        Generation advances on every ingest, so a generation-keyed cache is
-        invalidated by the very writes it is meant to dedupe: each new row would
-        force a full rebuild, which is the cost this cache exists to avoid.
-        Instead ``run()`` takes one snapshot at the start of the pass and
-        ``_remember_written`` adds each new row to it, so the pass sees its own
-        writes without any rebuild.  Cross-pass correctness does not depend on
-        the cache being fresh: ``_existing_duplicate`` is only an optimisation
-        that lets us skip a write, and a stale miss just means the ledger unique
-        constraint (or the next pass) catches it.
-        """
+    def _duplicate_index(self) -> Dict[Tuple[str, str], str]:
+        """(scope, fingerprint) -> memory_id for every live distilled memory."""
         cached = getattr(self, "_dup_index_cache", None)
         if cached is not None:
             return cached
-        index: Dict[str, str] = {}
-        # Reuse the schema-owned retrieval predicate instead of restating it:
-        # tests/test_fts_invariant.py enforces that schema.py is the only module
-        # allowed to spell this literal out, precisely so the ingest gate, the
-        # FTS index and the audit surfaces cannot drift apart.
+        index: Dict[Tuple[str, str], str] = {}
         predicate = fts_indexed_predicate("m")
         with self.ledger._reading() as conn:
             rows = conn.execute(
-                "SELECT m.memory_id, m.content FROM memories m "
+                "SELECT m.memory_id, m.scope, m.content FROM memories m "
                 "WHERE " + predicate + " AND m.source_agent='hippomind-distill'").fetchall()
         for row in rows:
             key = content_fingerprint(str(row["content"] or ""))
-            if key and key not in index:
-                index[key] = str(row["memory_id"])
+            row_scope = str(row["scope"] or "shared")
+            if key and (row_scope, key) not in index:
+                index[(row_scope, key)] = str(row["memory_id"])
         self._dup_index_cache = index
         return index
 
-    def _remember_written(self, content: str, memory_id: str) -> None:
-        """Teach the in-pass duplicate index about a row just written.
-
-        Without this, two rows written inside the same pass would not see each
-        other: the snapshot predates both.  Kept deliberately cheap -- it is the
-        only mutation of the index during a pass.
-        """
+    def _remember_written(self, content: str, memory_id: str,
+                          scope: str = "shared") -> None:
         key = content_fingerprint(content)
         if not key:
             return
         cached = getattr(self, "_dup_index_cache", None)
         if cached is not None:
-            cached.setdefault(key, memory_id)
+            cached.setdefault((str(scope or "shared"), key), memory_id)
 
     def _reset_duplicate_index(self) -> None:
-        """Drop the per-pass snapshot so the next pass re-reads the ledger.
-
-        Called at the start of every ``run()``.  A long-lived daemon reuses one
-        engine across passes, so without this the snapshot from the first pass
-        would live forever and miss everything other writers added.
-        """
         self._dup_index_cache = None
-    def _existing_duplicate(self, content: str) -> str:
-        """Return the id of an already-accepted memory with the same content.
 
-        This is the ingest-side half of the duplicate problem.  On the live
-        ledger the *same* distilled sentence was written 141 times with one
-        identical evidence id but 141 different metadata blobs: the ledger
-        identity key includes mutable metadata, so every re-observation became
-        a new row.  Fixing the identity key is a schema-level change (out of
-        scope, tracked in docs/DATA_HYGIENE.md); the durable mitigation is to
-        refuse to write a row whose normalised content is already live.
-
-        Deliberately compares *normalised* content, not raw bytes: rows that
-        differ only by whitespace are the same fact.  Returns "" when the
-        content is new.
-        """
+    def _existing_duplicate(self, content: str, scope: str = "shared") -> str:
         fingerprint = content_fingerprint(content)
         if not fingerprint:
             return ""
         index = self._duplicate_index()
-        return index.get(fingerprint, "")
+        return index.get((str(scope or "shared"), fingerprint), "")
     def _mark_duplicate(self, candidate: Candidate, representative_id: str) -> None:
         """Retire a repeat row without a model call, keeping the audit trail.
 
@@ -950,6 +1233,7 @@ class DistillEngine:
         distilling every row.
         """
         started = time.time()
+        self._begin_run_cost()
         # One duplicate snapshot per pass; see _duplicate_index for why this is
         # not keyed on the ledger generation.
         self._reset_duplicate_index()
@@ -997,20 +1281,21 @@ class DistillEngine:
                    # but said nothing worth storing.
                    "claims_dropped": {}, "claims_dropped_total": 0,
                    "extractor": "none", "extractors": {},
+                   # Cost/latency fields (new keys; existing keys keep their
+                   # meaning).  Filled from the per-run accumulator below.
+                   "extractor_calls": 0, "extractor_failures": 0,
+                   "extractor_ms": 0.0, "batch_count": 0,
+                   "items_in": 0, "items_out": 0,
+                   "deterministic_fallback_count": 0,
                    "conflicts_resolved": 0, "elapsed_ms": 0.0}
-        last_by_subject: Dict[str, str] = {}
+        last_by_subject: Dict[Tuple[str, str], str] = {}
+        subject_map = self._active_subject_map() if not dry_run else {}
         for start in range(0, len(representatives), size):
             batch = representatives[start:start + size]
             if not batch:
                 continue
             summary["batches"] += 1
             claims, extractor_name = self._claims_for(batch)
-            # "extractor" is the last transport that ran (kept for compatibility
-            # with existing dashboards); "extractors" counts them, because a
-            # single pass can genuinely mix them -- a batch whose model answer is
-            # an empty claims array legitimately falls back for that batch only.
-            # Reporting just the last one made a mostly-API run look entirely
-            # heuristic, which is exactly the number an operator would trust.
             summary["extractor"] = extractor_name
             counts = summary["extractors"]
             counts[extractor_name] = counts.get(extractor_name, 0) + 1
@@ -1022,8 +1307,6 @@ class DistillEngine:
                 by_source.setdefault(source, []).append(claim)
             for index, candidate in enumerate(batch, 1):
                 source_claims = by_source.get(index, [])
-                # Repeats share this group's claims; they are retired together
-                # with it so a batch never half-finishes.
                 repeats = groups[start + index - 1][1]
                 if not source_claims:
                     summary["skipped"] += 1 + len(repeats)
@@ -1035,11 +1318,13 @@ class DistillEngine:
                 summary["claims"] += len(source_claims)
                 if dry_run:
                     continue
+                cand_scope = str(getattr(candidate, "scope", "") or "shared")
+                canonical_claims = self._canonicalize_claims(source_claims, cand_scope, subject_map)
                 try:
-                    subject = str(source_claims[0].get("subject", "")).strip().lower()
-                    parent = last_by_subject.get(subject, "")
+                    subject = str(canonical_claims[0].get("subject", "")).strip().lower()
+                    parent = last_by_subject.get((cand_scope, subject), "")
                     dropped: Dict[str, int] = {}
-                    record = self._record(candidate, source_claims,
+                    record = self._record(candidate, canonical_claims,
                                           extractor_name, parent, dropped)
                     if dropped:
                         bucket = summary["claims_dropped"]
@@ -1047,51 +1332,43 @@ class DistillEngine:
                             bucket[reason] = bucket.get(reason, 0) + n
                         summary["claims_dropped_total"] += sum(dropped.values())
                     if not record.get("claims"):
-                        # Every claim this source produced was filtered, so
-                        # there is nothing to store.  Retire the row like an
-                        # empty extraction -- otherwise it is retried forever.
                         summary["skipped"] += 1 + len(repeats)
                         self._mark(candidate, 0)
                         for repeat in repeats:
                             self._mark_duplicate(repeat, candidate.memory_id)
                         continue
-                    # Ingest-side dedupe: an identical live memory means this
-                    # observation adds nothing but a duplicate row.  Skip the
-                    # write, but still mark the cursor -- otherwise the same
-                    # source row is retried forever.
-                    existing = self._existing_duplicate(str(record.get("content", "")))
+                    existing = self._existing_duplicate(str(record.get("content", "")), scope=cand_scope)
                     if existing:
-                        summary["skipped_duplicate"] = summary.get("skipped_duplicate", 0) + 1
+                        summary["skipped_duplicate"] = summary.get("skipped_duplicate", 0) + 1 + len(repeats)
                         self._mark_duplicate(candidate, existing)
+                        for repeat in repeats:
+                            self._mark_duplicate(repeat, existing)
                         continue
                     result = self.ledger.ingest(record)
                     self._remember_written(str(record.get("content", "")),
-                                           result.memory_id)
+                                           result.memory_id, scope=cand_scope)
                     if subject:
-                        last_by_subject[subject] = result.memory_id
-                    self._mark(candidate, len(source_claims))
+                        last_by_subject[(cand_scope, subject)] = result.memory_id
+                    self._mark(candidate, len(canonical_claims))
                     summary["distilled"] += 1
                 except (LedgerError, ValueError):
                     summary["errors"] += 1
                     continue
                 for repeat in repeats:
                     try:
-                        repeat_parent = last_by_subject.get(subject, "") or result.memory_id
-                        repeat_record = self._record(repeat, source_claims,
+                        rep_scope = str(getattr(repeat, "scope", "") or "shared")
+                        repeat_parent = last_by_subject.get((rep_scope, subject), "") or result.memory_id
+                        repeat_record = self._record(repeat, canonical_claims,
                                                      extractor_name, repeat_parent)
-                        # A repeat shares its representative's claims, so its
-                        # content is identical to a row just written: writing it
-                        # again would recreate the duplication this gate exists to
-                        # stop.  Record the skip and retire the cursor.
                         repeat_dup = self._existing_duplicate(
-                            str(repeat_record.get("content", "")))
+                            str(repeat_record.get("content", "")), scope=rep_scope)
                         if repeat_dup:
                             summary["skipped_duplicate"] = summary.get("skipped_duplicate", 0) + 1
                             self._mark_duplicate(repeat, repeat_dup)
                             continue
                         written = self.ledger.ingest(repeat_record)
                         self._remember_written(str(repeat_record.get("content", "")),
-                                               written.memory_id)
+                                               written.memory_id, scope=rep_scope)
                         self._mark_duplicate(repeat, candidate.memory_id)
                         summary["distilled"] += 1
                     except (LedgerError, ValueError):
@@ -1107,6 +1384,9 @@ class DistillEngine:
             if hasattr(self.ledger, "repair_claim_states"):
                 self.ledger.repair_claim_states()
         summary["elapsed_ms"] = round((time.time() - started) * 1000.0, 1)
+        run_cost = self._finish_run_cost(summary["elapsed_ms"])
+        for field in COST_FIELDS:
+            summary[field] = run_cost.get(field, 0)
         return summary
 
     def status(self) -> Dict[str, Any]:

@@ -9,12 +9,13 @@ incrementally closes the gap for Gemini without depending on MCP tool calls.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from .ledger import LedgerError, SQLiteLedger, utc_now
 
@@ -54,48 +55,93 @@ class GeminiSummaryScanner:
     def _cursor_id(path: Path) -> str:
         return CURSOR_PREFIX + hashlib.sha1(str(path).encode("utf-8")).hexdigest()[:16]
 
-    def _read_cursor(self, path: Path) -> str:
-        row = self.ledger.get_cursor(self._cursor_id(path))
-        return str(row.get("cursor") or "")
+    @staticmethod
+    def _empty_cursor() -> Dict[str, str]:
+        return {"last_modified_time": "", "conversation_id": ""}
 
-    def _write_cursor(self, path: Path, value: str, error: str = "") -> None:
-        self.ledger.set_cursor(self._cursor_id(path), value[:4000], error=error,
+    def _read_cursor(self, path: Path) -> Dict[str, str]:
+        """Current compound keyset cursor, tolerant of the legacy shape.
+
+        The old cursor was a bare last_modified_time string.  It is still
+        understood: it becomes a keyset with an empty conversation id, so rows
+        sharing that exact timestamp are re-read once (and deduped by the
+        ledger) instead of being skipped forever.
+        """
+        row = self.ledger.get_cursor(self._cursor_id(path))
+        raw = str(row.get("cursor") or "").strip()
+        if not raw:
+            return self._empty_cursor()
+        try:
+            value = json.loads(raw)
+        except (TypeError, ValueError):
+            value = raw
+        if isinstance(value, Mapping):
+            return {"last_modified_time": str(value.get("last_modified_time") or ""),
+                    "conversation_id": str(value.get("conversation_id") or "")}
+        return {"last_modified_time": str(value or ""), "conversation_id": ""}
+
+    def _write_cursor(self, path: Path, value: Mapping[str, str], error: str = "") -> None:
+        payload = {"last_modified_time": str(value.get("last_modified_time") or ""),
+                   "conversation_id": str(value.get("conversation_id") or "")}
+        self.ledger.set_cursor(self._cursor_id(path),
+                               json.dumps(payload, separators=(",", ":"))[:4_000],
+                               error=error,
                                metadata={"kind": "gemini-summary", "path": str(path)})
 
-    def _records(self, path: Path, after: str, limit: int) -> List[Dict[str, Any]]:
+    def _records(self, path: Path, after: Mapping[str, str],
+                 limit: int) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+        """Fetch the next keyset page plus the keyset of the last fetched row.
+
+        Ordering is by the compound key (last_modified_time, conversation_id).
+        A single-column cursor silently lost rows written in the same
+        timestamp: several conversations summarised in one second produced only
+        one captured row, because 'last_modified_time > cursor' skipped every
+        sibling of the cursor row.
+        """
+        empty = self._empty_cursor()
         if not path.is_file() or path.is_symlink():
-            return []
+            return [], empty
         try:
             conn = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=2)
             conn.row_factory = sqlite3.Row
         except sqlite3.Error:
-            return []
+            return [], empty
         try:
             columns = {row[1] for row in conn.execute("PRAGMA table_info(conversation_summaries)")}
-            if not columns:
-                return []
+            if not columns or "conversation_id" not in columns:
+                return [], empty
             wanted = [name for name in ("conversation_id", "title", "preview",
                                         "step_count", "last_modified_time", "workspace_uris",
                                         "status", "project_id", "agent_name") if name in columns]
-            if "conversation_id" not in wanted:
-                return []
             query = "SELECT " + ",".join(wanted) + " FROM conversation_summaries"
             params: List[Any] = []
             if "last_modified_time" in columns:
-                query += " WHERE last_modified_time > ?"
-                params.append(after)
-                query += " ORDER BY last_modified_time ASC"
+                # Compound keyset: strictly greater timestamp, or the same
+                # timestamp with a greater conversation id.  Without the second
+                # arm, every same-timestamp sibling after max_rows is skipped.
+                query += (" WHERE last_modified_time > ?"
+                          " OR (last_modified_time = ? AND conversation_id > ?)")
+                params.extend([str(after.get("last_modified_time") or ""),
+                               str(after.get("last_modified_time") or ""),
+                               str(after.get("conversation_id") or "")])
+                query += " ORDER BY last_modified_time ASC, conversation_id ASC"
             query += " LIMIT ?"
             params.append(max(1, min(500, int(limit))))
             rows = conn.execute(query, tuple(params)).fetchall()
         except sqlite3.Error:
-            return []
+            return [], empty
         finally:
             conn.close()
         records: List[Dict[str, Any]] = []
+        last = empty
         for row in rows:
             item = {key: row[key] for key in row.keys()}
             conversation_id = str(item.get("conversation_id") or "").strip()
+            # Advance the keyset over every fetched row, including ones skipped
+            # below for having no content: otherwise a blank row stalls the
+            # cursor and the page is re-read on every pass.
+            last = {"last_modified_time": str(item.get("last_modified_time") or "")[:64],
+                    "conversation_id": conversation_id[:256]}
             title = " ".join(str(item.get("title") or "").split()).strip()
             preview = " ".join(str(item.get("preview") or "").split()).strip()
             content = "\n".join(part for part in (title, preview) if part)[:4_000]
@@ -103,6 +149,7 @@ class GeminiSummaryScanner:
                 continue
             source_modified = str(item.get("last_modified_time") or "")[:64]
             timestamp = _iso_timestamp(source_modified)
+            external_id = "gemini:" + conversation_id
             metadata = {
                 "source": "gemini-antigravity-summary",
                 "conversation_id": conversation_id,
@@ -112,23 +159,25 @@ class GeminiSummaryScanner:
                 "step_count": item.get("step_count"),
                 "workspace_uris": str(item.get("workspace_uris") or ""),
                 "source_modified_time": source_modified,
+                "external_id": external_id,
             }
             records.append({
                 "content": content,
                 "kind": "task",
                 "source_agent": "gemini",
                 "scope": "shared",
+                "event_id": external_id,
                 "task_id": conversation_id,
                 "project": str(item.get("project_id") or "")[:200],
                 "evidence": ["gemini:%s" % conversation_id],
                 "timestamp": timestamp,
                 "metadata": metadata,
             })
-        return records
+        return records, last
 
     def sync(self, *, max_rows: int = 100) -> Dict[str, Any]:
         summary = {"databases": 0, "rows": 0, "inserted": 0, "duplicate": 0,
-                   "errors": 0, "last_modified_time": ""}
+                   "errors": 0, "last_modified_time": "", "last_conversation_id": ""}
         remaining = max(0, int(max_rows))
         for path in self.databases:
             if remaining <= 0:
@@ -138,7 +187,7 @@ class GeminiSummaryScanner:
             summary["databases"] += 1
             after = self._read_cursor(path)
             try:
-                records = self._records(path, after, remaining)
+                records, last = self._records(path, after, remaining)
             except Exception as exc:  # one corrupt DB must not stop the loop
                 summary["errors"] += 1
                 self._write_cursor(path, after, error=str(exc)[:500])
@@ -153,9 +202,10 @@ class GeminiSummaryScanner:
                     summary["errors"] += 1
                     self._write_cursor(path, after, error=str(exc)[:500])
                     continue
-                last = str((records[-1].get("metadata") or {}).get("source_modified_time") or after)
-                summary["last_modified_time"] = last
-                self._write_cursor(path, last)
                 remaining -= len(records)
+            if last.get("last_modified_time") or last.get("conversation_id"):
+                summary["last_modified_time"] = last["last_modified_time"]
+                summary["last_conversation_id"] = last["conversation_id"]
+                self._write_cursor(path, last)
         self._last_summary = summary
         return summary

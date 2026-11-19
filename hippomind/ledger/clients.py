@@ -6,6 +6,7 @@ former single ``ledger.py``; behaviour and wire formats are unchanged).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import secrets
@@ -180,19 +181,39 @@ class ClientsMixin:
         if not isinstance(data, Mapping):
             raise LedgerError("JSON 根节点必须是对象")
         imported = duplicate = 0
+        _ADMIN_EVENT_TYPES = {
+            "feedback", "supersede", "decay", "forget",
+            "pin", "unpin", "resolve", "release",
+        }
         if data.get("hippomind_memory_hub_export") in {1, 2}:
             for event in data.get("events", []):
-                if not isinstance(event, Mapping) or event.get("event_type") in {"feedback", "supersede"}:
+                if not isinstance(event, Mapping):
                     continue
-                result = self.ingest({
-                    "kind": event.get("event_type", "fact"), "content": event.get("content", ""),
+                if event.get("event_type") in _ADMIN_EVENT_TYPES:
+                    continue
+                content = str(event.get("content", "") or "")
+                if not content.strip():
+                    continue
+                try:
+                    evidence = json.loads(event.get("evidence_json", "[]") or "[]")
+                except (TypeError, ValueError):
+                    evidence = []
+                try:
+                    metadata = json.loads(event.get("metadata_json", "{}") or "{}")
+                except (TypeError, ValueError):
+                    metadata = {}
+                record: Dict[str, Any] = {
+                    "kind": event.get("event_type", "fact"), "content": content,
                     "source_agent": event.get("source_agent", source_agent),
                     "session_id": event.get("session_id", ""), "task_id": event.get("task_id", ""),
                     "project": event.get("project", ""), "role": event.get("role", ""),
                     "scope": event.get("scope", "shared"), "timestamp": event.get("occurred_at", ""),
-                    "evidence": json.loads(event.get("evidence_json", "[]") or "[]"),
-                    "metadata": json.loads(event.get("metadata_json", "{}") or "{}"),
-                })
+                    "evidence": evidence,
+                    "metadata": metadata if isinstance(metadata, Mapping) else {},
+                }
+                if isinstance(metadata, Mapping) and metadata.get("external_id"):
+                    record["external_id"] = str(metadata["external_id"])[:512]
+                result = self.ingest(record)
                 imported += int(result.inserted)
                 duplicate += int(not result.inserted)
             return {"imported": imported, "duplicate": duplicate}
@@ -237,6 +258,23 @@ class ClientsMixin:
         默认只导 accepted 且非 raw 的行；raw chat 是不可信审计证据，
         需要显式 ``include_raw_chat=True`` 才随包导出。
         ``since`` 只导该 ISO 时刻之后创建的记忆（增量导出）。
+
+        每条记录携带**完整投影**，而不只是第一组平铺字段：
+
+        * ``claims`` -- 该记忆全部 active claims（subject/predicate/slot_key/
+          value/valid_from/valid_until/confidence），``ingest_many`` 可原样重建；
+        * ``procedural`` -- 技能卡本体（trigger_pattern/preconditions/
+          execution_pipeline/verification_assertion/calibration_score）；
+        * ``context`` -- 结构化上下文；
+        * ``causal_parents`` -- 已登记的因果父边；父 id 是**源库坐标**，导入端
+          只有在父记忆也存在时才连边（同库坐标迁移或先导入父节点时成立）；
+        * ``tags`` / ``confidence`` / ``importance`` / ``weight`` / ``utility`` /
+          ``valid_from`` / ``valid_until`` -- 检索与双时态所需的字段。
+
+        旧版平铺字段（kind/content/subject/predicate/slot_key/value/...）全部
+        保留，老导入器仍可只读这些键工作。claims 只导 ``state='active'`` 的行：
+        导入端会把每条 claim 当新断言重建，导出已下线的历史 slot 会把它重新
+        激活，那是数据损坏而不是迁移。
         """
         scope = _short(scope, 128) or "shared"
         limit = _clamp_int(limit, 0, 0, 1_000_000)
@@ -258,10 +296,17 @@ class ClientsMixin:
             sql += f" LIMIT {int(limit)}"
         rows: List[Dict[str, Any]] = []
         with self._reading() as conn:
-            for row in conn.execute(sql, params):
+            db_rows = conn.execute(sql, params).fetchall()
+            memory_ids = [str(row["memory_id"]) for row in db_rows]
+            claims_by_memory = self._export_claims(conn, memory_ids)
+            relations_by_memory = self._export_relations(conn, memory_ids)
+            for row in db_rows:
+                memory_id = str(row["memory_id"])
                 try:
                     metadata = json.loads(row["metadata_json"] or "{}")
                 except (TypeError, ValueError):
+                    metadata = {}
+                if not isinstance(metadata, Mapping):
                     metadata = {}
                 try:
                     evidence = json.loads(row["evidence_json"] or "[]")
@@ -280,30 +325,112 @@ class ClientsMixin:
                     "timestamp": row["occurred_at"],
                     "importance": int(row["importance"]),
                     "confidence": float(row["confidence"]),
+                    "weight": float(row["weight"]),
+                    "utility": float(row["utility"]),
                 }
                 if tags:
                     record["tags"] = tags
-                context = metadata.get("context") if isinstance(metadata, Mapping) else None
+                context = metadata.get("context")
                 if isinstance(context, Mapping) and context:
-                    record["context"] = context
-                claims = metadata.get("claims") if isinstance(metadata, Mapping) else None
-                if isinstance(claims, list) and claims:
+                    record["context"] = dict(context)
+                procedural = metadata.get("procedural")
+                if isinstance(procedural, Mapping) and procedural:
+                    record["procedural"] = dict(procedural)
+                claims = claims_by_memory.get(memory_id) or []
+                if claims:
+                    record["claims"] = claims
+                    # Backward-compatible flat view of the first claim: old
+                    # importers only knew subject/predicate/slot_key/value.
                     first = claims[0]
-                    if isinstance(first, Mapping):
-                        for key in ("subject", "predicate", "slot_key"):
-                            if first.get(key):
-                                record[key] = str(first[key])[:256]
-                        if "value" in first:
-                            record["value"] = first["value"]
-                        if first.get("confidence") is not None:
-                            record["confidence"] = max(record["confidence"],
-                                                       float(first["confidence"]))
+                    for key in ("subject", "predicate", "slot_key"):
+                        if first.get(key):
+                            record[key] = str(first[key])[:256]
+                    if "value" in first:
+                        record["value"] = first["value"]
+                parents = relations_by_memory.get(memory_id) or []
+                if parents:
+                    record["causal_parents"] = parents
+                external_id = metadata.get("external_id")
+                if isinstance(external_id, str) and external_id:
+                    # v3 identity input: re-exporting it keeps the event id
+                    # (and therefore identity) stable across the round trip.
+                    record["event_id"] = external_id[:512]
                 if row["valid_from"]:
                     record["valid_from"] = row["valid_from"]
                 if row["valid_until"]:
                     record["valid_until"] = row["valid_until"]
                 rows.append(record)
         return rows
+
+    #: IN(...) batch width for the export sub-queries.  SQLite's default
+    #: variable limit is 999, so stay well below it and never build a statement
+    #: whose placeholder count depends on how many memories were selected.
+    EXPORT_CHUNK = 400
+
+    @classmethod
+    def _export_claims(cls, conn: sqlite3.Connection,
+                       memory_ids: Sequence[str]) -> Dict[str, List[Dict[str, Any]]]:
+        """Active claims grouped by memory (bounded IN chunks)."""
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for start in range(0, len(memory_ids), cls.EXPORT_CHUNK):
+            chunk = memory_ids[start:start + cls.EXPORT_CHUNK]
+            placeholders = ",".join("?" for _ in chunk)
+            try:
+                claims = conn.execute(
+                    "SELECT * FROM memory_claims WHERE state='active' "
+                    "AND memory_id IN (" + placeholders + ") "
+                    "ORDER BY memory_id, asserted_at, claim_id", chunk).fetchall()
+            except sqlite3.DatabaseError:
+                continue
+            for claim in claims:
+                try:
+                    value = json.loads(claim["value_json"] or "null")
+                except (TypeError, ValueError):
+                    value = str(claim["value_json"] or "")
+                grouped.setdefault(str(claim["memory_id"]), []).append({
+                    "subject": str(claim["subject"]),
+                    "predicate": str(claim["predicate"]),
+                    "slot_key": str(claim["slot_key"]),
+                    "value": value,
+                    "valid_from": str(claim["valid_from"] or ""),
+                    "valid_until": str(claim["valid_until"] or ""),
+                    "confidence": float(claim["confidence"]),
+                })
+        return grouped
+
+    @classmethod
+    def _export_relations(cls, conn: sqlite3.Connection,
+                          memory_ids: Sequence[str]) -> Dict[str, List[Dict[str, Any]]]:
+        """Causal parent edges grouped by child memory (bounded IN chunks).
+
+        The parent id is a source-ledger coordinate; the event id is included so
+        an operator can audit which source event the edge pointed at even when
+        the import target mints a different memory id.
+        """
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for start in range(0, len(memory_ids), cls.EXPORT_CHUNK):
+            chunk = memory_ids[start:start + cls.EXPORT_CHUNK]
+            placeholders = ",".join("?" for _ in chunk)
+            try:
+                relations = conn.execute(
+                    "SELECT r.child_memory_id, r.parent_memory_id, r.relation_type, "
+                    "r.confidence, m.origin_event_id AS parent_event_id "
+                    "FROM memory_relations r LEFT JOIN memories m "
+                    "ON m.memory_id=r.parent_memory_id "
+                    "WHERE r.child_memory_id IN (" + placeholders + ") "
+                    "ORDER BY r.child_memory_id, r.parent_memory_id", chunk).fetchall()
+            except sqlite3.DatabaseError:
+                continue
+            for relation in relations:
+                item: Dict[str, Any] = {
+                    "memory_id": str(relation["parent_memory_id"]),
+                    "relation_type": str(relation["relation_type"]),
+                    "confidence": float(relation["confidence"]),
+                }
+                if relation["parent_event_id"]:
+                    item["event_id"] = str(relation["parent_event_id"])
+                grouped.setdefault(str(relation["child_memory_id"]), []).append(item)
+        return grouped
 
     def export_sql(self, *, scope: str = "shared", include_raw_chat: bool = False,
                    limit: int = 0, since: str = "") -> str:
@@ -314,10 +441,9 @@ class ClientsMixin:
         IGNORE 保证重复回放幂等。claims/relations/feedback 不随包——它们是
         派生数据，正式迁移请用 backup/restore 或 import。
         """
-        rows = self.export_rows(scope=scope, include_raw_chat=include_raw_chat,
-                                limit=limit, since=since)
         # 取原始行（含未解析的 json 字段与事件列）
         scope_val = _short(scope, 128) or "shared"
+        limit = _clamp_int(limit, 0, 0, 1_000_000)
         since_iso = _timestamp(since) if since else ""
         clauses = ["m.scope=?", "m.quality_state='accepted'",
                    "m.lifecycle IN ('active','cold')",
@@ -338,14 +464,6 @@ class ClientsMixin:
                "WHERE " + " AND ".join(clauses) + " ORDER BY m.created_at ASC")
         if limit:
             sql += f" LIMIT {int(limit)}"
-        out: List[str] = [
-            "-- HippoMind 审计导出（可回放）",
-            f"-- generated: {utc_now()}",
-            f"-- scope: {scope_val} | rows: {len(rows)} | "
-            f"schema_version: {SCHEMA_VERSION}",
-            "-- 回放: sqlite3 target.db < this_file.sql （须为同版本空库）",
-            "BEGIN TRANSACTION;",
-        ]
 
         def q(value) -> str:
             if value is None:
@@ -353,12 +471,15 @@ class ClientsMixin:
             return "'" + str(value).replace("'", "''") + "'"
 
         seen_events: set = set()
+        body: List[str] = []
+        row_count = 0
         with self._reading() as conn:
             for row in conn.execute(sql, params):
+                row_count += 1
                 eid = row["_event_id"]
                 if eid not in seen_events:
                     seen_events.add(eid)
-                    out.append(
+                    body.append(
                         "INSERT OR IGNORE INTO ledger_events(event_id,event_type,"
                         "occurred_at,ingested_at,source_agent,session_id,task_id,"
                         "project,role,scope,evidence_json,content,content_hash,"
@@ -369,13 +490,14 @@ class ClientsMixin:
                             "_e_task_id", "_e_project", "_e_role", "scope",
                             "_e_evidence_json", "_e_content", "_e_content_hash",
                             "_e_metadata_json")) + ");")
-                out.append(
+                body.append(
                     "INSERT OR IGNORE INTO memories(memory_id,origin_event_id,kind,"
                     "content,source_agent,session_id,task_id,project,role,scope,"
                     "evidence_json,tags_json,metadata_json,created_at,updated_at,"
                     "last_access_at,last_weighted_at,valid_until,superseded_by,"
                     "archived_at,lifecycle,raw_chat,weight,importance,touch_count,"
-                    "utility,confidence,success_count,failure_count,pinned) VALUES("
+                    "utility,confidence,success_count,failure_count,pinned,"
+                    "valid_from,asserted_at,agent_trust,quality_score,quality_state) VALUES("
                     + ",".join(q(row[k]) for k in (
                         "memory_id", "origin_event_id", "kind", "content",
                         "source_agent", "session_id", "task_id", "project",
@@ -385,17 +507,22 @@ class ClientsMixin:
                         "superseded_by", "archived_at", "lifecycle", "raw_chat",
                         "weight", "importance", "touch_count", "utility",
                         "confidence", "success_count", "failure_count",
-                        "pinned")) + ");")
-        # Rebuild only the hot index, using the same single predicate as every
-        # other writer.  The unconditional ``SELECT ... FROM memories`` used to
-        # copy cold/quarantined/conflicted rows into the target ledger's FTS,
-        # which the target immediately reported as drift.  A dump carries only
-        # ``accepted`` rows in ``active``/``cold`` lifecycle (see the clause
-        # above), so this is exactly "the active subset".
-        out.append("INSERT INTO memory_fts(memory_id, content) "
-                   "SELECT memory_id, content FROM memories WHERE "
-                   + fts_indexed_predicate() + ";")
-        out.append("COMMIT;")
+                        "pinned", "valid_from", "asserted_at", "agent_trust",
+                        "quality_score", "quality_state")) + ");")
+        out: List[str] = [
+            "-- HippoMind 审计导出（可回放）",
+            f"-- generated: {utc_now()}",
+            f"-- scope: {scope_val} | rows: {row_count} | "
+            f"schema_version: {SCHEMA_VERSION}",
+            "-- 回放: sqlite3 target.db < this_file.sql （须为同版本空库）",
+            "BEGIN TRANSACTION;",
+            *body,
+            "INSERT INTO memory_fts(memory_id, content) "
+            "SELECT memory_id, content FROM memories WHERE "
+            + fts_indexed_predicate() +
+            " AND memory_id NOT IN (SELECT memory_id FROM memory_fts);",
+            "COMMIT;",
+        ]
         return "\n".join(out) + "\n"
 
     def backup_to(self, path: os.PathLike) -> Path:
@@ -458,7 +585,7 @@ class ClientsMixin:
         temporary = Path(name)
         try:
             self.backup_to(temporary)
-            with sqlite3.connect(str(temporary)) as conn:
+            with contextlib.closing(sqlite3.connect(str(temporary))) as conn:
                 integrity = str(conn.execute("PRAGMA integrity_check").fetchone()[0]).lower()
                 version = conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0]
                 events = int(conn.execute("SELECT COUNT(*) FROM ledger_events").fetchone()[0])
@@ -480,6 +607,8 @@ class ClientsMixin:
         Callers should stop the daemon first.  Validation happens before the
         destination is touched; SQLite's backup API then performs the copy.
         """
+        if getattr(self, "read_only", False):
+            raise LedgerError("只读账本拒绝恢复写入")
         source_path = Path(backup_path).expanduser()
         if not source_path.exists():
             raise LedgerError(f"备份不存在: {source_path}")
@@ -500,6 +629,7 @@ class ClientsMixin:
             integrity = str(source.execute("PRAGMA integrity_check").fetchone()[0]).lower()
             if integrity != "ok":
                 raise LedgerError("备份完整性检查失败，拒绝恢复")
+            self.close()
             dest = sqlite3.connect(str(self.path))
             try:
                 source.backup(dest)
@@ -509,4 +639,7 @@ class ClientsMixin:
         finally:
             source.close()
         self._bootstrap()
+        with self._search_lock:
+            self._generation += 1
+            self._search_cache.clear()
 

@@ -124,6 +124,9 @@ def normalise_for_dedup(text: str, *, keep_wrappers: bool = False) -> str:
     "the same message" therefore collapse to the same string even when they were
     captured at different times.
 
+    Standalone ``YYYY-MM-DD`` dates inside the payload are preserved so facts
+    such as release windows or milestone dates on different days never collide.
+
     ``keep_wrappers`` retains the wrapper blocks while still normalising
     whitespace and timestamps; callers that must preserve structural markers can
     opt in.
@@ -132,7 +135,6 @@ def normalise_for_dedup(text: str, *, keep_wrappers: bool = False) -> str:
     if not keep_wrappers:
         cleaned = strip_wrappers(cleaned)
     cleaned = _TIMESTAMP_RE.sub(" ", cleaned)
-    cleaned = _ISO_DATE_RE.sub(" ", cleaned)
     cleaned = _WS_RE.sub(" ", cleaned).strip().lower()
     return cleaned
 
@@ -268,3 +270,21 @@ def dedupe_preserving_order(values: Iterable[str]) -> List[str]:
         seen.add(key)
         ordered.append(value)
     return ordered
+
+
+def coerce_random_seed(seed):
+    """Return a seed that random.Random accepts on Python 3.9 and 3.11+.
+
+    Before Python 3.11 random.seed() fell back to hash() for arbitrary
+    objects, so passing e.g. a Hippocampus instance happened to work.
+    Python 3.13 raises TypeError for anything that is not None, int, float,
+    str, bytes or bytearray. Coerce index-able values (numpy integers) to int
+    and fall back to None for everything else, so the demo half keeps
+    working instead of crashing on a newer interpreter.
+    """
+    if seed is None or isinstance(seed, (int, float, str, bytes, bytearray)):
+        return seed
+    try:
+        return int(seed.__index__())
+    except (AttributeError, TypeError, ValueError):
+        return None

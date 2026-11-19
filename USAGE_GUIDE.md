@@ -181,8 +181,25 @@ record_feedback() 之前不会把模型自评的 good/bad 当作真实长期经�
 
 ## 验证与排障
 
+> 记忆 Hub 的现代验证入口（2026-11 起；grid-world 基线仍有效，但不再代表 Hub 质量）：
+
 ~~~bash
-# 自动化测试（115 项）：生命周期、持久化、共享账本、LLM 反馈、watcher
+# 解释一次检索：候选/过滤原因/选中/为空原因/门控（离线只读）
+python3 -m hippomind explain "继续" --json
+
+# 检索质量基准（48 查询，5 类；阈值来自 tests/fixtures/retrieval/benchmark_baseline.json）
+python3 scripts/eval_benchmark.py --json
+
+# 9 步发布门禁：compileall/全量/lint/drill/node/DSH/acceptance/检索质量/灾备演练
+bash scripts/release_check.sh
+
+# 备份→变更→恢复→体检→篡改拒绝（合成账本，不碰生产数据）
+bash scripts/backup_restore_drill.sh --json
+~~~
+
+~~~bash
+# 旧实验回归（grid world / 驱力 / 可视化）
+# 自动化测试（数量以实际 discover 为准）：生命周期、持久化、共享账本、LLM 反馈、watcher
 # 阻塞恢复、真实 MCP 注册握手和受控自动安装
 python3 -m unittest discover          # 两种写法等价，均发现全部测试
 python3 -m unittest discover -s tests -v

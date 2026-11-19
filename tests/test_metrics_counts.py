@@ -25,6 +25,12 @@ class MetricsCountsTests(unittest.TestCase):
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.shutdown)
 
+    def _metrics_request(self):
+        # /metrics now requires the local token (it used to be anonymous).
+        return urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/metrics",
+            headers={"X-HippoMind-Token": self.service.token})
+
     def _claim(self, value):
         return {"subject": "service-a", "predicate": "status",
                 "slot_key": "state", "value": {"v": value},
@@ -40,8 +46,7 @@ class MetricsCountsTests(unittest.TestCase):
         led.ingest({"content": "冲突值 v2", "kind": "fact",
                     "source_agent": "t", "evidence": ["t:2"],
                     "claims": [self._claim("v2")]})
-        with urllib.request.urlopen(
-                f"http://127.0.0.1:{self.port}/metrics", timeout=10) as resp:
+        with urllib.request.urlopen(self._metrics_request(), timeout=10) as resp:
             body = resp.read().decode()
         lines = {l.split()[0]: l.split()[1] for l in body.splitlines()
                  if l and not l.startswith("#")}
@@ -54,8 +59,7 @@ class MetricsCountsTests(unittest.TestCase):
         led.ingest({"content": "唯一值 v9", "kind": "fact",
                     "source_agent": "t", "evidence": ["t:9"],
                     "claims": [self._claim("v9")]})
-        with urllib.request.urlopen(
-                f"http://127.0.0.1:{self.port}/metrics", timeout=10) as resp:
+        with urllib.request.urlopen(self._metrics_request(), timeout=10) as resp:
             body = resp.read().decode()
         lines = {l.split()[0]: l.split()[1] for l in body.splitlines()
                  if l and not l.startswith("#")}

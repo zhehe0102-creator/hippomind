@@ -180,7 +180,7 @@ class GuiApiTests(unittest.TestCase):
     def test_meta_catalogue(self):
         meta = self.get("/api/v1/meta")
         self.assertEqual("v1", meta["api_version"])
-        self.assertEqual(meta["schema_version"], 8)
+        self.assertEqual(meta["schema_version"], 9)
         self.assertEqual({"memories_page", "content_preview", "detail_content",
                           "graph_nodes"}, set(meta["limits"]))
         paths = {item["path"] for item in meta["endpoints"]}
@@ -359,7 +359,7 @@ class GuiApiTests(unittest.TestCase):
         self.assertIn("disk", env["workspace"])
         self.assertGreaterEqual(env["ledger"]["events"], 1)
         self.assertGreaterEqual(env["ledger"]["memories"], 8)
-        self.assertEqual(8, env["ledger"]["schema_version"])
+        self.assertEqual(9, env["ledger"]["schema_version"])
         self.assertIn("matplotlib", env["dependencies"])
         self.assertIn("sqlite", env["dependencies"])
         ids = {item["id"] for item in env["checks"]}

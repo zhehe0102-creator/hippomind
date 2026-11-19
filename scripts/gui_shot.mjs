@@ -21,9 +21,15 @@ import process from "node:process";
 const VIEW_IDS = [
   "pulse", "archive", "recall", "compose", "graph",
   "facts", "timeline", "agents", "health", "reference",
+  // 11th view (2026-10-25): the forgetting audit.  This list is the capture
+  // order, and it must match hippomind/web/js/views/registry.js or the new
+  // view silently never gets a screenshot - which is exactly how a view can
+  // ship broken while the QA report still says "20/20 passed".
+  "forgetting",
 ];
 const VIEW_OWNER = {
   pulse: "views-a", timeline: "views-a", agents: "views-a",
+  forgetting: "views-b",
   health: "views-a", reference: "views-a",
   archive: "views-b", recall: "views-b", compose: "views-b",
   graph: "views-b", facts: "views-b",
@@ -104,7 +110,7 @@ function usage() {
     "",
     "  --daemon-url <url>    fixture daemon base URL (default http://127.0.0.1:8765)",
     "  --token <token>       admin bearer token (or --token-file <path>)",
-    "  --views a,b,c         views to capture (default: all 10)",
+    "  --views a,b,c         views to capture (default: all 11)",
     "  --theme paper|night|both  theme(s) to capture (default: both)",
     "  --out <dir>           screenshot + report directory (default output/gui)",
     "  --chrome <path>       Chrome binary (default macOS Google Chrome)",

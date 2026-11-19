@@ -33,7 +33,10 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from .access import AccessDenied, AccessPolicy
 from .context_pack import DEFAULT_MAX_CHARS, DEFAULT_MAX_TOKENS, ContextPackBuilder, ContextPackOptions
+from .fact_cards import fact_cards_enabled  # noqa: E402
 from .injection import InjectionState
+from . import injection_trace  # noqa: E402
+from . import injection_ab  # noqa: E402
 from .cursor_capture import collect as collect_cursor  # noqa: E402
 from .distill import DistillEngine  # noqa: E402
 from .gemini_capture import GeminiSummaryScanner  # noqa: E402
@@ -54,6 +57,8 @@ SERVER_VERSION = _PACKAGE_VERSION
 MAX_REQUEST_BYTES = 1_000_000
 MAX_RESPONSE_BYTES = 512_000
 MAX_CONCURRENT_REQUESTS = 16
+#: Background metrics trend log rotation bound (metrics.jsonl + one .1).
+METRICS_LOG_MAX_BYTES = 8 * 1024 * 1024
 
 
 def render_prometheus(stats: Mapping[str, Any], uptime_s: float) -> str:
@@ -200,7 +205,10 @@ class MemoryHubService:
         self._started_at = time.time()
         self._metrics_log_path = paths.state_path.parent / "metrics.jsonl"
         self._last_metrics_log = 0.0
-        self.ledger = SQLiteLedger(paths.ledger_path)
+        # Read-only must be known before the ledger is opened: a mirror has to
+        # serve the existing file as-is and must never bootstrap/migrate it.
+        self.read_only = bool(read_only)
+        self.ledger = SQLiteLedger(paths.ledger_path, read_only=self.read_only)
         # Optional ledger-native semantic space: only used when a fitted model
         # exists.  It improves pack recall (~+2 points on the labelled set) at a
         # modest latency cost, and silently falls back when absent.
@@ -235,7 +243,6 @@ class MemoryHubService:
         self.distiller = DistillEngine(self.ledger)
         self.watch_enabled = bool(watch)
         self.require_auth = bool(require_auth)
-        self.read_only = bool(read_only)
         # Discovery walks the home directory, so it runs at most once per
         # interval; between scans the persisted report is reused.
         self.discovery = AgentDiscovery(paths.state_path.parent / "agent-discovery.json",
@@ -243,12 +250,21 @@ class MemoryHubService:
         self._discovery_thread: Optional[threading.Thread] = None
         self._sleep_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+        # Graceful shutdown is idempotent: exactly one caller performs the
+        # join/checkpoint/close sequence, concurrent callers wait for it.
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_started = False
+        self._shutdown_complete = threading.Event()
+        self._server_stop_thread: Optional[threading.Thread] = None
         # 空闲睡眠巩固：外部活动（HTTP 请求）会推迟触发；watcher 增量同样算活动。
         self._last_activity_monotonic = time.monotonic()
         # 健康自监控（迭代55）：后台周期任务的成功/失败计数进 /stats，
         # 让「daemon 看起来活着但巩固一直在静默失败」这类问题可观测。
         self.health = {"sleep_cycles": 0, "sleep_errors": 0,
                        "last_sleep_report_at": "",
+                       # Observability: which mode is served and which background
+                       # loops actually run ("running" vs "skipped:read_only").
+                       "read_only": bool(self.read_only), "background": {},
                        # Convergence counters: a long-running hub must be able to
                        # show that it is shrinking, not just "healthy".
                        "raw_purged_total": 0, "bytes_reclaimed_total": 0,
@@ -330,16 +346,46 @@ class MemoryHubService:
     def authenticated(self, supplied: str) -> bool:
         return self.access_policy(supplied) is not None
 
+    def _set_background_state(self, name: str, state: str) -> None:
+        """Record which background loops this process actually runs.
+
+        Without this, a read-only mirror and a daemon whose watcher silently
+        died look identical from /stats: both just have no loop. Exposed through
+        the health record -> /stats and /metrics.
+        """
+        background = self.health.get("background")
+        if not isinstance(background, dict):
+            background = {}
+            self.health["background"] = background
+        background[name] = state
+
     def start_watcher(self) -> None:
-        if not self.watch_enabled or self._watch_thread is not None:
+        if self.read_only:
+            self._set_background_state("watcher", "skipped:read_only")
             return
+        if not self.watch_enabled or self._watch_thread is not None:
+            self._set_background_state(
+                "watcher",
+                "skipped:watch_disabled" if not self.watch_enabled else "running")
+            return
+        self._set_background_state("watcher", "running")
         self._watch_thread = threading.Thread(target=self.watcher.run, name="hippomind-watcher", daemon=True)
         self._watch_thread.start()
 
     def start_discovery_loop(self) -> None:
-        """Background low-frequency agent discovery; cached between scans."""
-        if self._discovery_thread is not None:
+        """Background low-frequency agent discovery; cached between scans.
+
+        Read-only mode never runs it: discovery is the only caller of the
+        controlled auto-install, and installing integrations rewrites Agent
+        configuration files under HOME.
+        """
+        if self.read_only:
+            self._set_background_state("discovery", "skipped:read_only")
             return
+        if self._discovery_thread is not None:
+            self._set_background_state("discovery", "running")
+            return
+        self._set_background_state("discovery", "running")
 
         def loop() -> None:
             check_interval = min(600.0, max(30.0, self.discovery.interval / 8.0))
@@ -368,6 +414,10 @@ class MemoryHubService:
 
     def append_metrics_trend(self) -> Optional[Dict[str, Any]]:
         """把关键指标追加到 runtime_dir/metrics.jsonl（每小时至多一行）。"""
+        if self.read_only:
+            # A read-only mirror must not append to its runtime trend log: the
+            # mirror is not the writer of record for this ledger.
+            return None
         if self._metrics_log_path is None:
             return None
         now = time.time()
@@ -385,12 +435,38 @@ class MemoryHubService:
                 "uptime_s": round(now - self._started_at, 1),
             }
             self._metrics_log_path.parent.mkdir(parents=True, exist_ok=True)
-            with self._metrics_log_path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            self._append_private_line(self._metrics_log_path,
+                                      json.dumps(entry, ensure_ascii=False) + "\n")
             self._last_metrics_log = now
             return entry
         except Exception:
             return None
+
+    @staticmethod
+    def _append_private_line(path: Path, line: str) -> None:
+        """Append one 0600 line, rotating at METRICS_LOG_MAX_BYTES.
+
+        The runtime directory is shared by the console, so these files must not
+        be world-readable; and an hourly append that never rotates grows for the
+        lifetime of the daemon. Rotation keeps one bounded .1 generation.
+        """
+        try:
+            if path.exists() and path.stat().st_size >= METRICS_LOG_MAX_BYTES:
+                os.replace(str(path), str(path) + ".1")
+        except OSError:
+            pass
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            payload = line.encode("utf-8")
+            while payload:
+                written = os.write(fd, payload)
+                payload = payload[written:]
+        finally:
+            os.close(fd)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
 
     def start_warmup(self) -> None:
         """Warm SQLite page cache and the pack builder before the first hook.
@@ -401,7 +477,10 @@ class MemoryHubService:
         making the user's first prompt pay for it.
         """
         if self.read_only or self._stop_event.is_set():
+            self._set_background_state(
+                "warmup", "skipped:read_only" if self.read_only else "skipped:stopped")
             return
+        self._set_background_state("warmup", "running")
 
         def warm() -> None:
             try:
@@ -422,7 +501,12 @@ class MemoryHubService:
         so newly captured memories become semantically reachable.
         """
         if self.read_only or not self.watch_enabled or self._stop_event.is_set():
+            self._set_background_state(
+                "vector_index",
+                "skipped:read_only" if self.read_only else
+                ("skipped:watch_disabled" if not self.watch_enabled else "skipped:stopped"))
             return
+        self._set_background_state("vector_index", "running")
 
         def loop() -> None:
             while not self._stop_event.is_set():
@@ -463,10 +547,71 @@ class MemoryHubService:
         threading.Thread(target=loop, name="hippomind-vector-index",
                          daemon=True).start()
 
+    def start_entity_index_loop(self, *, tick_seconds: float = 900.0) -> None:
+        """把实体倒排挂到 live builder 上（默认关闭，仅显式开启时）。
+
+        与 start_vector_index_loop 的区别：实体索引**不需要**独立的同步循环。
+        EntityIndex.build() 实测暖态 30ms（生产 2,815 条 claim / 2,490 个实体），
+        而且 load_entity_index() 已按 (账本, generation) 做进程内缓存——写事务
+        一提交就自动重建。所以这里只需要：
+          1. 开关打开时构建一次并挂上；
+          2. 每 tick 重新调一次 load_entity_index()：缓存命中时是空操作，
+             generation 变了才会真重建。
+
+        这样 daemon 重启后不必等 900s，索引也不会「比账本旧」。
+        """
+        try:
+            from .entity_index import entity_channel_enabled
+        except Exception:
+            return
+        if not entity_channel_enabled():
+            self.health["entity_index"] = {"state": "disabled"}
+            self._set_background_state("entity_index", "disabled")
+            return
+        # 刻意**不**用 read_only / watch_enabled 门禁（向量通道用了，这里不用）：
+        # 实体倒排的构建是纯读（ledger._reading()），既不采集也不写盘，所以
+        # 只读镜像和 --no-watch 的 daemon 同样能用它。把只读能力挡在门禁外
+        # 是没必要的功能损失——而且会让 health 里连个状态都没有，运维看不到
+        # 「到底开没开」。
+        if self._stop_event.is_set():
+            self.health["entity_index"] = {"state": "stopped"}
+            self._set_background_state("entity_index", "skipped:stopped")
+            return
+        # Deliberately allowed in read-only mode: building the entity inverted
+        # index only reads the ledger (ledger._reading()).
+        self._set_background_state(
+            "entity_index", "running:read_only" if self.read_only else "running")
+
+        def loop() -> None:
+            while not self._stop_event.is_set():
+                try:
+                    from .entity_index import load_entity_index
+                    index = load_entity_index(self.ledger)
+                    if index is None:
+                        self.health["entity_index"] = {"state": "unavailable"}
+                    else:
+                        # 换到 live builder：新 pack 立刻用上实体通道。
+                        self.contexts.entity_index = index
+                        self.health["entity_index"] = dict(index.stats(),
+                                                           state="ready")
+                except Exception as exc:  # never take the hub down
+                    self.health["entity_index"] = {
+                        "state": "error",
+                        "error": "%s: %s" % (type(exc).__name__, str(exc)[:200])}
+                self._stop_event.wait(tick_seconds)
+
+        threading.Thread(target=loop, name="hippomind-entity-index",
+                         daemon=True).start()
+
     def start_capture_loop(self, *, tick_seconds: float = 60.0) -> None:
         """Continuously capture native Claude/Codex transcripts."""
         if self.read_only or not self.watch_enabled or self._stop_event.is_set():
+            self._set_background_state(
+                "capture",
+                "skipped:read_only" if self.read_only else
+                ("skipped:watch_disabled" if not self.watch_enabled else "skipped:stopped"))
             return
+        self._set_background_state("capture", "running")
 
         def loop() -> None:
             while not self._stop_event.is_set():
@@ -497,7 +642,12 @@ class MemoryHubService:
     def start_distill_loop(self, *, tick_seconds: float = 300.0) -> None:
         """Continuously distill new evidence into claims, with bounded batches."""
         if self.read_only or not self.watch_enabled or self._stop_event.is_set():
+            self._set_background_state(
+                "distill",
+                "skipped:read_only" if self.read_only else
+                ("skipped:watch_disabled" if not self.watch_enabled else "skipped:stopped"))
             return
+        self._set_background_state("distill", "running")
 
         def loop() -> None:
             while not self._stop_event.is_set():
@@ -532,6 +682,10 @@ class MemoryHubService:
 
     def start_metrics_trend_thread(self, *, tick_seconds: float = 60.0) -> None:
         """后台线程：每分钟醒来检查是否到了写趋势行的时间（每小时一行）。"""
+        if self.read_only:
+            self._set_background_state("metrics_trend", "skipped:read_only")
+            return
+        self._set_background_state("metrics_trend", "running")
 
         def loop() -> None:
             while not self._stop_event.is_set():
@@ -550,6 +704,10 @@ class MemoryHubService:
         Each install is verified and repaired once; failures are recorded in
         ``self.auto_install`` and never propagate to the caller.
         """
+        if self.read_only:
+            # Defense in depth: even a direct call cannot rewrite Agent configs
+            # from a read-only mirror.
+            return {"ran_at": utc_now(), "skipped": "read_only", "agents": {}}
         from .agent_install import agent_install_status, install_agents
         known = report.get("known", {}) if isinstance(report, dict) else {}
         detected = sorted(str(agent) for agent, item in known.items()
@@ -607,7 +765,45 @@ class MemoryHubService:
             "pid": os.getpid(), "host": host, "port": port, "started_at": self.started_at,
             "api_version": API_VERSION, "ledger": str(self.paths.ledger_path),
             "watch_enabled": self.watch_enabled, "auto_install": self.auto_install,
+            "read_only": bool(self.read_only),
         }
+
+    #: Trace window size/recent samples exposed by /stats (bounded tail read).
+    INJECTION_TRACE_WINDOW = 200
+    INJECTION_TRACE_RECENT = 10
+
+    def _injection_trace_window(self, policy: AccessPolicy) -> Dict[str, Any]:
+        """最近注入 trace 的窗口统计与末尾样本（复用 tail 读取）。
+
+        读取量由 injection_trace.recent() 的 TAIL_READ_BYTES 硬上限约束，
+        与 trace 文件总大小无关；关闭 debug/空结果/错误样本同样计入。
+        """
+        try:
+            rows = injection_trace.recent(self.INJECTION_TRACE_WINDOW)
+        except Exception:
+            rows = []
+        injected = sum(1 for row in rows if row.get("injected"))
+        arms = {injection_ab.TREATMENT: 0, injection_ab.CONTROL: 0, "unknown": 0}
+        for row in rows:
+            arm = str(row.get("arm") or "") or "unknown"
+            arms[arm] = arms.get(arm, 0) + 1
+        window: Dict[str, Any] = {
+            "count": len(rows),
+            "injected": injected,
+            "empty": len(rows) - injected,
+            "errors": sum(1 for row in rows if row.get("error")),
+            "arms": arms,
+            "last_at": str(rows[-1].get("at", "")) if rows else "",
+            "last_agent": str(rows[-1].get("agent", "")) if rows else "",
+            "recent": [dict(row) for row in rows[-self.INJECTION_TRACE_RECENT:]],
+        }
+        if not policy.admin:
+            # memory_ids/query_hash 是各 Agent 自己的可见面：scoped caller
+            # 只看本 Agent 的样本，聚合计数仍可作为健康信号。
+            window["restricted"] = True
+            window["recent"] = [row for row in window["recent"]
+                                if str(row.get("agent", "")) == policy.agent_id]
+        return window
 
     def stats(self, policy: Optional[AccessPolicy] = None) -> Dict[str, Any]:
         policy = policy or AccessPolicy.administrator()
@@ -628,6 +824,7 @@ class MemoryHubService:
                     "health": dict(self.health),
                     "started_at": self.started_at,
                     "pid": os.getpid() if policy.admin else 0}
+        response["injection_trace"] = self._injection_trace_window(policy)
         # WAL 体积告警：正常情况下维护周期 TRUNCATE 检查点会归零侧车；
         # 持续超阈值说明检查点被长读饿住或写入异常放大，需要运维关注。
         try:
@@ -654,6 +851,10 @@ class MemoryHubService:
         watcher 归档根在启动时固定，重载不改变采集范围。任何失败都
         不应中断 daemon——错误以字段形式返回。
         """
+        if self.read_only:
+            # Discovery + controlled auto-install rewrite Agent configuration
+            # files under HOME; a read-only mirror never does that.
+            return {"reloaded_at": utc_now(), "skipped": "read_only"}
         outcome: Dict[str, Any] = {"reloaded_at": utc_now()}
         try:
             report = self.discovery.maybe_discover(force=True)
@@ -676,6 +877,12 @@ class MemoryHubService:
 
         返回本轮报告；未触发返回 None。同一空闲期内只跑一次。
         """
+        if self.read_only:
+            # Repeated here (not only in start_sleep_loop) so a direct call can
+            # never decay/purge/checkpoint the read-only copy. The ledger write
+            # guard would refuse anyway; not even attempting keeps the mirror
+            # provably free of maintenance side effects.
+            return None
         now = time.monotonic()
         activity_sources = [self._last_activity_monotonic]
         last_import = getattr(self.watcher, "last_import_monotonic", None)
@@ -684,7 +891,14 @@ class MemoryHubService:
         idle_for = now - max(activity_sources)
         since_last = (now - self._last_sleep_run
                       if self._last_sleep_run is not None else float("inf"))
-        if idle_for < SLEEP_IDLE_SECONDS or since_last < SLEEP_IDLE_SECONDS:
+        import_idle = (now - last_import) if last_import is not None else float("inf")
+        max_interval = float(getattr(self, "_sleep_max_interval", 3600.0))
+        force_due = (
+            self._last_sleep_run is not None
+            and since_last >= max_interval
+            and import_idle >= 30.0
+        )
+        if not force_due and (idle_for < SLEEP_IDLE_SECONDS or since_last < SLEEP_IDLE_SECONDS):
             return None
         self._last_sleep_run = now
         report: Dict[str, Any] = {"triggered_at": utc_now(),
@@ -737,8 +951,13 @@ class MemoryHubService:
 
     def start_sleep_loop(self) -> None:
         """低频空闲检测线程：每分钟检查一次是否满足睡眠巩固条件。"""
-        if self._sleep_thread is not None:
+        if self.read_only:
+            self._set_background_state("sleep", "skipped:read_only")
             return
+        if self._sleep_thread is not None:
+            self._set_background_state("sleep", "running")
+            return
+        self._set_background_state("sleep", "running")
 
         def loop() -> None:
             while not self._stop_event.is_set():
@@ -760,28 +979,99 @@ class MemoryHubService:
                                               daemon=True)
         self._sleep_thread.start()
 
-    def shutdown(self) -> None:
-        """优雅停机：停采集与监听后做 WAL TRUNCATE 检查点并关闭本线程读连接。
-
-        账本写入是同步事务（无待刷队列），因此收尾重点是 WAL 侧车归零——
-        下次启动无需恢复，备份也只需主库文件。任何一步失败都不应阻止
-        进程退出。
-        """
+    def begin_shutdown(self) -> None:
+        """Stop serving quickly; the checkpoint happens in shutdown()."""
         self._stop_event.set()
-        self.watcher.stop()
-        if self._server is not None:
-            threading.Thread(target=self._server.shutdown, name="hippomind-shutdown", daemon=True).start()
         try:
-            summary = self.ledger.maintenance_checkpoint()
-            if summary.get("wal_truncated"):
-                logging.getLogger("hippomindd").info("停机检查点：WAL 已归零")
+            self.watcher.stop()
         except Exception:
             pass
         try:
-            self.ledger.close()
+            self.gui.close()
         except Exception:
             pass
+        self._request_server_stop()
 
+    def _request_server_stop(self) -> None:
+        if self._server is None:
+            return
+        thread = getattr(self, "_server_stop_thread", None)
+        if thread is not None and thread.is_alive():
+            return
+        thread = threading.Thread(target=self._server.shutdown,
+                                  name="hippomind-shutdown", daemon=True)
+        self._server_stop_thread = thread
+        thread.start()
+
+    def _join_server_stop(self, timeout: float = 5.0) -> None:
+        thread = getattr(self, "_server_stop_thread", None)
+        if thread is not None:
+            thread.join(timeout=timeout)
+
+    def _join_background_threads(self, *, timeout: float = 8.0) -> list:
+        """Wait for service-owned loops so no writer commits after the checkpoint."""
+        deadline = time.monotonic() + max(0.1, timeout)
+        current = threading.current_thread()
+        survivors = []
+        for thread in threading.enumerate():
+            if thread is current or not thread.name.startswith("hippomind-"):
+                continue
+            remaining = max(0.0, deadline - time.monotonic())
+            thread.join(timeout=min(remaining, 2.0))
+            if thread.is_alive():
+                survivors.append(thread.name)
+        return survivors
+
+    def _final_checkpoint(self, *, attempts: int = 5, delay: float = 0.05) -> Dict[str, Any]:
+        """TRUNCATE the WAL with bounded retries (a reader may report busy once)."""
+        summary: Dict[str, Any] = {}
+        for _attempt in range(max(1, attempts)):
+            try:
+                summary = self.ledger.maintenance_checkpoint()
+            except Exception as exc:
+                summary = {"wal_truncated": False, "wal_busy": False,
+                           "wal_pages": 0, "error": type(exc).__name__}
+            if summary.get("wal_truncated") or int(summary.get("wal_pages") or 0) == 0:
+                return summary
+            time.sleep(delay)
+        logging.getLogger("hippomindd").warning(
+            "停机检查点重试 %d 次后 WAL 未归零: busy=%s pages=%s",
+            attempts, summary.get("wal_busy"), summary.get("wal_pages"))
+        return summary
+
+    def shutdown(self) -> None:
+        """Graceful stop: stop writers, TRUNCATE checkpoint, reclaim readers.
+
+        Ordering matters.  Checkpointing before the background writers stop
+        leaves their commits in the WAL after shutdown returns; checkpointing
+        before readers are reclaimed lets TRUNCATE report busy.  So: stop the
+        server, join service threads, retry the checkpoint, close every reader,
+        then retry once more and close again.  Idempotent by design: the first
+        caller does the work, concurrent callers wait for completion.
+        """
+        with self._shutdown_lock:
+            first = not self._shutdown_started
+            if first:
+                self._shutdown_started = True
+        if not first:
+            self._shutdown_complete.wait(15.0)
+            return
+        try:
+            self.begin_shutdown()
+            self._join_server_stop()
+            self._join_background_threads()
+            self._final_checkpoint()
+            try:
+                self.ledger.close()
+            except Exception:
+                pass
+            self._final_checkpoint(attempts=2, delay=0.02)
+            try:
+                self.ledger.close()
+            except Exception:
+                pass
+        finally:
+            self._shutdown_complete.set()
 
 class MemoryHubHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
@@ -894,6 +1184,19 @@ class MemoryHubRequestHandler(BaseHTTPRequestHandler):
             from_time=raw.get("from_time", data.get("from_time", "")),
             to_time=raw.get("to_time", data.get("to_time", "")),
             as_of=raw.get("as_of", data.get("as_of", "")),
+            # WP-M：会话感知 follow-up 锚定。session_id 由宿主 hooks / DSH
+            # 插件 / CLI 透传；query_context 允许单次请求关闭（全局开关是
+            # HIPPOMIND_QUERY_CONTEXT，在 context_pack/query_context 里判）。
+            session_id=str(raw.get("session_id", data.get("session_id", "")) or "")[:256],
+            query_context=bool(raw.get("query_context",
+                                       data.get("query_context", True))),
+            # WP-Q：事实卡默认跟随 HIPPOMIND_FACT_CARDS（默认关闭）；单次请求
+            # 可用 body.options.fact_cards 显式覆盖。自动注入 path 与显式 API
+            # 共用本方法，所以显式调用方想关就传 false。
+            fact_cards=bool(raw.get("fact_cards",
+                                    data.get("fact_cards", fact_cards_enabled()))),
+            max_fact_card_chars=raw.get("max_fact_card_chars",
+                                        data.get("max_fact_card_chars", 600)),
             debug=bool(raw.get("debug", data.get("debug", False))),
             # /context-pack is the automatic-injection endpoint, so it
             # defaults to the same relevance gate as the CLI auto path.
@@ -902,6 +1205,10 @@ class MemoryHubRequestHandler(BaseHTTPRequestHandler):
                 float(os.environ.get("HIPPOMIND_MIN_SCORE", "0.20")))),
             hybrid_rerank=bool(raw.get("hybrid_rerank",
                                       data.get("hybrid_rerank", True))),
+            workspace_cwd=str(raw.get("workspace_cwd",
+                data.get("workspace_cwd", data.get("cwd", ""))) or "")[:512],
+            include_pinned=bool(raw.get("include_pinned",
+                data.get("include_pinned", False))),
         )
 
     @staticmethod
@@ -917,11 +1224,194 @@ class MemoryHubRequestHandler(BaseHTTPRequestHandler):
             "score": round(float(item.get("score", 0.0)), 4),
         }
 
+    @staticmethod
+    def _query_data(raw_query: str) -> Dict[str, Any]:
+        """GET query string -> 与 POST JSON body 同形的 data 映射。"""
+        params_ = parse_qs(raw_query)
+        data: Dict[str, Any] = {}
+        for key, values in params_.items():
+            if values:
+                data[str(key)] = values[0]
+        for key in ("max_items", "max_chars", "max_tokens"):
+            if key in data:
+                try:
+                    data[key] = int(data[key])
+                except (TypeError, ValueError):
+                    data.pop(key)
+        if "min_score" in data:
+            try:
+                data["min_score"] = float(data["min_score"])
+            except (TypeError, ValueError):
+                data.pop("min_score")
+        for key in ("raw_chat", "require_evidence", "hybrid_rerank", "debug",
+                    "query_context", "fact_cards"):
+            if key in data:
+                data[key] = str(data[key]).strip().lower() in {"1", "true", "yes", "on"}
+        return data
+
+    @staticmethod
+    def _trace_context_pack(*, agent: str, query: str, injected: bool,
+                            item_count: int, text: str, memory_ids: list,
+                            empty_reason: str, latency_ms: float, scope: str,
+                            task_id: str, error: str = "",
+                            arm: str = "") -> None:
+        """旁路写一条 HTTP 注入 trace；观测失败绝不影响请求本身。"""
+        try:
+            injection_trace.record_server_injection(
+                agent=agent, query=query, injected=injected,
+                item_count=item_count, context_chars=len(text or ""),
+                memory_ids=memory_ids, empty_reason=empty_reason,
+                latency_ms=latency_ms, scope=scope, task_id=task_id,
+                error=error, arm=arm, source="http")
+        except Exception as exc:
+            # 只记录异常类型：错误正文可能带路径/数据，不进日志。
+            sys.stderr.write(
+                f"[hippomindd] injection trace failure: {type(exc).__name__}\n")
+
+    def _serve_context_pack(self, policy: AccessPolicy,
+                            data: Mapping[str, Any]) -> None:
+        """GET/POST /context-pack 的唯一注入与 trace 路径。"""
+        started = time.perf_counter()
+        query = str(data.get("query", ""))
+        agent = str(data.get("agent", "all") or "all")
+        if not policy.admin:
+            if agent not in {"", "all", policy.agent_id}:
+                raise AccessDenied(
+                    f"agent {policy.agent_id} 不能读取 {agent} 的上下文开关")
+            agent = policy.agent_id
+        trace_agent = str(data.get("agent") or "").strip()
+        if trace_agent in {"", "all"}:
+            trace_agent = "" if policy.admin else str(policy.agent_id or "")
+        trace_agent = (trace_agent or "http")[:64]
+        options = self._options(data)
+        options.scope = policy.enforce_options(options.scope, raw_chat=options.raw_chat)
+        if options.session_id and not options.anchor_scopes:
+            extra_scopes = [s for s in getattr(policy, "scopes", ()) or () if s and s != options.scope]
+            if not extra_scopes and trace_agent and trace_agent != "http":
+                extra_scopes = [f"agent:{trace_agent}"]
+            options.anchor_scopes = tuple(extra_scopes)
+        trace_scope = str(options.scope or "")
+        trace_task = str(options.task_id or "")[:128]
+        # A/B runs after the host decided this prompt wants memory and before
+        # the build, so an empty retrieval cannot consume a control slot.  The
+        # control arm still retrieves (matched pair), only delivery differs.
+        caller_ab_handled = bool(data.get("ab_handled", False))
+        if caller_ab_handled:
+            ab_arm = str(data.get("ab_arm") or "").strip()[:32]
+        else:
+            ab_decision = injection_ab.assign(agent=trace_agent, query=query)
+            ab_arm = (str(ab_decision.get("arm") or "")
+                      if ab_decision.get("enabled") else "")
+        if ab_arm == injection_ab.CONTROL:
+            options.record_touch = False
+        try:
+            injection = self.hub.injection.status(agent)
+        except LedgerError:
+            injection = {"agent": agent, "enabled": False, "error": "invalid_state"}
+        if not injection.get("enabled", False):
+            # 关闭开关同样是「未注入」对照样本，必须留 trace。
+            reason = "injection_state_error" if injection.get("error") else "injection_disabled"
+            if not caller_ab_handled:
+                self._trace_context_pack(
+                    agent=trace_agent, query=query, injected=False, item_count=0,
+                    text="", memory_ids=[], empty_reason=reason,
+                    latency_ms=(time.perf_counter() - started) * 1000.0,
+                    scope=trace_scope, task_id=trace_task)
+            self._write(200, {"items": [], "text": "",
+                              "injection_enabled": False,
+                              "injection_agent": injection.get("agent", agent)})
+            return
+        debug_requested = bool(options.debug)
+        # memory_ids 只有 build() 的 debug 视图会披露（items 本身不带 id）。
+        # 内部强制开启 debug 取 id，再按调用方是否请求过 debug 剥离。
+        options.debug = True
+        try:
+            pack = self.hub.contexts.build(query, options)
+        except Exception as exc:
+            if not caller_ab_handled:
+                self._trace_context_pack(
+                    agent=trace_agent, query=query, injected=False, item_count=0,
+                    text="", memory_ids=[], empty_reason="error",
+                    latency_ms=(time.perf_counter() - started) * 1000.0,
+                    scope=trace_scope, task_id=trace_task,
+                    error=type(exc).__name__)
+            raise
+        # build() 的缓存按 options.debug 分键且返回共享 dict：这里先浅拷贝，
+        # 避免响应剥离 debug / 追加 injection_* 字段时污染缓存条目。
+        pack = dict(pack)
+        debug = pack.get("debug") if isinstance(pack.get("debug"), Mapping) else {}
+        if not debug_requested:
+            pack.pop("debug", None)
+        items = pack.get("items") if isinstance(pack.get("items"), list) else []
+        text = str(pack.get("text", "") or "")
+        memory_ids = []
+        selected = debug.get("selected") if isinstance(debug.get("selected"), list) else []
+        for entry in selected:
+            entry_ids = entry.get("memory_ids") if isinstance(entry, Mapping) else None
+            for memory_id in entry_ids if isinstance(entry_ids, list) else []:
+                value = str(memory_id)
+                if value and value not in memory_ids:
+                    memory_ids.append(value)
+        injected = bool(items)
+        empty_reason = ""
+        if not injected:
+            empty_reason = str(debug.get("empty_reason") or "")
+            if not empty_reason:
+                count = debug.get("candidate_count")
+                if count is None and isinstance(debug.get("candidates"), list):
+                    count = len(debug["candidates"])
+                empty_reason = ("candidates=%d" % int(count)
+                                if isinstance(count, int) else "candidates=0")
+        if ab_arm == injection_ab.CONTROL and not caller_ab_handled:
+            # Matched control: retrieval and scoring ran on exactly the same
+            # candidate set as the treatment arm; only delivery is withheld.
+            # Recording the offered ids keeps both arms evaluable.
+            self._trace_context_pack(
+                agent=trace_agent, query=query, injected=False,
+                item_count=0, text="", memory_ids=memory_ids,
+                empty_reason="ab_control",
+                latency_ms=(time.perf_counter() - started) * 1000.0,
+                scope=trace_scope, task_id=trace_task, arm=ab_arm)
+            self._write(200, {"items": [], "text": "",
+                              "injection_enabled": True,
+                              "injection_agent": injection.get("agent", agent),
+                              "injection_arm": ab_arm})
+            return
+        if not caller_ab_handled:
+            self._trace_context_pack(
+                agent=trace_agent, query=query, injected=injected,
+                item_count=len(items), text=text if injected else "",
+                memory_ids=memory_ids, empty_reason=empty_reason,
+                latency_ms=(time.perf_counter() - started) * 1000.0,
+                scope=trace_scope, task_id=trace_task, arm=ab_arm)
+        pack["injection_enabled"] = True
+        pack["injection_agent"] = injection.get("agent", agent)
+        if ab_arm:
+            pack["injection_arm"] = ab_arm
+        self._write(200, pack)
+
+    def _safe_serve_context_pack(self, policy: AccessPolicy,
+                                 data: Mapping[str, Any]) -> None:
+        """把共享注入路径的异常映射成与 POST 原有语义一致的 HTTP 状态。"""
+        try:
+            self._serve_context_pack(policy, data)
+        except AccessDenied as exc:
+            self._write(403, {"error": str(exc)})
+        except LedgerError as exc:
+            self._write(400, {"error": str(exc)})
+        except (TypeError, ValueError) as exc:
+            self._write(400, {"error": str(exc)})
+        except Exception as exc:
+            sys.stderr.write(
+                f"[hippomindd] context-pack failure: {type(exc).__name__}: {exc}\n")
+            self._write(500, {"error": "internal server error"})
+
     def _handle_get(self) -> None:
         path = urlsplit(self.path).path.rstrip("/") or "/"
         if path == "/health":
             self._write(200, {"status": "ok", "api_version": API_VERSION, "pid": os.getpid(),
                               "server_version": SERVER_VERSION, "watch_enabled": self.hub.watch_enabled,
+                              "read_only": bool(getattr(self.hub, "read_only", False)),
                               "ledger_id": ledger_identity(self.hub.paths.ledger_path)})
             return
         if path == "/stats":
@@ -929,9 +1419,18 @@ class MemoryHubRequestHandler(BaseHTTPRequestHandler):
             if policy is not None:
                 self._write(200, self.hub.stats(policy))
             return
+        if path == "/context-pack":
+            # GET/POST 共用 _serve_context_pack：两种方法写同一条统一 trace。
+            policy = self._require_auth()
+            if policy is not None:
+                self.server.service.note_activity()
+                self._safe_serve_context_pack(
+                    policy, self._query_data(urlsplit(self.path).query))
+            return
         if path == "/graph":
             policy = self._require_auth()
             if policy is not None:
+                self.server.service.note_activity()
                 params_ = parse_qs(urlsplit(self.path).query)
                 subject = (params_.get("subject") or [""])[0]
                 if not subject:
@@ -953,13 +1452,15 @@ class MemoryHubRequestHandler(BaseHTTPRequestHandler):
                 except ValueError:
                     limit = 200
                 # 节点/边仅含主语、计数与 memory_id，不含记忆正文。
+                as_of_arg = str((params_.get("as_of") or [""])[0] or "").strip()
                 self._write(200, self.hub.ledger.entity_graph(
-                    subject, scope=scope, hops=hops, limit=limit))
+                    subject, scope=scope, hops=hops, limit=limit, as_of=as_of_arg))
             return
         if path == "/conflicts":
             # 冲突裁决入口只读视图：claim 元数据 + 记忆摘要，不含全文。
             policy = self._require_auth()
             if policy is not None:
+                self.server.service.note_activity()
                 params_ = parse_qs(urlsplit(self.path).query)
                 try:
                     scope = policy.enforce_options(
@@ -980,6 +1481,13 @@ class MemoryHubRequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/metrics":
             # Prometheus 抓取端点：仅暴露计数/体积，不含记忆内容。
+            # 匿名抓取曾把账本规模/健康面暴露给本机任意进程；现在与 /stats
+            # 一样要求本地凭据（/health 仍是唯一免鉴权端点）。载荷只有聚合
+            # 计数与体积，因此按管理员视图渲染以便 Prometheus 在只读镜像上
+            # 也能抓到真实规模。
+            policy = self._require_auth()
+            if policy is None:
+                return
             stats = self.hub.stats(AccessPolicy.administrator())
             body = render_prometheus(
                 stats, time.time() - getattr(self.hub, "_started_at", time.time()))
@@ -1113,8 +1621,10 @@ class MemoryHubRequestHandler(BaseHTTPRequestHandler):
             return
         try:
             if path.startswith("/api/v1/"):
+                self.server.service.note_activity()
                 self._write(200, self.hub.gui.post(path, data, policy))
             elif path == "/ingest":
+                self.server.service.note_activity()
                 records = data.get("records", [data])
                 if not isinstance(records, list) or not records or len(records) > 128:
                     raise LedgerError("records 必须是 1 到 128 条对象")
@@ -1128,6 +1638,7 @@ class MemoryHubRequestHandler(BaseHTTPRequestHandler):
                 self._write(200, {"accepted": len(results), "inserted": sum(r["inserted"] for r in results),
                                   "results": results})
             elif path == "/recall":
+                self.server.service.note_activity()
                 query = str(data.get("query", ""))
                 options = self._options(data).normalise()
                 options.scope = policy.enforce_options(options.scope, raw_chat=options.raw_chat)
@@ -1139,33 +1650,17 @@ class MemoryHubRequestHandler(BaseHTTPRequestHandler):
                     from_time=options.from_time, to_time=options.to_time,
                     include_raw_chat=options.raw_chat, require_evidence=options.require_evidence,
                     limit=limit, offset=offset, as_of=options.as_of,
+                    embedder=self.hub.contexts.embedder,
+                    vector_index=self.hub.contexts.vector_index,
+                    entity_index=self.hub.contexts.entity_index,
                 )
                 self._write(200, {"hits": [self._public_memory(hit) for hit in hits],
                                   "offset": offset, "limit": limit})
             elif path == "/context-pack":
-                agent = str(data.get("agent", "all") or "all")
-                if not policy.admin:
-                    if agent not in {"", "all", policy.agent_id}:
-                        raise AccessDenied(f"agent {policy.agent_id} 不能读取 {agent} 的上下文开关")
-                    agent = policy.agent_id
-                try:
-                    injection = self.hub.injection.status(agent)
-                except LedgerError:
-                    # A damaged local preference must never cause accidental
-                    # context disclosure. The caller can keep working with no
-                    # injected history and repair the setting explicitly.
-                    injection = {"agent": agent, "enabled": False, "error": "invalid_state"}
-                if not injection.get("enabled", False):
-                    self._write(200, {"items": [], "text": "", "injection_enabled": False,
-                                      "injection_agent": injection.get("agent", agent)})
-                    return
-                options = self._options(data)
-                options.scope = policy.enforce_options(options.scope, raw_chat=options.raw_chat)
-                pack = self.hub.contexts.build(str(data.get("query", "")), options)
-                pack["injection_enabled"] = True
-                pack["injection_agent"] = injection.get("agent", agent)
-                self._write(200, pack)
+                self.server.service.note_activity()
+                self._safe_serve_context_pack(policy, data)
             elif path == "/feedback":
+                self.server.service.note_activity()
                 memory = self.hub.ledger.get_memory(str(data.get("memory_id", "")))
                 if memory is None:
                     raise LedgerError("未找到记忆")
@@ -1178,6 +1673,7 @@ class MemoryHubRequestHandler(BaseHTTPRequestHandler):
                 )
                 self._write(200, {"updated": changed})
             elif path == "/sync":
+                self.server.service.note_activity()
                 policy.require("sync")
                 self._write(200, self.hub.watcher.sync_once())
             elif path == "/stats":
@@ -1220,11 +1716,9 @@ class MemoryHubRequestHandler(BaseHTTPRequestHandler):
             slots.release()
 
     def do_GET(self) -> None:
-        self.server.service.note_activity()
         self._limited(self._handle_get)
 
     def do_POST(self) -> None:
-        self.server.service.note_activity()
         self._limited(self._handle_post)
 
 
@@ -1245,22 +1739,51 @@ def run_daemon(*, ledger_path: Optional[os.PathLike] = None,
     server = MemoryHubHTTPServer((host, int(port)), service)
     service._server = server
     _atomic_json(paths.state_path, service.state(host, int(port)))
-    service.start_watcher()
-    service.start_warmup()
-    service.start_discovery_loop()
-    service.start_capture_loop()
-    service.start_vector_index_loop()
-    service.start_distill_loop()
-    service.start_metrics_trend_thread()
-    service.start_sleep_loop()
+    if read_only:
+        # Read-only mirror: the only retained background work is the *pure
+        # read* entity index build. Watcher, discovery (auto-install), capture,
+        # distill, vector sync, sleep consolidation, metrics-trend and warmup
+        # either write the ledger or rewrite Agent config, so they are never
+        # started. Each start_* carries the same gate; skipping here keeps the
+        # startup path auditable in one place.
+        service.start_entity_index_loop()
+    else:
+        service.start_watcher()
+        service.start_warmup()
+        service.start_discovery_loop()
+        service.start_capture_loop()
+        service.start_vector_index_loop()
+        service.start_entity_index_loop()
+        service.start_distill_loop()
+        service.start_metrics_trend_thread()
+        service.start_sleep_loop()
+    # 遗忘审计报告首次调用要付一次无索引全表扫描（ledger_events 279 MiB，
+    # 冷页实测 0.7-2.7s），其余部分只要 8-9ms。控制台首屏会卡在这上面。
+    # 预热是**显式 opt-in**（GuiApi 的 __init__ 不启动任何后台线程——那样
+    # 会持只读连接建出 -shm 文件，把 test_mcp_register 的 rmtree 撞成
+    # ENOTEMPTY）。这里在后台线程里跑一次，让第一个真实请求命中缓存。
+    if not read_only:
+        try:
+            service.gui.start_forgetting_prefetch()
+        except Exception:
+            # 预热失败不影响 daemon 启动：缓存未命中只是慢一点，不是故障。
+            pass
 
     def stop_signal(_signum, _frame) -> None:
-        service.shutdown()
+        # Signal handlers must return fast: only stop accepting work here;
+        # the join/checkpoint sequence runs in the finally block below.
+        service.begin_shutdown()
 
     def reload_signal(_signum, _frame) -> None:
-        # SIGHUP 热重载：强制重扫发现 + 受控自动安装；失败不中断 daemon。
+        # SIGHUP 热重载：在信号处理器中只起守护线程，避免重入锁或阻塞事件循环。
+        def _bg_reload() -> None:
+            try:
+                service.reload()
+            except Exception:
+                pass
         try:
-            service.reload()
+            threading.Thread(target=_bg_reload, name="hippomind-sighup-reload",
+                             daemon=True).start()
         except Exception:
             pass
 
@@ -1273,7 +1796,11 @@ def run_daemon(*, ledger_path: Optional[os.PathLike] = None,
     try:
         server.serve_forever(poll_interval=0.35)
     finally:
-        service.watcher.stop()
+        # Full graceful stop before the process exits, whichever path got us
+        # here (SIGTERM only begins shutdown; /shutdown requests and plain
+        # serve_forever exits land here).  Idempotent, so a second call is a
+        # no-op and a concurrent call waits for the first to finish.
+        service.shutdown()
         server.server_close()
         current = load_runtime_state(paths)
         if current.get("pid") == os.getpid():

@@ -23,9 +23,14 @@ import math
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from typing import Any, Dict
+from unittest import mock
+
+import json
 
 import numpy as np
 
@@ -40,6 +45,7 @@ import eval_semantic  # noqa: E402
 _HERMETIC_HOME = tempfile.mkdtemp(prefix="hippo-vi-home-")
 os.environ["HIPPOMIND_HOME"] = _HERMETIC_HOME
 
+from hippomind import semantic_space
 from hippomind.ledger import SQLiteLedger
 from hippomind.vector_index import (
     CLAIM_FORMAT_VERSION, CLAIM_INDEX_FILENAME, CLAIM_OVERSCAN, DEFAULT_GRANULARITY,
@@ -1220,6 +1226,293 @@ class SemanticGateTests(unittest.TestCase):
         result = eval_semantic.gate(self._healthy())
         self.assertEqual(0.935, result["baselines"]["keyword"])
         self.assertEqual(0.067, result["baselines"]["semantic"])
+
+
+# ---------------------------------------------------------------------------
+# 并发检索与原子落盘（WP-E）
+# ---------------------------------------------------------------------------
+# 设计契约（本区测试逐条锁定）：
+#   1. search 在取 matrix/ids/valid 三个并行数组时拿同一把 RLock 做快照；
+#      remove/add_many 只会**重绑定**这些数组，matmul 在锁外跑在快照上。
+#      因此并发 remove 不可能让 search 用旧矩阵索引新（更短的）ids -> IndexError；
+#      也不会把 cosine 归到错误的 memory 上。
+#   2. save 用 mkstemp 的唯一临时文件 + os.replace 原子发布：并发写者互不踩踏，
+#      读者只会看到旧的完整文件或新的完整文件；失败时旧文件必须原样保留。
+#   3. semantic_space.save 同一契约（后台重建与在线查询共存）。
+
+
+def _patch_slow_dot(entered, release, real_dot):
+    """让 np.dot 在进入后阻塞，给测试一个确定的竞态窗口。"""
+
+    def slow_dot(left, right, *args, **kwargs):
+        entered.set()
+        release.wait(5)
+        return real_dot(left, right, *args, **kwargs)
+
+    return slow_dot
+
+
+class VectorIndexConcurrencyTests(LedgerCase):
+    def _build(self, count=16):
+        for index in range(count):
+            _ingest(self.ledger, "并发索引记忆 %d 数据库端口" % index)
+        index = VectorIndex.build(self.ledger, self.embedder)
+        self.assertIsNotNone(index)
+        return index
+
+    def test_search_survives_remove_rebinding_the_arrays(self):
+        index = self._build()
+        ids_before = list(index.ids)
+        entered, release = threading.Event(), threading.Event()
+        results: Dict[str, Any] = {}
+        errors: list = []
+
+        def run_search():
+            try:
+                results["hits"] = index.search_text("数据库端口", topn=10)
+            except Exception as exc:  # noqa: BLE001 - 记录下来断言为空
+                errors.append(exc)
+
+        with mock.patch.object(np, "dot", _patch_slow_dot(entered, release, np.dot)):
+            worker = threading.Thread(target=run_search)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(5), "search 没有进入 np.dot")
+                index.remove(ids_before[:4])
+            finally:
+                release.set()
+                worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual([], errors, "并发 remove 让 search 抛了 %r" % errors)
+        self.assertTrue(results["hits"])
+        self.assertTrue({mid for mid, _score in results["hits"]} <= set(ids_before),
+                        "结果必须来自快照那一代 id")
+
+    def test_search_and_remove_stress_100_iterations(self):
+        index = self._build(48)
+        errors: list = []
+        stop = threading.Event()
+
+        def searcher():
+            while not stop.is_set():
+                try:
+                    index.search_text("数据库端口", topn=10)
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(exc)
+                    return
+                # 让出 GIL：本测试要的是竞态，不是把主线程饿死。
+                time.sleep(0.0002)
+
+        worker = threading.Thread(target=searcher)
+        worker.start()
+        try:
+            for iteration in range(100):
+                victims = index.ids[:3]
+                if victims:
+                    index.remove(victims)
+                index.add_many([("m-refill-%d" % iteration,
+                                 "重新填充的并发记忆 %d 数据库端口" % iteration)])
+        finally:
+            stop.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual([], errors, "100 次竞态出现异常: %r" % errors[:3])
+
+    def test_sync_snapshots_the_generation_before_reconciling(self):
+        index = self._build(6)
+        errors: list = []
+        stop = threading.Event()
+
+        def churn():
+            while not stop.is_set():
+                try:
+                    if index.ids:
+                        index.remove([index.ids[-1]])
+                    index.add_many([("m-churn-%d" % len(index.ids),
+                                     "churn %d 数据库端口" % len(index.ids))])
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(exc)
+                    return
+                time.sleep(0.0002)
+
+        worker = threading.Thread(target=churn)
+        worker.start()
+        try:
+            for _ in range(20):
+                index.sync(self.ledger)
+        finally:
+            stop.set()
+            worker.join(5)
+        self.assertEqual([], errors)
+
+
+class VectorIndexAtomicSaveTests(LedgerCase):
+    def _index(self, count=3):
+        for index in range(count):
+            _ingest(self.ledger, "落盘记忆 %d 数据库端口" % index)
+        return VectorIndex.build(self.ledger, self.embedder)
+
+    def test_save_uses_a_unique_temporary_file_and_atomic_replace(self):
+        index = self._index()
+        path = self.root / "index.npz"
+        replaced = []
+        real_replace = os.replace
+
+        def tracking_replace(source, destination, *args, **kwargs):
+            replaced.append((str(source), str(destination)))
+            return real_replace(source, destination, *args, **kwargs)
+
+        with mock.patch("hippomind.vector_index.os.replace", tracking_replace):
+            saved = index.save(path)
+        self.assertEqual(path, saved)
+        self.assertEqual(1, len(replaced))
+        source, destination = replaced[0]
+        self.assertEqual(str(path), destination)
+        self.assertNotEqual(str(path) + ".tmp", source,
+                            "不能用固定的 *.tmp 名：并发写者会互相踩踏")
+        self.assertTrue(source.endswith(".tmp"))
+        self.assertEqual([], [item.name for item in self.root.iterdir()
+                              if item.name.endswith(".tmp")])
+        loaded = VectorIndex.load(self.embedder, path)
+        self.assertEqual(index.ids, loaded.ids)
+
+    def test_failed_save_keeps_the_previous_complete_file(self):
+        first = self._index()
+        path = self.root / "index.npz"
+        self.assertIsNotNone(first.save(path))
+        _ingest(self.ledger, "落盘新增记忆 数据库端口")
+        second = VectorIndex.build(self.ledger, self.embedder)
+        with mock.patch.object(np, "savez", side_effect=RuntimeError("disk full")):
+            self.assertIsNone(second.save(path), "落盘失败按契约返回 None")
+        self.assertTrue(path.is_file())
+        loaded = VectorIndex.load(self.embedder, path)
+        self.assertIsNotNone(loaded)
+        self.assertEqual(first.ids, loaded.ids, "失败不得破坏上一个完整索引")
+        self.assertEqual([], [item.name for item in self.root.iterdir()
+                              if item.name.endswith(".tmp")])
+
+    def test_two_concurrent_saves_leave_one_loadable_file(self):
+        first = self._index()
+        _ingest(self.ledger, "第二个索引多出来的记忆 数据库端口")
+        second = VectorIndex.build(self.ledger, self.embedder)
+        path = self.root / "index.npz"
+        errors: list = []
+
+        def save(index):
+            try:
+                if index.save(path) is None:
+                    errors.append("save returned None")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        workers = [threading.Thread(target=save, args=(index,))
+                   for index in (first, second)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(5)
+        self.assertEqual([], errors)
+        loaded = VectorIndex.load(self.embedder, path)
+        self.assertIsNotNone(loaded, "并发落盘后文件必须仍然可读")
+        self.assertIn(loaded.ids, (first.ids, second.ids))
+
+
+class ClaimVectorIndexConcurrencyTests(LedgerCase):
+    def _build(self, count=8):
+        for index in range(count):
+            _ingest_claims(self.ledger, "并发 claim 记忆 %d" % index,
+                           [_claim("s%d" % index, "p", "v%d" % index)])
+        built = ClaimVectorIndex.build(self.ledger, self.embedder)
+        self.assertIsNotNone(built)
+        return built
+
+    def test_claim_search_survives_remove_rebinding_the_arrays(self):
+        index = self._build()
+        claim_ids_before = list(index.claim_ids)
+        entered, release = threading.Event(), threading.Event()
+        results: Dict[str, Any] = {}
+        errors: list = []
+
+        def run_search():
+            try:
+                results["hits"] = index.search_text("s0 p", topn=5)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        with mock.patch.object(np, "dot", _patch_slow_dot(entered, release, np.dot)):
+            worker = threading.Thread(target=run_search)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(5), "claim search 没有进入 np.dot")
+                index.remove(claim_ids_before[:3])
+            finally:
+                release.set()
+                worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual([], errors, "并发 remove 让 claim search 抛了 %r" % errors)
+        for _memory_id, _score, claim_id in results["hits"]:
+            self.assertIn(claim_id, claim_ids_before)
+
+    def test_claim_save_is_atomic_and_failure_preserves_the_old_file(self):
+        index = self._build()
+        path = self.root / "claims.npz"
+        self.assertIsNotNone(index.save(path))
+        with mock.patch.object(np, "savez", side_effect=RuntimeError("disk full")):
+            self.assertIsNone(index.save(path))
+        loaded = ClaimVectorIndex.load(self.embedder, path)
+        self.assertIsNotNone(loaded)
+        self.assertEqual(index.claim_ids, loaded.claim_ids)
+        self.assertEqual([], [item.name for item in self.root.iterdir()
+                              if item.name.endswith(".tmp")])
+
+
+class SemanticSpaceAtomicSaveTests(unittest.TestCase):
+    MODEL = {"dim": 2, "vectors": {"a": [1.0, 0.0], "b": [0.0, 1.0]}}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="hippo-sem-")
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.path = self.root / "semantic_space.json"
+
+    def test_save_is_atomic_and_leaves_no_temporary_file(self):
+        semantic_space.save(self.MODEL, self.path)
+        self.assertEqual(self.MODEL, json.loads(self.path.read_text(encoding="utf-8")))
+        self.assertEqual([], [item.name for item in self.root.iterdir()
+                              if item.name.endswith(".tmp")])
+        updated = {"dim": 2, "vectors": {"c": [0.5, 0.5]}}
+        semantic_space.save(updated, self.path)
+        self.assertEqual(updated, json.loads(self.path.read_text(encoding="utf-8")))
+
+    def test_failed_replace_keeps_the_previous_model(self):
+        semantic_space.save(self.MODEL, self.path)
+        with mock.patch("hippomind.semantic_space.os.replace",
+                        side_effect=OSError("read-only fs")):
+            with self.assertRaises(OSError):
+                semantic_space.save({"dim": 2, "vectors": {"z": [1.0, 1.0]}}, self.path)
+        self.assertEqual(self.MODEL, json.loads(self.path.read_text(encoding="utf-8")),
+                         "替换失败不得留下半截模型")
+        self.assertEqual([], [item.name for item in self.root.iterdir()
+                              if item.name.endswith(".tmp")])
+
+    def test_concurrent_saves_produce_a_parseable_model(self):
+        models = [{"dim": 2, "vectors": {"t%d" % i: [float(i), 1.0]}} for i in range(4)]
+        errors: list = []
+
+        def save(model):
+            try:
+                semantic_space.save(model, self.path)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        workers = [threading.Thread(target=save, args=(model,)) for model in models]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(5)
+        self.assertEqual([], errors)
+        payload = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertIn(payload, models, "并发保存后文件必须是一个完整模型")
 
 
 if __name__ == "__main__":

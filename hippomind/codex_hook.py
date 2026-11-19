@@ -16,9 +16,36 @@ import sys
 from types import SimpleNamespace
 from typing import Any, Dict, Mapping, Optional
 
+from . import injection_ab
 from .auto_context import (AUTO_MAX_CHARS, AUTO_MAX_ITEMS, extract_memory_request,
                            render_untrusted_context)
 from .cli import fetch_auto_context
+
+
+def _memory_ids(pack: Mapping[str, Any]) -> list:
+    seen: list = []
+    debug = pack.get("debug") if isinstance(pack.get("debug"), Mapping) else {}
+    selected = debug.get("selected") if isinstance(debug.get("selected"), list) else []
+    for entry in selected:
+        if not isinstance(entry, Mapping):
+            continue
+        for mid in (entry.get("memory_ids") or []):
+            val = str(mid or "").strip()
+            if val and val not in seen:
+                seen.append(val)
+    if not seen:
+        for item in pack.get("items", []) or []:
+            if not isinstance(item, Mapping):
+                continue
+            mid = str(item.get("memory_id") or "").strip()
+            if mid and mid not in seen:
+                seen.append(mid)
+            for ev in (item.get("evidence") or [])[:2]:
+                if isinstance(ev, Mapping) and ev.get("memory_id"):
+                    val = str(ev["memory_id"]).strip()
+                    if val and val not in seen:
+                        seen.append(val)
+    return seen[:8]
 
 
 HOOK_EVENT_NAME = "UserPromptSubmit"
@@ -76,34 +103,52 @@ def build_hook_response(payload: Mapping[str, Any], *, agent_config: str,
         mode = "anywhere"
     if mode != "always" and not extract_memory_request(request, mode=mode)["triggered"]:
         return None
+    # WP-M：UserPromptSubmit payload 的 session_id 用来锚定「继续/同上」。
+    # 收口长度，绝不把长文本带进查询或 trace。
+    session_id = str(payload.get("session_id") or payload.get("sessionId") or "")[:256]
+    ab_active = injection_ab.enabled()
+    always_mode = (mode == "always" or os.environ.get("HIPPOMIND_AUTO_INJECT") == "always")
+    decision = injection_ab.assign(agent="codex", query=request) if (ab_active or always_mode) else {
+        "arm": "treatment", "inject": True, "enabled": False, "reason": "ab_disabled"
+    }
     args = SimpleNamespace(
         ledger=None, runtime_dir=None, port=None, agent_config=str(agent_config),
         offline=False, no_start=False, archive=None, watch_interval=30.0,
         no_watch=False, agent="codex", scope="shared", project="", task="",
         max_items=AUTO_MAX_ITEMS, max_chars=AUTO_MAX_CHARS, debug=False, cwd=cwd,
-        trigger_mode=mode,
+        trigger_mode=mode, session_id=session_id,
+        ab_handled=bool(ab_active or always_mode),
+        ab_arm=str(decision.get("arm") or "") if decision.get("enabled") else "",
     )
     try:
-        pack = fetch_auto_context(args, request[:MAX_HOOK_PROMPT_CHARS])
+        pack = fetch_auto_context(args, request[:MAX_HOOK_PROMPT_CHARS],
+                                  session_id=session_id)
         context = render_untrusted_context(pack, max_chars=AUTO_MAX_CHARS)
     except Exception:
         return None
-    if not context:
-        return None
-    if os.environ.get("HIPPOMIND_INJECTION_TRACE", "1") != "0" and (
-            trigger_mode == "always" or os.environ.get("HIPPOMIND_AUTO_INJECT") == "always"):
+    if (ab_active or always_mode) and os.environ.get("HIPPOMIND_INJECTION_TRACE", "1") != "0":
         try:
             from .injection_trace import record
-            memory_ids = []
-            for item in pack.get("items", []) or []:
-                for evidence in (item.get("evidence") or [])[:2]:
-                    if isinstance(evidence, dict) and evidence.get("memory_id"):
-                        memory_ids.append(str(evidence["memory_id"]))
-            record(agent="codex", query=request, context=context,
-                   item_count=len(pack.get("items", [])), source="codex-hook",
-                   memory_ids=memory_ids[:8])
+            offered = _memory_ids(pack)
+            items = pack.get("items", []) or []
+            if not context:
+                record(agent="codex", query=request, context="", item_count=0,
+                       injected=bool(decision["inject"]), source="codex-hook",
+                       memory_ids=offered,
+                       arm=str(decision.get("arm") or "") if decision.get("enabled") else "",
+                       arm_reason="empty_pack")
+                return None
+            record(agent="codex", query=request,
+                   context=context if decision["inject"] else "",
+                   item_count=len(items) if decision["inject"] else 0,
+                   injected=bool(decision["inject"]), source="codex-hook",
+                   memory_ids=offered,
+                   arm=str(decision.get("arm") or "") if decision.get("enabled") else "",
+                   arm_reason=str(decision.get("reason") or "") if decision.get("enabled") else "")
         except Exception:
             pass
+    if not context or not decision["inject"]:
+        return None
     return {
         "hookSpecificOutput": {
             "hookEventName": HOOK_EVENT_NAME,

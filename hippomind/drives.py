@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+from .textutil import coerce_random_seed
+
 import math
 import random
 from typing import Dict, List, Optional
@@ -95,7 +97,7 @@ def _drive_names(value) -> List[str]:
 
 class DriveEngine:
     def __init__(self, seed: Optional[int] = None, **cfg):
-        self.rng = random.Random(seed)
+        self.rng = random.Random(coerce_random_seed(seed))
         self.cfg = {
             "drives": list(DEFAULT_DRIVES),
             "grow": dict(DEFAULT_GROW),
@@ -250,8 +252,8 @@ class DriveEngine:
                 continue
             delta = min(self.cfg["resonance_nudge"] * aff, self.cfg["resonance_cap"])
             before = self.values[d]
-            self.values[d] = min(self.cfg["ceil"].get(d, 1.0),
-                                 max(0.0, before + delta))
+            ceil = self.cfg["ceil"].get(d, 1.0)
+            self.values[d] = max(before, min(ceil, max(0.0, before + delta)))
             if abs(self.values[d] - before) > 1e-6:
                 applied[d] = self.values[d] - before
         return applied

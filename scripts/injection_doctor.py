@@ -27,8 +27,8 @@ sys.path.insert(0, str(ROOT))
 from hippomind.agent_install import (SUPPORTED_AGENTS, agent_config_path,  # noqa: E402
                                      agent_mcp_path, agent_rule_path)
 from hippomind.injection_audit import audit, summarize  # noqa: E402
-from hippomind.injection_repair import (apply_repairs, repair_codex_hook,  # noqa: E402
-                                        repair_mcp_server)
+from hippomind.injection_repair import (apply_repairs, repair_claude_hook,  # noqa: E402
+                                        repair_codex_hook, repair_mcp_server)
 
 DEFAULT_LEDGER = os.path.expanduser(
     "~/Library/Application Support/HippoMind/hippomind.sqlite")
@@ -73,6 +73,14 @@ def main(argv=None) -> int:
             repairs.append(repair_codex_hook(
                 home / ".codex" / "hooks.json", package_root=ROOT,
                 agent_config=agent_config_path(config_root.parent, "codex"),
+                python=python, ledger_path=ledger_path))
+        if "claude" in agents:
+            # Claude 的 hook 落在 settings.json —— 用户自己的设置文件。
+            # 修复只替换带 hippomind.claude_hook 的那条 handler，并收敛历史
+            # 重复（正则修补每跑一次多叠一层的产物）。
+            repairs.append(repair_claude_hook(
+                home / ".claude" / "settings.json", package_root=ROOT,
+                agent_config=agent_config_path(config_root.parent, "claude"),
                 python=python, ledger_path=ledger_path))
         # 规则文件单独处理：它要求"就地重写托管段"，不能整份覆盖
         # （用户在同一文件里还写了自己的内容）。

@@ -16,6 +16,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from .context_pack import (DEFAULT_MAX_TOKENS, ContextPackBuilder, ContextPackOptions,
                            render_untrusted_payload)
+from .fact_cards import fact_cards_enabled
 from .ledger import SQLiteLedger
 
 
@@ -60,6 +61,29 @@ def _load_vector_index(ledger: SQLiteLedger, embedder):
         # 预取的预算是 700ms——在请求里重建等于把一次冷启动变成一次超时。
         # 构建与增量同步归 daemon 的 start_vector_index_loop（每 900s 一次）。
         return load_granular_index(ledger, onnx_embedder, build=False)
+    except Exception:
+        return None
+
+
+def _load_entity_index(ledger: SQLiteLedger):
+    """可选实体倒排（entity_index.EntityIndex）：任何失败都返回 None。
+
+    **默认关闭**（HIPPOMIND_ENTITY_CHANNEL 未设置时返回 None）。关闭时
+    ledger.search 的行为与改造前逐字节相同——这是硬要求，有测试锁定。
+
+    与向量通道的区别：实体倒排不落盘、构建只要几十毫秒（生产 2,815 条
+    claim / 2,490 个实体实测 < 50ms），所以**可以在请求路径上重建**，
+    不需要 daemon 的后台循环，也不会有「索引比账本旧」的窗口。这是它相对
+    向量通道的一个真实工程优势，别照抄向量那边的落盘+后台同步复杂度。
+    """
+    try:
+        from .entity_index import entity_channel_enabled, load_entity_index
+    except Exception:
+        return None
+    if not entity_channel_enabled():
+        return None
+    try:
+        return load_entity_index(ledger)
     except Exception:
         return None
 
@@ -136,7 +160,7 @@ def augment_auto_context_query(request: str, *, cwd: str = "") -> str:
 def build_auto_context(ledger: SQLiteLedger, request: str, *, scope: str = "shared",
                        project: str = "", task_id: str = "", max_items: int = AUTO_MAX_ITEMS,
                        max_chars: int = AUTO_MAX_CHARS, debug: bool = False,
-                       cwd: str = "") -> Dict[str, Any]:
+                       cwd: str = "", session_id: str = "") -> Dict[str, Any]:
     """Build the strict pack used before an agent starts ordinary task work.
 
     The marker-selected user request is deliberately retained as the query.
@@ -163,10 +187,16 @@ def build_auto_context(ledger: SQLiteLedger, request: str, *, scope: str = "shar
         task_id=task_id,
         debug=debug,
         min_score=float(os.environ.get("HIPPOMIND_MIN_SCORE", "0.20")),
+        # WP-M：同会话 follow-up 锚定。空串 = 不用会话过滤（按时间窗兜底）。
+        session_id=str(session_id or "")[:256],
+        # WP-Q：事实卡是自动注入路径的 opt-in（HIPPOMIND_FACT_CARDS=1 才开）。
+        # 显式 API/CLI/MCP 的 ContextPackOptions 默认仍是 False，行为零变化。
+        fact_cards=fact_cards_enabled(),
         # The ledger-native semantic space only helps through the rerank stage:
         # with the embedder alone the labelled pack recall is unchanged (0.935),
         # with hybrid rerank it rises to 0.957.
         hybrid_rerank=True,
+        workspace_cwd=str(cwd or "")[:512],
     )
     # Match the native Codex/Pi contract exactly. Workspace paths may differ
     # across hosts even when they are continuing the same shared task.
@@ -179,6 +209,7 @@ def build_auto_context(ledger: SQLiteLedger, request: str, *, scope: str = "shar
     return ContextPackBuilder(
         ledger, embedder=embedder,
         vector_index=_load_vector_index(ledger, embedder),
+        entity_index=_load_entity_index(ledger),
     ).build(request, options)
 
 

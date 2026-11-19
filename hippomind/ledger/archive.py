@@ -111,13 +111,15 @@ class ArchiveMixin:
     def _prune_raw_archives(root: Path, max_bytes: int) -> Tuple[int, int]:
         files = []
         total = 0
-        for path in root.glob("raw-*.jsonl.gz"):
-            try:
-                size = path.stat().st_size
-            except OSError:
-                continue
-            files.append((path.stat().st_mtime_ns, path, size))
-            total += size
+        for pattern in ("raw-*.jsonl.gz", "purged-*.jsonl.gz", "dedupe-*.jsonl.gz"):
+            for path in root.glob(pattern):
+                try:
+                    st = path.stat()
+                    size = st.st_size
+                except OSError:
+                    continue
+                files.append((st.st_mtime_ns, path, size))
+                total += size
         removed = 0
         for _mtime, path, size in sorted(files):
             if total <= max_bytes:
@@ -172,7 +174,7 @@ class ArchiveMixin:
         cutoff_epoch = time.time() - before_days * 86_400
         cutoff_iso = datetime.fromtimestamp(cutoff_epoch, tz=timezone.utc).isoformat()
 
-        with self._connect() as conn:
+        with self._reading() as conn:
             summary["purge_candidates"] = int(conn.execute(
                 "SELECT COUNT(*) FROM memories WHERE raw_chat=1 AND created_at<=?",
                 (cutoff_iso,),
@@ -191,7 +193,7 @@ class ArchiveMixin:
             with gzip.open(archive_path, "wb") as handle:
                 after = ""
                 while True:
-                    with self._connect() as conn:
+                    with self._reading() as conn:
                         batch = conn.execute("""
                             SELECT m.memory_id,m.origin_event_id,m.content,m.source_agent,
                                    m.session_id,m.task_id,m.project,m.role,m.scope,
@@ -548,32 +550,41 @@ class ArchiveMixin:
         summary: Dict[str, Any] = {"duplicate_groups": 0, "collapsed": 0,
                                    "archive_path": "", "dry_run": bool(dry_run)}
 
+        if not self.read_only:
+            self._transaction(lambda conn: conn.execute("DROP TABLE IF EXISTS _dedupe_groups"))
+
+        with self._reading() as conn:
+            summary["duplicate_groups"] = int(conn.execute("""
+                SELECT COUNT(*) FROM (
+                    SELECT 1 FROM memories WHERE raw_chat=1 AND content!=''
+                    GROUP BY content, source_agent, session_id, role
+                    HAVING COUNT(*)>1
+                )
+            """).fetchone()[0])
+        if dry_run or not summary["duplicate_groups"]:
+            return summary
+
         def rebuild_groups(conn: sqlite3.Connection) -> None:
-            # Crash-window guard.  ``_dedupe_groups`` is a *persistent* table and
-            # the drop only happens in the ``finally`` below, so a process killed
-            # mid-run leaves a stale snapshot behind.  ``CREATE TABLE IF NOT
-            # EXISTS`` then silently keeps that snapshot, and the delete JOIN
-            # below trusts it: a stale row whose survivor was already removed
-            # makes every remaining copy look like a loser, so rows that must
-            # survive get deleted (measured: 3 duplicate rows -> 0 left instead
-            # of 1).  Each run therefore starts from an unconditional rebuild;
-            # DROP+CREATE in one transaction means a crash leaves no table at
-            # all, which is the safe state, rather than a plausible-looking lie.
             conn.execute("DROP TABLE IF EXISTS _dedupe_groups")
             conn.execute("""
                 CREATE TABLE _dedupe_groups AS
-                SELECT MAX(memory_id) AS survivor_id, content, source_agent, session_id,
-                       role, COUNT(*) AS n
+                SELECT substr(
+                           MAX(
+                               CASE WHEN COALESCE(json_extract(metadata_json, '$.identity_version'), 0) >= 2
+                                    THEN '1:' ELSE '0:' END || memory_id
+                           ), 3
+                       ) AS survivor_id,
+                       content, source_agent, session_id, role, COUNT(*) AS n
                 FROM memories WHERE raw_chat=1 AND content!=''
                 GROUP BY content, source_agent, session_id, role HAVING COUNT(*)>1
             """)
 
         self._transaction(rebuild_groups)
         try:
-            with self._connect() as conn:
+            with self._reading() as conn:
                 summary["duplicate_groups"] = int(conn.execute(
                     "SELECT COUNT(*) FROM _dedupe_groups").fetchone()[0])
-            if dry_run or not summary["duplicate_groups"]:
+            if not summary["duplicate_groups"]:
                 return summary
 
             root = self._raw_archive_root(archive_dir)
@@ -584,7 +595,7 @@ class ArchiveMixin:
             with gzip.open(archive_path, "wb") as handle:
                 after = ""
                 while True:
-                    with self._connect() as conn:
+                    with self._reading() as conn:
                         batch = conn.execute("""
                             SELECT m.memory_id,m.origin_event_id,m.content,m.source_agent,
                                    m.session_id,m.task_id,m.project,m.role,m.scope,
@@ -648,6 +659,7 @@ class ArchiveMixin:
                     conn.execute(f"DELETE FROM memory_relations WHERE child_memory_id IN ({ph})", chunk)
                     conn.execute(f"DELETE FROM memory_relations WHERE parent_memory_id IN ({ph})", chunk)
                     conn.execute(f"DELETE FROM memory_claims WHERE memory_id IN ({ph})", chunk)
+                    conn.execute(f"DELETE FROM memory_feedback WHERE memory_id IN ({ph})", chunk)
                     conn.execute(f"DELETE FROM memories WHERE memory_id IN ({ph})", chunk)
                     conn.execute(f"DELETE FROM ledger_events WHERE event_id IN ({eph})", events)
 

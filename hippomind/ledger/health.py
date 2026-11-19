@@ -58,51 +58,36 @@ class HealthMixin:
         reported separately as ``stale``: they waste index space but do not
         make recall incorrect, so they do not by themselves fail the check.
         """
+        indexed = fts_indexed_predicate()
         with self._reading() as conn:
-            # One pass over the FTS table, then a linear anti-join.  A temp
-            # table (not an IN-list) keeps this bounded regardless of size.
-            #
-            # ``memory_id`` is declared UNINDEXED in the fts5 table, so a
-            # duplicate index row is representable — and has been observed
-            # after an interrupted redact/maintenance pass.  The audit must
-            # *report* that, not crash on it: a ``PRIMARY KEY`` insert aborted
-            # the whole health check with `UNIQUE constraint failed`, turning a
-            # diagnosable index defect into an opaque traceback.  Counting raw
-            # rows and distinct ids separately keeps the invariant comparable
-            # while the duplication shows up as ``duplicate_rows``.
-            conn.execute("DROP TABLE IF EXISTS temp._fts_sync_ids")
-            conn.execute("CREATE TEMP TABLE _fts_sync_ids(memory_id TEXT PRIMARY KEY)")
-            conn.execute("INSERT OR IGNORE INTO _fts_sync_ids "
-                         "SELECT memory_id FROM memory_fts")
-            fts_rows = int(conn.execute(
-                "SELECT COUNT(*) FROM memory_fts").fetchone()[0])
-            duplicate_rows = fts_rows - int(conn.execute(
-                "SELECT COUNT(*) FROM _fts_sync_ids").fetchone()[0])
-            indexed = fts_indexed_predicate()
-            indexed_m = fts_indexed_predicate("m")
-            expected = int(conn.execute(
-                "SELECT COUNT(*) FROM memories WHERE " + indexed).fetchone()[0])
-            missing = int(conn.execute(
-                "SELECT COUNT(*) FROM memories m WHERE " + indexed_m +
-                " AND NOT EXISTS (SELECT 1 FROM _fts_sync_ids f "
-                "                WHERE f.memory_id=m.memory_id)"
-            ).fetchone()[0])
-            # Index entries that maintenance should have removed.  These are
-            # capacity waste, not a recall correctness problem.
-            stale = int(conn.execute(
-                "SELECT COUNT(*) FROM _fts_sync_ids f JOIN memories m "
-                "ON m.memory_id=f.memory_id WHERE NOT (" + indexed_m + ")"
-            ).fetchone()[0])
-            orphan = int(conn.execute(
-                "SELECT COUNT(*) FROM _fts_sync_ids f WHERE NOT EXISTS "
-                "(SELECT 1 FROM memories m WHERE m.memory_id=f.memory_id)"
-            ).fetchone()[0])
-            conn.execute("DROP TABLE IF EXISTS temp._fts_sync_ids")
+            # 纯只读扫描：不在 temp 库建表，保证 SQLiteLedger(read_only=True) 的
+            # PRAGMA query_only=ON 连接也能正常诊断，同时保持 O(N) 线性时间。
+            fts_id_list = [str(r[0]) for r in conn.execute("SELECT memory_id FROM memory_fts")]
+            expected_ids = {str(r[0]) for r in conn.execute(
+                "SELECT memory_id FROM memories WHERE " + indexed)}
+            fts_rows = len(fts_id_list)
+            fts_set = set(fts_id_list)
+            duplicate_rows = fts_rows - len(fts_set)
+            expected = len(expected_ids)
+            missing = len(expected_ids - fts_set)
+            extra = sorted(fts_set - expected_ids)
+            stale = 0
+            if extra:
+                for start in range(0, len(extra), 400):
+                    chunk = extra[start:start + 400]
+                    marks = ",".join("?" for _ in chunk)
+                    stale += int(conn.execute(
+                        "SELECT COUNT(*) FROM memories WHERE memory_id IN (" + marks + ")",
+                        tuple(chunk),
+                    ).fetchone()[0])
+            orphan = len(extra) - stale
         status = "ok" if missing == 0 and duplicate_rows == 0 else "warn"
         if missing:
             hint = "运行 hippomind maintain 可重建 FTS"
         elif duplicate_rows:
             hint = "FTS 存在重复索引行，运行 hippomind maintain 可清理"
+        elif stale or orphan:
+            hint = "存在陈旧/孤儿 FTS 索引行，运行 hippomind maintain 可清理"
         else:
             hint = None
         return {"status": status,
@@ -120,12 +105,13 @@ class HealthMixin:
                 "hint": hint}
 
     def claims_consistency_report(self) -> Dict[str, Any]:
-        """活跃 claim 指向的记忆必须存在且为 accepted。"""
+        """活跃 claim 指向的记忆必须存在且满足 accepted+active。"""
+        indexed_m = fts_indexed_predicate("m")
         with self._reading() as conn:
             row = conn.execute(
                 "SELECT COUNT(*) FROM memory_claims c LEFT JOIN memories m "
                 "ON m.memory_id=c.memory_id WHERE c.state='active' "
-                "AND (m.memory_id IS NULL OR m.quality_state!='accepted')"
+                "AND (m.memory_id IS NULL OR NOT (" + indexed_m + "))"
             ).fetchone()[0]
             total = conn.execute(
                 "SELECT COUNT(*) FROM memory_claims WHERE state='active'").fetchone()[0]
@@ -203,12 +189,13 @@ class HealthMixin:
         archive_files = 0
         archive_bytes = 0
         if archive_root.is_dir() and not archive_root.is_symlink():
-            for archive in archive_root.glob("raw-*.jsonl.gz"):
-                try:
-                    archive_files += 1
-                    archive_bytes += archive.stat().st_size
-                except OSError:
-                    continue
+            for pattern in ("raw-*.jsonl.gz", "purged-*.jsonl.gz", "dedupe-*.jsonl.gz"):
+                for archive in archive_root.glob(pattern):
+                    try:
+                        archive_files += 1
+                        archive_bytes += archive.stat().st_size
+                    except OSError:
+                        continue
         return {
             "path": str(self.path), "schema_version": int(version), "journal_mode": str(journal).upper(),
             "events": event_count, "memories": sum(lifecycle.values()), "raw_chat": raw,

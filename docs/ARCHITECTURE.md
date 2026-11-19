@@ -9,28 +9,51 @@ HippoMind is a local, single-user memory hub for coding agents. It is not a clou
 ```text
 normal user request
         |
-        +-- no 记忆： marker --> no ledger read, no daemon start, no injection
+        +-- injection state off --> no injection (collection may continue)
         |
-        +-- marker present --> native hook / DSH plugin / managed rule
-                                  |
-                                  v
-                         localhost daemon or local CLI
-                                  |
-                                  v
-                     scope + evidence filtering, FTS5, rank, MMR
-                                  |
-                                  v
-                 <= 8 items, <= 16000 transport characters, 6000-token budget
-                                  |
-                                  v
-                    nonce-wrapped untrusted reference data
+        +-- injection state on  --> native hook / DSH plugin / managed rule
+        |                          (auto-context, trigger-mode always)
+        |                          |
+        |                          v
+        |                 localhost daemon or local CLI
+        |                          |
+        |                          v
+        |             scope + evidence filtering, FTS5 + optional vector/entity, rank, MMR
+        |                          |
+        |                          v
+        |     <= 8 items, <= 16000 transport characters, 6000-token budget
+        |                          |
+        |                          v
+        |             escaped, nonce-wrapped untrusted reference data
+        |
+        +-- explicit "记忆：" query --> same pipeline, but the query is forced
+                                         (trigger-mode anywhere; still parsed
+                                         before runtime paths, and never fires
+                                         inside quoted lines/fenced code)
 ```
 
-The explicit marker is deliberately the first gate. It is parsed before creating runtime paths or contacting the daemon. Markers inside quoted lines, fenced code blocks, inline code, or without text after the colon do not trigger. This preserves a simple user interaction while preventing accidental history injection in ordinary work.
+Injection is **on by default per agent** for the installed integrations, so an
+ordinary request prefetches the minimal evidence context without a marker. The
+`记忆：` marker is not a global gate any more: it only forces the query for that
+turn, and it remains parsed before any runtime path is created, so quoted or
+fenced occurrences never trigger a lookup accidentally. A disabled agent still
+collects evidence but receives an empty Context Pack until it is enabled again.
+
+A short follow-up (继续/同上, a bare acknowledgement, or an otherwise content-free
+request under 16 characters) is anchored to the most recent real user message in
+the same session, bounded to the last two messages and a 180-minute window,
+before retrieval. This is a retrieval-only rewrite: non-follow-up queries take
+the identical path and produce byte-identical packs, and a short request that
+still carries its own content words (跑测试/部署/回滚) is deliberately *not*
+anchored. Queries with content words keep a strict original-token overlap guard,
+and `as_of` historical slices never anchor because a session window comes from
+now. Disable per process with `HIPPOMIND_QUERY_CONTEXT=0` or per request with
+`options.query_context=false`; the anchor query itself is a bounded read-only
+SELECT over the last 30 user raw-chat rows (p95 under 1 ms in the fixture).
 
 ## Storage and lifecycle
 
-`ledger_events` is append-only evidence. `memories` is a mutable retrieval projection. `memory_fts` is an incremental FTS5 index. Claims use `(subject, predicate, slot_key)` to mark superseded facts inactive; relation rows preserve causal parents until the active chain can be archived together. Structured facts include valid time and asserted time. Procedural records keep trigger patterns, preconditions, an ordered pipeline, verification assertions, and a calibration score without executing stored commands.
+`ledger_events` is append-only evidence. `memories` is a mutable retrieval projection. `memory_fts` is an incremental FTS5 index. Claims use `(subject, predicate, slot_key)` to mark superseded facts inactive; relation rows preserve causal parents until the active chain can be archived together. Structured facts include valid time and asserted time; claim identity is versioned (v3) so an explicit source event id distinguishes repeated wording, while replay of the same event stays idempotent. Procedural records keep trigger patterns, preconditions, an ordered pipeline, verification assertions, and a calibration score without executing stored commands.
 
 Raw chat is evidence only. Watchers admit user and assistant messages, filter tool/system/developer content, redact secrets, constrain size, retain raw data for a bounded period, and archive cold material as private compressed JSONL. Context Pack excludes raw chat by default.
 
@@ -46,7 +69,7 @@ MCP resources are an additional explicit control surface. The active-context tem
 
 ## Operational model
 
-The daemon binds only to `127.0.0.1`, validates ledger ownership, enforces token and ACL boundaries, reconstructs watcher cursors after failures, and uses bounded retry/backoff for privacy permissions. SQLite uses WAL, busy timeouts, batched writes, incremental FTS updates, pagination, caches, and checkpoints. The legacy matplotlib GUI is optional and samples graph edges incrementally so it cannot become a daemon dependency. The primary GUI is the same-origin Atlas web console served at `/ui`; its read model lives in `hippomind/gui_api.py` behind `/api/v1/*`, requires the local admin token, is bounded and read-only except audited pin/feedback operations, and the static asset server only exposes files inside `hippomind/web/` with CSP/frame-ancestors headers.
+The daemon binds only to `127.0.0.1`, validates ledger ownership, enforces token and ACL boundaries, reconstructs watcher cursors after failures, and uses bounded retry/backoff for privacy permissions. All authenticated write verbs are downgraded in `--read-only` mode, and a read-only daemon additionally opens the ledger through `mode=ro` plus `PRAGMA query_only=ON`, skips schema migration/WAL maintenance/raw purge, and starts no background write loop (watcher, discovery auto-install, capture, distill, vector refresh, sleep consolidation, metrics trend); only pure-read index builds keep running. `/health` is the only unauthenticated HTTP endpoint. SQLite uses WAL, busy timeouts, batched writes, incremental FTS updates, pagination, caches, and checkpoints. The legacy matplotlib GUI is optional and samples graph edges incrementally so it cannot become a daemon dependency. The primary GUI is the same-origin Atlas web console served at `/ui`; its read model lives in `hippomind/gui_api.py` behind `/api/v1/*`, requires the local admin token, is bounded and read-only except audited pin/feedback operations, and the static asset server only exposes files inside `hippomind/web/` with CSP/frame-ancestors headers.
 
 ## Portability and release
 

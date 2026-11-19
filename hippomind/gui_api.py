@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import platform
 import plistlib
@@ -33,6 +34,7 @@ import secrets
 import shutil
 import sqlite3
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -46,6 +48,12 @@ from .ledger._helpers import (
     DEFAULT_RAW_CAPACITY,
     DEFAULT_RAW_RETENTION_DAYS,
     RAW_ARCHIVE_DIR_NAME,
+)
+from .forgetting import (
+    DEFAULT_DAYS as FORGETTING_DEFAULT_DAYS,
+    DEFAULT_LIMIT as FORGETTING_DEFAULT_LIMIT,
+    ReadOnlyLedger as ForgettingReader,
+    forgetting_report,
 )
 
 ATLAS_VERSION = "1.0"
@@ -61,16 +69,80 @@ UI_NONCE_TTL_SECONDS = 120
 MAX_PENDING_UI_NONCES = 8
 WAL_WARN_BYTES = 64 * 1024 * 1024
 
+#: 遗忘审计报告在进程内的存活时间（秒）。
+#:
+#: 为什么要缓存：forgetting_report() 每次都要重读整个窗口，其中「全部时间 decay
+#: 事件数」在生产账本上是一次无索引全表扫描（实测：页缓存热 ~50ms，冷启动
+#: 0.8-2.1s；ledger_events 268k 行、账本 924MB）。控制台每次打开视图都付一次
+#: 这个成本，首屏就卡住了。
+#:
+#: 为什么还要 TTL 而不是纯按 generation 失效：ledger.generation 只对**本进程**
+#: 的写事务自增。运维在终端里跑一次 maintain 是另一个进程写的，generation 不动，
+#: 缓存会把维护前的报告一直端出去。30 秒是「审计报告」这个新鲜度诉求的上限：
+#: 它描述的是按天计的衰减，不是秒级指标。
+#: 2026-10-25 从 30s 提到 300s。原值定得太短，理由本身没错（运维在终端跑
+#: maintain 是另一个进程写的，generation 不动，缓存会把维护前的报告一直端出去），
+#: 但它把「跨进程维护」的新鲜度诉求套在了「按天计的衰减报告」上：
+#:
+#:   * 这份报告描述的是天级的 utility 衰减与归档，不是秒级指标；
+#:   * 实测全量重算 0.65s（冷页）/ 0.065s（热页），TTL=30s 意味着
+#:     每 30 秒就有一个倒霉请求要付一次全表扫描；
+#:   * maintain 的 tick 是小时级，5 分钟的新鲜度已经比它细。
+#:
+#: 需要立刻看到最新状态时，加 ?refresh=1 绕过缓存（见 forgetting()）。
+FORGETTING_CACHE_TTL_SECONDS = 300.0
+
+#: 首屏汇总（/api/v1/overview）与体检（/api/v1/health）的缓存存活时间。
+#:
+#: 为什么要缓存：这两个端点是 Pulse / Health 视图的**首屏**依赖，而它们各自
+#: 都要跑一遍全库聚合。2026-10-25 生产账本（26.8 万记忆 / 27.9 万事件 / 881 MiB）
+#: 实测：ledger.stats() 3.2s、integrity_check() 3.6s、health_overview() 0.7s、
+#: fts_sync_report() 0.5s。Pulse 视图同时调 overview + health，首屏超过 15 秒——
+#: 截图 QA 里表现为「骨架屏还在，页面一片空白」，而报告却显示 PASS。
+#:
+#: 15 秒是「账本规模 + 无索引 COUNT」的物理成本，不是可以靠优化查询消掉的；
+#: 而这些数字描述的是**按小时变化的账本规模**，不是秒级指标。缓存 60 秒让
+#: 第二次之后的访问是毫秒级，同时保持「一分钟内的变化可见」。
+#: 需要立刻看到最新值时加 ?refresh=1。
+SNAPSHOT_CACHE_TTL_SECONDS = 60.0
+
+#: 报告缓存的条目上限。键里含 days/limit/scope/include_raw_chat，正常浏览只会
+#: 用到个位数条目；超过就整体清空（代数一变旧键永远不可能再命中，留着是泄漏）。
+FORGETTING_CACHE_MAX = 8
+
+#: GUI 允许回看的天数上限。与 CLI 的 --days 不同，这里要挡掉「一次点开 3650 天」
+#: 这种把事件预算打满的请求；1 年是衰减审计还能问出答案的实际边界。
+FORGETTING_MAX_DAYS = 365
+
+#: A/B 进度端点的 tail-read 上界（字节）。
+#:
+#: 注：injection_trace.recent()/summary() 已改为尾部有界读取；GUI 侧仍自行
+#: append-only 且没有轮转，所以直接用它等于把文件大小变成每次请求的成本。
+#: 2 MiB 够放几万条 trace（一条约 300-400 字节），而「距 30 条还差多少」这个
+#: 问题不需要全量历史：数到 30 就够下结论了，再多也只是同一个答案。
+INJECTION_AB_TAIL_BYTES = 2 * 1024 * 1024
+
+#: 进度端点允许回看多少条 trace（tail 读之后的上界）。
+INJECTION_AB_MAX_TRACES = 50_000
+
+#: 单飞锁的上限。键里含写代数，而 daemon 每次写事务都会让它变一次，所以这个
+#: dict 会随写入缓慢增长。超过就整体清空：**等待者持有的是 Lock 对象本身**，
+#: 清空 dict 不会打断它们，最多让一个后来的调用者新建一把锁、多扫一遍窗口——
+#: 代价是一次 60ms 的重复读，而留着不清理是确定的泄漏。
+FORGETTING_LOCK_MAX = 32
+
 #: Endpoint catalogue served by /api/v1/meta and rendered by the reference view.
 ENDPOINTS: Tuple[Dict[str, Any], ...] = (
     {"method": "GET", "path": "/health", "summary": "存活与账本指纹（无需令牌）", "auth": "none"},
     {"method": "GET", "path": "/stats", "summary": "账本/归档/来源/缓存统计", "auth": "token"},
     {"method": "POST", "path": "/recall", "summary": "关键词召回（FTS + LIKE 双通道）", "auth": "token"},
+    {"method": "GET", "path": "/context-pack",
+     "summary": "组装最小、带证据的上下文包（query string）", "auth": "token"},
     {"method": "POST", "path": "/context-pack", "summary": "组装最小、带证据的上下文包", "auth": "token"},
     {"method": "POST", "path": "/feedback", "summary": "以外部反馈调整工作记忆权重", "auth": "token"},
     {"method": "GET", "path": "/graph", "summary": "实体图谱邻域", "auth": "token"},
     {"method": "GET", "path": "/conflicts", "summary": "冲突/被取代 claim 谱系", "auth": "token"},
-    {"method": "GET", "path": "/metrics", "summary": "Prometheus 文本指标", "auth": "none"},
+    {"method": "GET", "path": "/metrics", "summary": "Prometheus 文本指标（需令牌）", "auth": "token"},
     {"method": "GET", "path": "/api/v1/meta", "summary": "版本、上限与接口目录", "auth": "admin"},
     {"method": "GET", "path": "/api/v1/overview", "summary": "首屏体征：统计+增长+最近入档", "auth": "admin"},
     {"method": "GET", "path": "/api/v1/memories", "summary": "记忆库分页浏览与筛选", "auth": "admin"},
@@ -88,6 +160,9 @@ ENDPOINTS: Tuple[Dict[str, Any], ...] = (
     {"method": "GET", "path": "/api/v1/events", "summary": "结构化事件流（排除 raw/tool/system）", "auth": "admin"},
     {"method": "GET", "path": "/api/v1/pins", "summary": "置顶记忆列表", "auth": "admin"},
     {"method": "GET", "path": "/api/v1/duplicates", "summary": "近似重复候选（只读）", "auth": "admin"},
+    {"method": "GET", "path": "/api/v1/forgetting", "summary": "遗忘审计：为什么被降权、还能否召回", "auth": "admin"},
+    {"method": "GET", "path": "/api/v1/injection-ab",
+     "summary": "注入 A/B 实验进度：两臂样本与还差多少", "auth": "admin"},
     {"method": "POST", "path": "/api/v1/pin", "summary": "置顶/取消置顶一条记忆", "auth": "admin"},
     {"method": "POST", "path": "/api/v1/feedback", "summary": "对一条记忆给出正负反馈", "auth": "admin"},
     {"method": "POST", "path": "/api/v1/ui-token", "summary": "签发一次性 UI 引导令牌", "auth": "admin"},
@@ -228,10 +303,30 @@ def _relation_memory(row: Mapping[str, Any]) -> Dict[str, Any]:
 class GuiApi:
     """Admin-scoped read model for the console; mounted by the daemon handler."""
 
-    def __init__(self, hub: Any):
+    def __init__(self, hub: Any, *, prefetch: bool = False):
         self.hub = hub
         self.ledger = hub.ledger
         self._ui_nonces: Dict[str, float] = {}
+        # 遗忘审计报告的进程内缓存：值 = (monotonic, 报告)，键见 _forgetting_key()。
+        # 用锁而不是「读多写少就无所谓」：ThreadingHTTPServer 下两个标签页同时
+        # 打开视图就会并发写这个 dict。
+        self._forgetting_cache: Dict[Tuple[Any, ...], Tuple[float, Dict[str, Any]]] = {}
+        # 首屏快照缓存：overview 与 health 各一个槽位。键含 generation，
+        # 所以本进程写一次就会失效——跨进程写入靠 TTL 兜底（与 forgetting 同理）。
+        self._snapshot_cache: Dict[str, Tuple[float, int, Dict[str, Any]]] = {}
+        self._snapshot_lock = threading.Lock()
+        self._forgetting_lock = threading.Lock()
+        # 单飞：每个键一把锁，先到者扫描、后到者等它发布结果再直接命中缓存。
+        # 没有它，预取与真实请求撞在一起时会把 279 MiB 扫两遍。
+        self._forgetting_build_locks: Dict[Tuple[Any, ...], threading.Lock] = {}
+        #: 预热线程句柄。默认**不启动**：__init__ 由 MemoryHubService 调用，
+        #: 而构造 service 不代表进程会长跑（测试建完就删目录）。这条线程持有
+        #: 只读连接，会创建 hub.sqlite-shm；在删除目录之后才创建就会让 rmtree
+        #: 撞上 ENOTEMPTY。长跑进程（daemon main）显式调用
+        #: start_forgetting_prefetch()，并在 shutdown 前 close() 等它结束。
+        self._prefetch_thread: Optional[threading.Thread] = None
+        if prefetch:
+            self.start_forgetting_prefetch()
 
     # ------------------------------------------------------------------
     # dispatch
@@ -274,6 +369,10 @@ class GuiApi:
             return self.pins(params)
         if route == "duplicates":
             return self.duplicates(params)
+        if route == "forgetting":
+            return self.forgetting(params)
+        if route == "injection-ab":
+            return self.injection_ab(params)
         raise GuiApiError(404, "unknown endpoint")
 
     def post(self, path: str, body: Mapping[str, Any],
@@ -337,12 +436,13 @@ class GuiApi:
         files = 0
         total = 0
         if root.is_dir() and not root.is_symlink():
-            for archive in root.glob("raw-*.jsonl.gz"):
-                try:
-                    files += 1
-                    total += archive.stat().st_size
-                except OSError:
-                    continue
+            for pattern in ("raw-*.jsonl.gz", "purged-*.jsonl.gz", "dedupe-*.jsonl.gz"):
+                for archive in root.glob(pattern):
+                    try:
+                        files += 1
+                        total += archive.stat().st_size
+                    except OSError:
+                        continue
         return {"archive_files": files, "archive_bytes": total}
 
     def _storage(self) -> Dict[str, int]:
@@ -391,7 +491,27 @@ class GuiApi:
             "ui": {"name": "HippoMind Atlas", "version": ATLAS_VERSION},
         }
 
+    def _snapshot(self, slot, refresh, compute):
+        """Cache one whole-ledger aggregate. slot is overview/health."""
+        generation = int(getattr(self.ledger, "generation", 0) or 0)
+        now = time.monotonic()
+        with self._snapshot_lock:
+            cached = self._snapshot_cache.get(slot)
+            if (not refresh and cached is not None
+                    and cached[1] == generation
+                    and (now - cached[0]) <= SNAPSHOT_CACHE_TTL_SECONDS):
+                return cached[2]
+        value = compute()
+        with self._snapshot_lock:
+            self._snapshot_cache[slot] = (time.monotonic(), generation, value)
+        return value
+
     def overview(self, params: Mapping[str, List[str]]) -> Dict[str, Any]:
+        refresh = _truthy_param(params, "refresh")
+        return self._snapshot("overview", refresh,
+                              lambda: self._overview_uncached(params))
+
+    def _overview_uncached(self, params: Mapping[str, List[str]]) -> Dict[str, Any]:
         days = _clamp_int(params, "days", 30, 1, 365)
         stats = self.hub.stats(AccessPolicy.administrator())
         ledger_stats = stats.get("ledger", {}) if isinstance(stats, Mapping) else {}
@@ -850,6 +970,16 @@ class GuiApi:
         }
 
     def health(self, params: Mapping[str, List[str]]) -> Dict[str, Any]:
+        refresh = _truthy_param(params, "refresh")
+        # integrity=1 runs a whole-ledger PRAGMA check (3.6s on production).
+        # It is only reached when the user explicitly asks for a deep check, so
+        # caching a possibly-stale integrity verdict would be pointless.
+        if _truthy_param(params, "integrity"):
+            return self._health_uncached(params)
+        return self._snapshot("health", refresh,
+                              lambda: self._health_uncached(params))
+
+    def _health_uncached(self, params: Mapping[str, List[str]]) -> Dict[str, Any]:
         hub = self.hub
         overview = self.ledger.health_overview()
         fts = self.ledger.fts_sync_report()
@@ -1218,6 +1348,338 @@ class GuiApi:
             limit=limit, sample=sample, min_similarity=similarity)
 
     # ------------------------------------------------------------------
+    # forgetting audit
+    # ------------------------------------------------------------------
+    def forgetting(self, params: Mapping[str, List[str]]) -> Dict[str, Any]:
+        """Why did a memory lose weight, and can it still be recalled?
+
+        Everything the numbers mean lives in hippomind/forgetting.py; this is
+        only the transport.  Two things it must not do:
+
+        * write.  The report opens its own mode=ro handle (ReadOnlyLedger), so
+          measuring production can never mutate it -- not even by accident.
+        * answer slowly.  See FORGETTING_CACHE_TTL_SECONDS for the measured
+          cost, and why the memo is keyed on (ledger path, generation) + TTL.
+        """
+        days = _clamp_int(params, "days", FORGETTING_DEFAULT_DAYS, 1,
+                          FORGETTING_MAX_DAYS)
+        limit = _clamp_int(params, "limit", FORGETTING_DEFAULT_LIMIT, 1,
+                           MAX_LIST_LIMIT)
+        scope = _text_param(params, "scope", "shared", 128) or "shared"
+        include_raw_chat = _truthy_param(params, "include_raw_chat")
+        # ?refresh=1 绕过缓存。TTL 从 30s 提到 300s 之后，这条是「我现在就要
+        # 看最新状态」的唯一入口——比如刚在终端跑完 maintain，不想等 5 分钟。
+        # 没有它，长 TTL 就变成「缓存说了算」，而这份报告的职责是解释现状。
+        if _truthy_param(params, "refresh"):
+            self._forgetting_cache.pop(
+                self._forgetting_key(days, limit, scope, include_raw_chat), None)
+        report, hit, age_s, elapsed_ms = self._forgetting_result(
+            days=days, limit=limit, scope=scope,
+            include_raw_chat=include_raw_chat)
+        return _with_cache_note(report, hit=hit, age_s=age_s,
+                                elapsed_ms=elapsed_ms)
+
+    def _forgetting_key(self, days: int, limit: int, scope: str,
+                        include_raw_chat: bool) -> Tuple[Any, ...]:
+        """(账本路径, 写代数, 窗口参数) —— 任一变化都必须重新测量。
+
+        路径而不是 id(ledger)：对象回收后地址会复用，新账本会命中旧账本的报告
+        （entity_index 的缓存注释里记着同一次踩坑）。
+        """
+        return (str(getattr(self.ledger, "path", "")),
+                int(getattr(self.ledger, "generation", 0) or 0),
+                days, limit, scope, include_raw_chat)
+
+    def _forgetting_result(self, *, days: int, limit: int, scope: str,
+                           include_raw_chat: bool
+                           ) -> Tuple[Dict[str, Any], bool, float, float]:
+        """缓存命中、等别人算完、或自己算——三者必居其一。
+
+        Returns (report, hit, age_s, elapsed_ms).
+
+        The per-key lock is what keeps a prefetch and a real request from
+        scanning the same 279 MiB concurrently: the loser blocks, then finds
+        the winner's report already published and returns a cache hit.
+        """
+        key = self._forgetting_key(days, limit, scope, include_raw_chat)
+        now = time.monotonic()
+        with self._forgetting_lock:
+            cached = self._forgetting_cache.get(key)
+            if (cached is not None
+                    and (now - cached[0]) <= FORGETTING_CACHE_TTL_SECONDS):
+                return cached[1], True, now - cached[0], 0.0
+            if len(self._forgetting_build_locks) >= FORGETTING_LOCK_MAX:
+                self._forgetting_build_locks.clear()
+            key_lock = self._forgetting_build_locks.get(key)
+            if key_lock is None:
+                key_lock = threading.Lock()
+                self._forgetting_build_locks[key] = key_lock
+        with key_lock:
+            now = time.monotonic()
+            with self._forgetting_lock:
+                cached = self._forgetting_cache.get(key)
+            if (cached is not None
+                    and (now - cached[0]) <= FORGETTING_CACHE_TTL_SECONDS):
+                return cached[1], True, now - cached[0], 0.0
+            started = time.monotonic()
+            try:
+                with ForgettingReader(self.ledger.path) as reader:
+                    report = forgetting_report(
+                        reader, days=days, limit=limit, scope=scope,
+                        include_raw_chat=include_raw_chat)
+            except FileNotFoundError as exc:
+                raise GuiApiError(503, "账本不存在，无法做遗忘审计: %s" % exc)
+            except sqlite3.Error as exc:
+                raise GuiApiError(503, "读取账本失败: %s: %s"
+                                 % (type(exc).__name__, exc))
+            elapsed_ms = (time.monotonic() - started) * 1000.0
+            with self._forgetting_lock:
+                if len(self._forgetting_cache) >= FORGETTING_CACHE_MAX:
+                    self._forgetting_cache.clear()
+                self._forgetting_cache[key] = (time.monotonic(), report)
+            return report, False, 0.0, elapsed_ms
+
+    def start_forgetting_prefetch(self) -> Optional[threading.Thread]:
+        """在后台把默认窗口算好，别让第一次打开视图的人等这次全表扫描。
+
+        NOT called from __init__ on purpose.  Constructing a GuiApi is not a
+        statement about how long the process lives, and this thread opens the
+        ledger read-only -- which creates hub.sqlite-shm.  A caller that
+        builds a service and then removes its directory (every test in
+        tests/test_mcp_register.py) gets a -shm recreated after the unlink
+        and rmtree fails with ENOTEMPTY.  The daemon's main() is the only
+        caller that knows it will run for weeks, so it starts this and
+        shutdown() joins it.
+
+        Idempotent and best effort: a second call is a no-op, and a failure
+        can never stop the daemon from serving.  The scan it hides is the
+        unindexed all-time decay COUNT, measured at 0.7-4.6 s with a cold
+        page cache on the 881 MiB production ledger.
+        """
+        if self._prefetch_thread is not None and self._prefetch_thread.is_alive():
+            return self._prefetch_thread
+        def warm() -> None:
+            try:
+                self._forgetting_result(
+                    days=FORGETTING_DEFAULT_DAYS,
+                    limit=FORGETTING_DEFAULT_LIMIT,
+                    scope="shared", include_raw_chat=False)
+            except Exception as exc:  # noqa: BLE001 - 预取失败不能影响 daemon
+                sys.stderr.write("[hippomindd] forgetting prefetch skipped: %s: %s\n"
+                                 % (type(exc).__name__, exc))
+
+        thread = threading.Thread(target=warm, name="forgetting-prefetch",
+                                  daemon=True)
+        self._prefetch_thread = thread
+        thread.start()
+        return thread
+
+    def close(self) -> None:
+        """Wait for the prefetch, so its read-only handle cannot outlive us.
+
+        A reader that is still open when the ledger directory is removed
+        recreates hub.sqlite-shm after the unlink, and the removal then fails
+        with ENOTEMPTY.  Observed in tests/test_mcp_register.py, which tears
+        its temporary directory down immediately after constructing a
+        service.  Joining here means "this GuiApi is done" is a real
+        statement rather than a hope.
+
+        Bounded: the scan is one COUNT over ledger_events (60 ms warm,
+        0.7-2.7 s cold), so a 30 s ceiling cannot turn a shutdown into a hang.
+        """
+        thread = self._prefetch_thread
+        self._prefetch_thread = None
+        if thread is None or not thread.is_alive():
+            return
+        if thread is threading.current_thread():
+            return
+        thread.join(timeout=30.0)
+
+
+    # ------------------------------------------------------------------
+    # injection A/B experiment progress
+    # ------------------------------------------------------------------
+    def injection_ab(self, params: Mapping[str, List[str]]) -> Dict[str, Any]:
+        """How far along is the injection A/B experiment, and what is missing?
+
+        Why this is not just injection_quality.report(): measured on the
+        production ledger, evaluate() costs 3.4 s (background+controls) or
+        1.2 s (both off), and _diagnostics alone is 4.7 s of SQL over
+        raw_chat.  None of that is needed to answer "how many samples do we
+        have".  The progress numbers come from explain() plus a bounded tail
+        read of the trace file, which together measured 0.74 ms.
+
+        The deeper metrics stay behind ?metrics=1 so the view can offer them as
+        an explicit action instead of paying for them on every paint.
+
+        Two different denominators, and conflating them is how this kind of
+        dashboard starts lying:
+          * min_samples (30) is the floor for ANY conclusion;
+          * a matched arm comparison additionally needs
+            min(treatment_n, control_n) >= min_samples, so the CONTROL arm is
+            the binding constraint at the default 20% rate.
+        The trace counts below are an UPPER BOUND on evaluable samples, not a
+        substitute for them: a trace is only evaluable when its window has a
+        readable assistant reply.  evaluable is null unless the caller asked
+        for metrics -- it is never guessed from the trace count.
+        """
+        from . import injection_ab as ab
+        from .injection_quality import MIN_SAMPLES
+
+        limit = _clamp_int(params, "limit", 500, 1, INJECTION_AB_MAX_TRACES)
+        config = ab.explain()
+
+        counts = self._injection_trace_counts()
+        treatment_n = counts["treatment"]
+        control_n = counts["control"]
+
+        # The arm comparison needs BOTH arms at the floor; at the default rate
+        # the control arm is always the one that is short.
+        treatment_short = max(0, MIN_SAMPLES - treatment_n)
+        control_short = max(0, MIN_SAMPLES - control_n)
+        binding = "control" if control_short >= treatment_short else "treatment"
+
+        payload: Dict[str, Any] = {
+            "config": config,
+            "min_samples": MIN_SAMPLES,
+            "traces": {
+                "read": counts["read"],
+                "malformed": counts["malformed"],
+                "truncated": counts["truncated"],
+                "treatment": treatment_n,
+                "control": control_n,
+                "sampled_upper_bound": treatment_n + control_n,
+                "last_at": counts["last_at"],
+                "agents": counts["agents"],
+                "path": counts["path"],
+            },
+            "progress": {
+                "treatment": {"have": treatment_n, "need": MIN_SAMPLES,
+                              "shortfall": treatment_short,
+                              "ratio": _ratio(treatment_n, MIN_SAMPLES)},
+                "control": {"have": control_n, "need": MIN_SAMPLES,
+                            "shortfall": control_short,
+                            "ratio": _ratio(control_n, MIN_SAMPLES)},
+                "binding_arm": binding,
+                "binding_shortfall": max(treatment_short, control_short),
+                "prompts_needed": config.get("prompts_needed_for_min_samples"),
+                "expected_control_per_100_prompts":
+                    config.get("expected_control_per_100_prompts"),
+            },
+            "arms": None,
+            "evaluable": None,
+            "verdict": None,
+            "note": (
+                "trace 计数是「可评估样本」的上界，不是它本身：一条 trace 只有在其"
+                "时间窗内存在可读的 assistant 回复时才可评估。要得到真实的可评估"
+                "样本数与两臂指标，用 ?metrics=1（需要数秒）。"),
+        }
+
+        if _truthy_param(params, "metrics"):
+            started = time.monotonic()
+            try:
+                from .injection_quality import ReadOnlyLedger as QualityReader
+                from .injection_quality import evaluate as quality_evaluate
+                with QualityReader(self.ledger.path) as reader:
+                    report = quality_evaluate(
+                        reader, self._injection_traces(limit),
+                        embedder=None, background=False, controls=False)
+                payload["arms"] = report.get("arms")
+                payload["evaluable"] = report.get("sampled")
+                payload["verdict"] = report.get("verdict")
+                payload["sample"] = report.get("sample")
+                payload["metrics"] = report.get("metrics")
+                payload["metrics_elapsed_ms"] = round(
+                    (time.monotonic() - started) * 1000.0, 1)
+            except sqlite3.Error as exc:
+                payload["metrics_error"] = (
+                    "%s: %s" % (type(exc).__name__, exc))[:300]
+            except Exception as exc:  # noqa: BLE001 - 指标失败不能拖垮进度
+                payload["metrics_error"] = (
+                    "%s: %s" % (type(exc).__name__, exc))[:300]
+        return payload
+
+    def _injection_trace_path(self) -> Path:
+        from .injection_trace import trace_path
+        return trace_path()
+
+    def _read_trace_tail(self) -> Optional[bytes]:
+        """Bounded tail of the append-only trace file, or None when absent.
+
+        Deliberately not injection_trace.recent(): that reads the WHOLE file
+        before slicing, and this file has no rotation.
+        """
+        path = self._injection_trace_path()
+        try:
+            size = path.stat().st_size
+            with path.open("rb") as handle:
+                if size > INJECTION_AB_TAIL_BYTES:
+                    handle.seek(size - INJECTION_AB_TAIL_BYTES)
+                    handle.readline()  # drop the partial first line
+                return handle.read()
+        except OSError:
+            return None
+
+    def _injection_trace_counts(self) -> Dict[str, Any]:
+        """Count both arms from a bounded tail of the trace file."""
+        out: Dict[str, Any] = {"treatment": 0, "control": 0, "read": 0,
+                               "malformed": 0, "truncated": False,
+                               "last_at": "", "agents": [],
+                               "path": str(self._injection_trace_path())}
+        try:
+            out["truncated"] = (self._injection_trace_path().stat().st_size
+                                > INJECTION_AB_TAIL_BYTES)
+        except OSError:
+            return out
+        raw = self._read_trace_tail()
+        if raw is None:
+            return out
+        agents = set()
+        for line in raw.decode("utf-8", "replace").splitlines():
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                entry = json.loads(text)
+            except ValueError:
+                out["malformed"] += 1
+                continue
+            if not isinstance(entry, dict):
+                out["malformed"] += 1
+                continue
+            out["read"] += 1
+            if entry.get("injected"):
+                out["treatment"] += 1
+            else:
+                out["control"] += 1
+            agent = str(entry.get("agent") or "")
+            if agent:
+                agents.add(agent)
+            at = str(entry.get("at") or "")
+            if at > out["last_at"]:
+                out["last_at"] = at
+        out["agents"] = sorted(agents)
+        return out
+
+    def _injection_traces(self, limit: int) -> List[Dict[str, Any]]:
+        """The newest limit traces, for the opt-in metrics path."""
+        raw = self._read_trace_tail()
+        if raw is None:
+            return []
+        rows: List[Dict[str, Any]] = []
+        for line in raw.decode("utf-8", "replace").splitlines():
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                entry = json.loads(text)
+            except ValueError:
+                continue
+            if isinstance(entry, dict):
+                rows.append(entry)
+        return rows[-max(1, int(limit)):]
+
+    # ------------------------------------------------------------------
     # writes (audited ledger operations only)
     # ------------------------------------------------------------------
     def pin(self, body: Mapping[str, Any]) -> Dict[str, Any]:
@@ -1269,6 +1731,46 @@ class GuiApi:
             "ttl_seconds": UI_NONCE_TTL_SECONDS,
             "url": "/ui/#/pulse?boot=" + nonce,
         }
+
+
+def _ratio(value: Any, total: Any) -> float:
+    """value/total clamped to [0, 1]; 0.0 when the denominator is unusable.
+
+    A progress bar that can exceed 1.0 is a bug report from the future: the
+    sample count is data from another writer and must never be trusted to be
+    <= need.
+    """
+    try:
+        denominator = float(total)
+        numerator = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if denominator <= 0 or not math.isfinite(denominator):
+        return 0.0
+    if not math.isfinite(numerator):
+        return 0.0
+    return max(0.0, min(1.0, numerator / denominator))
+
+
+def _with_cache_note(report: Mapping[str, Any], *, hit: bool, age_s: float,
+                     elapsed_ms: float) -> Dict[str, Any]:
+    """The report verbatim, plus the one envelope field the daemon adds.
+
+    Every key forgetting_report() returns stays at the top level and is passed
+    through untouched.  The console and scripts/forgetting_report.py --json must
+    read the same document: an operator cross-checking the view against the CLI
+    has to get identical numbers, and a view that reshaped the report would be a
+    second, drifting definition of "explained".
+
+    cache is additive and is the only key forgetting.py does not produce.  It
+    exists so the console can say how old the answer is instead of implying
+    every paint re-measured the ledger.
+    """
+    payload = dict(report)
+    payload["cache"] = {"hit": bool(hit), "age_s": round(max(0.0, age_s), 3),
+                        "ttl_s": FORGETTING_CACHE_TTL_SECONDS,
+                        "elapsed_ms": round(max(0.0, elapsed_ms), 1)}
+    return payload
 
 
 def _is_external_volume(path: Path) -> bool:

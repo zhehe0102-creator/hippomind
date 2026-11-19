@@ -153,6 +153,22 @@ function clip(text, max) {
   return value.length > max ? value.slice(0, max - 1) + "…" : value
 }
 
+/** 转义不可信 payload 里的 <：任何 MEMORY_DATA_UNTRUSTED 开/闭标签、
+ *  <MEMORY_DATA nonce="..."> 前缀的大小写与空白变体都无法保留原始尖括号，
+ *  因此渲染结果永远只有外层 1 个开标签 + 1 个闭标签。 */
+function escapeUntrusted(text) {
+  return String(text ?? "").replace(/</g, "&lt;")
+}
+
+/** 转义会让 < 扩张为 &lt;（每个 +3 字符）。极端恶意 payload 可能把注入体
+ *  顶出 maxChars；这里按预算收口，并剥掉被截断的半条实体引用
+ *  （& / &l / &lt），避免渲染出畸形尾巴。 */
+function clipEscaped(text, max) {
+  if (text.length <= max) return text
+  const head = text.slice(0, Math.max(0, max - 1)).replace(/&(?:l(?:t)?)?$/, "")
+  return head + "…"
+}
+
 /** 会话工作目录软线索：目录名 + 父目录名（与 Python 预取同一停用词表）。 */
 function workspaceHint(cwd) {
   const location = String(cwd ?? "").trim()
@@ -345,11 +361,13 @@ class HubClient {
     this.downUntil = 0
   }
 
-  /** 请求前最小 Context Pack；任何失败返回 null 且进入退避。 */
-  async contextPack(query) {
+  /** 请求前最小 Context Pack；任何失败返回 null 且进入退避。
+   * sessionId 用于 WP-M 的会话感知 follow-up 锚定（「继续/同上」）。 */
+  async contextPack(query, sessionId = "", cwd = "") {
     if (!this.available()) return null
     const credential = await this.loadCredential()
     if (credential === null) return null
+    const workspaceCwd = String(cwd || this._workspaceCwd || "").trim()
     const payloadChars = Math.max(200, this.options.maxChars - UNTRUSTED_OPEN.length - UNTRUSTED_CLOSE.length - 2)
     const result = await this.request(
       "POST",
@@ -367,6 +385,10 @@ class HubClient {
           require_evidence: true,
           min_score: 0.20,
           scope: "shared",
+          // WP-M：会话 id 让 follow-up 查询锚定本会话最近任务消息。
+          // 没有会话 id 时省略该字段，请求体与旧版本逐字节一致。
+          ...(sessionId ? { session_id: clip(String(sessionId), 256) } : {}),
+          ...(workspaceCwd ? { workspace_cwd: clip(workspaceCwd, 512) } : {}),
         },
       },
       this.options.requestTimeoutMs,
@@ -438,7 +460,13 @@ class SessionTracker {
 }
 
 function renderInjection(pack, options) {
-  const payload = clip(String(pack?.text ?? ""), options.maxChars - UNTRUSTED_OPEN.length - UNTRUSTED_CLOSE.length - UNTRUSTED_NOTE.length - 4)
+  // 预算按源字符计算：先 clip 再转义，保证截断永远不会切断转义实体。
+  const payloadBudget = options.maxChars - UNTRUSTED_OPEN.length - UNTRUSTED_CLOSE.length - UNTRUSTED_NOTE.length - 4
+  const rawPayload = clip(String(pack?.text ?? ""), payloadBudget)
+  if (!rawPayload) return null
+  // < 转义后每个字符会扩张为 &lt;（+3 字符），恶意 payload 因此可能超过
+  // maxChars；转义后再按同一预算收口，注入体始终保持有界。
+  const payload = clipEscaped(escapeUntrusted(rawPayload), payloadBudget)
   if (!payload) return null
   return [
     UNTRUSTED_OPEN,
@@ -612,14 +640,18 @@ export function apply(ctx, config = {}) {
         if (lastUser === undefined || lastUser === null) return decision
         // 工作目录软线索与 Python 离线预取路径对齐：同一请求在不同接入
         // 路径下得到一致的召回排序，而不是只有 CLI 侧附加工作区提示。
-        const query = memoryQuery(extractText(lastUser.content), options.triggerMode)
-          + workspaceHint(sessionCwd(agent?.session))
-        if (!query.trim()) return decision
+        const baseQuery = memoryQuery(extractText(lastUser.content), options.triggerMode)
+        if (!baseQuery.trim()) return decision
+        const cwd = sessionCwd(agent?.session)
+        const query = baseQuery + workspaceHint(cwd)
         signal?.throwIfAborted?.()
         // Keep the query contract byte-for-byte equivalent to Codex's hook.
         // Task/project filters belong to the shared Context Pack API, not to
         // host-specific working-directory guessing.
-        const pack = await client.contextPack(query)
+        // WP-M: 宿主会话 id 用于 follow-up 锚定；拿不到时传空串（行为不变）。
+        const sessionId = String(agent?.session?.id ?? "")
+        client._workspaceCwd = cwd
+        const pack = await client.contextPack(query, sessionId)
         // A successful request means the daemon is back after a startup race;
         // send the private runtime proof in the background, never delaying
         // the model-bound pre-step path.

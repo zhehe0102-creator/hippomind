@@ -100,7 +100,23 @@ class MCPAdapter:
     def __init__(self, ledger_path: str = "", *, agent_token: str = "", agent_token_file: str = "",
                  unsafe_admin: bool = False):
         self.ledger = SQLiteLedger(ledger_path or None)
-        self.contexts = ContextPackBuilder(self.ledger)
+        self._embedder = None
+        self._vector_index = None
+        self._entity_index = None
+        try:
+            from .auto_context import _load_entity_index, _load_vector_index
+            from .semantic_space import load_embedder
+            self._embedder = load_embedder()
+            self._vector_index = _load_vector_index(self.ledger, self._embedder)
+            self._entity_index = _load_entity_index(self.ledger)
+        except Exception:
+            pass
+        self.contexts = ContextPackBuilder(
+            self.ledger,
+            embedder=self._embedder,
+            vector_index=self._vector_index,
+            entity_index=self._entity_index,
+        )
         self._configured_agent = False
         self.runtime_dir = Path(self.ledger.path).parent
         if agent_token_file and not agent_token:
@@ -170,28 +186,61 @@ class MCPAdapter:
             hits = self.ledger.search(
                 str(arguments.get("query", "")), scope=scope,
                 limit=max(1, min(100, int(arguments.get("limit", 8)))),
-                offset=max(0, int(arguments.get("offset", 0))))
+                offset=max(0, int(arguments.get("offset", 0))),
+                embedder=self._embedder,
+                vector_index=self._vector_index,
+                entity_index=self._entity_index)
             for hit in hits:
                 hit.pop("raw_chat", None)
             return {"query": str(arguments.get("query", "")), "scope": scope,
                     "results": hits}
         if name == "hippomind_pin":
-            self.policy.require("write")
+            self.policy.require("ingest")
+            memory_id = str(arguments.get("memory_id", ""))
+            memory = self.ledger.get_memory(memory_id)
+            if memory is None:
+                raise LedgerError("未找到记忆")
+            mem_scope = self.policy.require_scope(memory.get("scope", ""))
+            if not self.policy.admin and mem_scope == "shared":
+                self.policy.require("shared_ingest")
             outcome = self.ledger.pin_memory(
-                str(arguments.get("memory_id", "")),
+                memory_id,
                 pinned=not bool(arguments.get("unpin", False)),
                 source=self.policy.agent_id or "mcp")
             return {"pinned": bool(outcome.get("pinned",
                                                not arguments.get("unpin", False)))}
         if name == "hippomind_forget":
-            self.policy.require("write")
+            self.policy.require("ingest")
             ids = [str(v) for v in (arguments.get("memory_ids") or []) if str(v)]
             batch = str(arguments.get("import_batch", "") or "")
+            purge = bool(arguments.get("purge", False))
             if not ids and not batch:
                 raise LedgerError("需要 memory_ids 或 import_batch 之一")
+            if purge and not self.policy.admin:
+                raise AccessDenied("物理清除需要管理员凭据")
+            if not self.policy.admin:
+                for mid in ids:
+                    memory = self.ledger.get_memory(mid)
+                    if memory is None:
+                        raise LedgerError("未找到记忆")
+                    mem_scope = self.policy.require_scope(memory.get("scope", ""))
+                    if mem_scope == "shared":
+                        self.policy.require("shared_ingest")
+                if batch:
+                    with self.ledger._reading() as conn:
+                        batch_rows = conn.execute(
+                            "SELECT memory_id, scope FROM memories WHERE import_batch=?",
+                            (batch,),
+                        ).fetchall()
+                    if not batch_rows:
+                        raise LedgerError("未找到匹配的导入批次")
+                    for row in batch_rows:
+                        mem_scope = self.policy.require_scope(row["scope"])
+                        if mem_scope == "shared":
+                            self.policy.require("shared_ingest")
             result = self.ledger.forget(
                 memory_ids=ids, import_batch=batch,
-                purge=bool(arguments.get("purge", False)),
+                purge=purge,
                 source_agent=self.policy.agent_id or "mcp")
             return {k: result.get(k) for k in ("forgotten", "purged",
                                                "purged_events", "impact")}
@@ -212,9 +261,10 @@ class MCPAdapter:
                 arguments.get("scope", "shared"))
             hops = max(1, min(2, int(arguments.get("hops", 1))))
             limit = max(10, min(2000, int(arguments.get("limit", 200))))
+            as_of = str(arguments.get("as_of") or "").strip()
             # 节点/边仅含主语、计数与 memory_id，不含记忆正文。
             return self.ledger.entity_graph(
-                subject, scope=scope, hops=hops, limit=limit)
+                subject, scope=scope, hops=hops, limit=limit, as_of=as_of)
         raise LedgerError(f"未知 MCP 工具: {name}")
 
     def resource_templates(self) -> Dict[str, Any]:

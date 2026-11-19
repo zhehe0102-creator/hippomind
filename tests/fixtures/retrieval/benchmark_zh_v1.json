@@ -1,0 +1,1376 @@
+{
+ "schema": 1,
+ "set_version": "benchmark_zh_v1",
+ "name": "HippoMind retrieval benchmark (self-authored, zh)",
+ "description": "自建、按 LongMemEval 能力维度对齐的中文检索评测集：事实召回 12、知识更新 8、时间推理 8、多会话连续性 8、弃权 12，共 48 条查询。记忆与查询同文件自洽，绝不读取生产账本。",
+ "note": "自建、按 LongMemEval 能力维度对齐、非官方数字；不能与 LongMemEval 官方分数横向比较。LongMemEval 官方数据需用户自行下载，见 scripts/eval_benchmark.py --help。",
+ "source": "self-authored fixture (no external data)",
+ "category_counts": {
+  "fact_recall": 12,
+  "knowledge_update": 8,
+  "temporal": 8,
+  "continuity": 8,
+  "abstention": 12
+ },
+ "search_options": {
+  "pack_min_score": 0.2,
+  "include_raw_chat": false,
+  "require_evidence": true
+ },
+ "memories": [
+  {
+   "content": "Orion 网关限流阈值是每分钟 1200 次请求",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:g1"
+   ]
+  },
+  {
+   "content": "Orion 网关 TLS 证书有效期至 2027-03-15，签发机构 Let's Encrypt",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:g2"
+   ]
+  },
+  {
+   "content": "Orion 网关负责人是林晓",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:g-owner"
+   ]
+  },
+  {
+   "content": "Orion 网关部署在 cn-east-2 区域",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:g-region"
+   ]
+  },
+  {
+   "content": "Orion 用户服务主库是 PostgreSQL，地址 db-03",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:u-db"
+   ]
+  },
+  {
+   "content": "Orion 用户服务只读副本地址 db-04",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:u-replica"
+   ]
+  },
+  {
+   "content": "Orion 用户服务负责登录注册",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:u-login"
+   ]
+  },
+  {
+   "content": "Orion 用户服务负责人是张伟",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:u-owner"
+   ]
+  },
+  {
+   "content": "Orion 缓存服务部署在 cache-07 主机",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:c-host"
+   ]
+  },
+  {
+   "content": "Orion 缓存服务淘汰策略 allkeys-lru",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:c-policy"
+   ]
+  },
+  {
+   "content": "Orion 缓存服务端口 6380",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:c-port"
+   ]
+  },
+  {
+   "content": "Orion 缓存击穿保护使用互斥锁",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:c-lock"
+   ]
+  },
+  {
+   "content": "Orion 缓存击穿保护超时 500ms",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:c-timeout"
+   ]
+  },
+  {
+   "content": "Orion 搜索引擎使用 Elasticsearch 8.13",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:s-engine"
+   ]
+  },
+  {
+   "content": "Orion 搜索索引名为 orion-docs-v3",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:s-index"
+   ]
+  },
+  {
+   "content": "Orion 搜索索引分词器 ik_max_word",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:s-analyzer"
+   ]
+  },
+  {
+   "content": "Orion 计费服务订阅 Kafka topic billing-events",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:b-topic"
+   ]
+  },
+  {
+   "content": "Orion 计费服务负责人是王芳",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:b-owner"
+   ]
+  },
+  {
+   "content": "Orion 计费服务负责月度账单生成",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:b-invoice"
+   ]
+  },
+  {
+   "content": "Orion 通知邮件摘要每天 09:00 发送",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:n-digest"
+   ]
+  },
+  {
+   "content": "Orion 数据管道 dag id 是 orion_daily",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:p-dag"
+   ]
+  },
+  {
+   "content": "Orion 数据管道上游 Kafka topic 是 orion-raw",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:p-upstream"
+   ]
+  },
+  {
+   "content": "Orion 移动端使用 Flutter 开发",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:m-flutter"
+   ]
+  },
+  {
+   "content": "Orion 移动端发布渠道为 beta",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:m-channel"
+   ]
+  },
+  {
+   "content": "Orion 部署在 Kubernetes 集群",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:d-k8s"
+   ]
+  },
+  {
+   "content": "Orion 部署集群跨 3 个可用区",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:d-az"
+   ]
+  },
+  {
+   "content": "Orion 安全审计每季度执行一次",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:sec-audit"
+   ]
+  },
+  {
+   "content": "Orion 安全审计负责人是赵敏",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:sec-owner"
+   ]
+  },
+  {
+   "content": "Orion 密钥保管在 vault 路径 secret/orion",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:sec-vault"
+   ]
+  },
+  {
+   "content": "Orion 备份保留周期为 35 天",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:x-backup"
+   ]
+  },
+  {
+   "content": "Orion 服务域名是 api.orion.internal",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:x-domain"
+   ]
+  },
+  {
+   "content": "Orion 值班电话是 8801",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:x-phone"
+   ]
+  },
+  {
+   "content": "Orion 搜索集群分片数为 8",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:upd-search-old"
+   ],
+   "timestamp": "2026-01-01T00:00:00+00:00",
+   "claims": [
+    {
+     "subject": "orion-search",
+     "predicate": "config",
+     "slot_key": "shards",
+     "value": 8,
+     "confidence": 0.6,
+     "valid_from": "2026-01-01T00:00:00+00:00"
+    }
+   ]
+  },
+  {
+   "content": "Orion 搜索集群分片数调整为 16",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:upd-search-new"
+   ],
+   "timestamp": "2026-02-01T00:00:00+00:00",
+   "claims": [
+    {
+     "subject": "orion-search",
+     "predicate": "config",
+     "slot_key": "shards",
+     "value": 16,
+     "confidence": 0.9,
+     "valid_from": "2026-02-01T00:00:00+00:00"
+    }
+   ]
+  },
+  {
+   "content": "Orion 缓存服务 maxmemory 为 32G",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:upd-cache-old"
+   ],
+   "timestamp": "2026-01-05T00:00:00+00:00",
+   "claims": [
+    {
+     "subject": "orion-cache",
+     "predicate": "config",
+     "slot_key": "maxmemory",
+     "value": "32G",
+     "confidence": 0.6,
+     "valid_from": "2026-01-05T00:00:00+00:00"
+    }
+   ]
+  },
+  {
+   "content": "Orion 缓存服务 maxmemory 调整为 64G",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:upd-cache-new"
+   ],
+   "timestamp": "2026-02-05T00:00:00+00:00",
+   "claims": [
+    {
+     "subject": "orion-cache",
+     "predicate": "config",
+     "slot_key": "maxmemory",
+     "value": "64G",
+     "confidence": 0.9,
+     "valid_from": "2026-02-05T00:00:00+00:00"
+    }
+   ]
+  },
+  {
+   "content": "Orion 计费 Kafka 分区数为 12 个",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:upd-billing-old"
+   ],
+   "timestamp": "2026-01-10T00:00:00+00:00",
+   "claims": [
+    {
+     "subject": "orion-billing",
+     "predicate": "config",
+     "slot_key": "partitions",
+     "value": 12,
+     "confidence": 0.6,
+     "valid_from": "2026-01-10T00:00:00+00:00"
+    }
+   ]
+  },
+  {
+   "content": "Orion 计费 Kafka 分区数调整为 24 个",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:upd-billing-new"
+   ],
+   "timestamp": "2026-02-10T00:00:00+00:00",
+   "claims": [
+    {
+     "subject": "orion-billing",
+     "predicate": "config",
+     "slot_key": "partitions",
+     "value": 24,
+     "confidence": 0.9,
+     "valid_from": "2026-02-10T00:00:00+00:00"
+    }
+   ]
+  },
+  {
+   "content": "Orion 告警通知使用 PagerDuty",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:upd-alert-old"
+   ],
+   "timestamp": "2026-01-12T00:00:00+00:00",
+   "claims": [
+    {
+     "subject": "orion-alert",
+     "predicate": "config",
+     "slot_key": "tool",
+     "value": "PagerDuty",
+     "confidence": 0.6,
+     "valid_from": "2026-01-12T00:00:00+00:00"
+    }
+   ]
+  },
+  {
+   "content": "Orion 告警通知已切换为 OpsGenie",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:upd-alert-new"
+   ],
+   "timestamp": "2026-02-12T00:00:00+00:00",
+   "claims": [
+    {
+     "subject": "orion-alert",
+     "predicate": "config",
+     "slot_key": "tool",
+     "value": "OpsGenie",
+     "confidence": 0.9,
+     "valid_from": "2026-02-12T00:00:00+00:00"
+    }
+   ]
+  },
+  {
+   "content": "Orion 数据管道每天 03:00 运行",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:upd-pipeline-old"
+   ],
+   "timestamp": "2026-01-15T00:00:00+00:00",
+   "claims": [
+    {
+     "subject": "orion-pipeline",
+     "predicate": "config",
+     "slot_key": "schedule",
+     "value": "03:00",
+     "confidence": 0.6,
+     "valid_from": "2026-01-15T00:00:00+00:00"
+    }
+   ]
+  },
+  {
+   "content": "Orion 数据管道运行时间调整为 04:30",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:upd-pipeline-new"
+   ],
+   "timestamp": "2026-02-15T00:00:00+00:00",
+   "claims": [
+    {
+     "subject": "orion-pipeline",
+     "predicate": "config",
+     "slot_key": "schedule",
+     "value": "04:30",
+     "confidence": 0.9,
+     "valid_from": "2026-02-15T00:00:00+00:00"
+    }
+   ]
+  },
+  {
+   "content": "Orion 移动端 Android min SDK 为 24",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:upd-mobile-old"
+   ],
+   "timestamp": "2026-01-18T00:00:00+00:00",
+   "claims": [
+    {
+     "subject": "orion-mobile",
+     "predicate": "config",
+     "slot_key": "min_sdk",
+     "value": 24,
+     "confidence": 0.6,
+     "valid_from": "2026-01-18T00:00:00+00:00"
+    }
+   ]
+  },
+  {
+   "content": "Orion 移动端 Android min SDK 升级到 26",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:upd-mobile-new"
+   ],
+   "timestamp": "2026-02-18T00:00:00+00:00",
+   "claims": [
+    {
+     "subject": "orion-mobile",
+     "predicate": "config",
+     "slot_key": "min_sdk",
+     "value": 26,
+     "confidence": 0.9,
+     "valid_from": "2026-02-18T00:00:00+00:00"
+    }
+   ]
+  },
+  {
+   "content": "Orion 部署集群节点池为 6 个节点",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:upd-deploy-old"
+   ],
+   "timestamp": "2026-01-20T00:00:00+00:00",
+   "claims": [
+    {
+     "subject": "orion-deploy",
+     "predicate": "config",
+     "slot_key": "node_pool",
+     "value": 6,
+     "confidence": 0.6,
+     "valid_from": "2026-01-20T00:00:00+00:00"
+    }
+   ]
+  },
+  {
+   "content": "Orion 部署集群节点池扩容到 10 个节点",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:upd-deploy-new"
+   ],
+   "timestamp": "2026-02-20T00:00:00+00:00",
+   "claims": [
+    {
+     "subject": "orion-deploy",
+     "predicate": "config",
+     "slot_key": "node_pool",
+     "value": 10,
+     "confidence": 0.9,
+     "valid_from": "2026-02-20T00:00:00+00:00"
+    }
+   ]
+  },
+  {
+   "content": "Orion 密钥轮换周期为 90 天",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:upd-secret-old"
+   ],
+   "timestamp": "2026-01-22T00:00:00+00:00",
+   "claims": [
+    {
+     "subject": "orion-secret",
+     "predicate": "config",
+     "slot_key": "rotation_days",
+     "value": 90,
+     "confidence": 0.6,
+     "valid_from": "2026-01-22T00:00:00+00:00"
+    }
+   ]
+  },
+  {
+   "content": "Orion 密钥轮换周期调整为 60 天",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:upd-secret-new"
+   ],
+   "timestamp": "2026-02-22T00:00:00+00:00",
+   "claims": [
+    {
+     "subject": "orion-secret",
+     "predicate": "config",
+     "slot_key": "rotation_days",
+     "value": 60,
+     "confidence": 0.9,
+     "valid_from": "2026-02-22T00:00:00+00:00"
+    }
+   ]
+  },
+  {
+   "content": "Orion 发布窗口：灰度阶段只在夜间 22:00 放量",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:tmp-release-old"
+   ],
+   "timestamp": "2026-03-01T00:00:00+00:00",
+   "valid_from": "2026-03-01T00:00:00+00:00",
+   "valid_until": "2026-03-20T00:00:00+00:00",
+   "task_id": "orion-rollout",
+   "context": {
+    "progress": [
+     "灰度阶段只在夜间 22:00 放量"
+    ]
+   }
+  },
+  {
+   "content": "Orion 发布窗口：全量阶段全天放量",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:tmp-release-new"
+   ],
+   "timestamp": "2026-03-20T00:00:00+00:00",
+   "valid_from": "2026-03-20T00:00:00+00:00",
+   "task_id": "orion-rollout",
+   "context": {
+    "progress": [
+     "全量阶段全天放量"
+    ]
+   }
+  },
+  {
+   "content": "Orion 值班主责是林晓",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:tmp-oncall-old"
+   ],
+   "timestamp": "2026-01-01T00:00:00+00:00",
+   "valid_from": "2026-01-01T00:00:00+00:00",
+   "valid_until": "2026-03-31T23:59:59+00:00",
+   "task_id": "orion-oncall",
+   "context": {
+    "progress": [
+     "Orion 值班主责是林晓"
+    ]
+   }
+  },
+  {
+   "content": "Orion 值班主责是赵敏",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:tmp-oncall-new"
+   ],
+   "timestamp": "2026-04-01T00:00:00+00:00",
+   "valid_from": "2026-04-01T00:00:00+00:00",
+   "task_id": "orion-oncall",
+   "context": {
+    "progress": [
+     "Orion 值班主责是赵敏"
+    ]
+   }
+  },
+  {
+   "content": "Orion 数据库迁移 Q1 期间只读维护",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:tmp-migration-old"
+   ],
+   "timestamp": "2026-01-01T00:00:00+00:00",
+   "valid_from": "2026-01-01T00:00:00+00:00",
+   "valid_until": "2026-03-31T23:59:59+00:00",
+   "task_id": "orion-migration",
+   "context": {
+    "progress": [
+     "Orion 数据库迁移 Q1 期间只读维护"
+    ]
+   }
+  },
+  {
+   "content": "Orion 数据库迁移 Q2 已完成主库切换",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:tmp-migration-new"
+   ],
+   "timestamp": "2026-04-01T00:00:00+00:00",
+   "valid_from": "2026-04-01T00:00:00+00:00",
+   "task_id": "orion-migration",
+   "context": {
+    "progress": [
+     "Orion 数据库迁移 Q2 已完成主库切换"
+    ]
+   }
+  },
+  {
+   "content": "Orion 2026 H1 云预算为 42 万元",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:tmp-budget-old"
+   ],
+   "timestamp": "2026-01-01T00:00:00+00:00",
+   "valid_from": "2026-01-01T00:00:00+00:00",
+   "valid_until": "2026-06-30T23:59:59+00:00",
+   "task_id": "orion-budget",
+   "context": {
+    "progress": [
+     "Orion 2026 H1 云预算为 42 万元"
+    ]
+   }
+  },
+  {
+   "content": "Orion 2026 H2 云预算为 58 万元",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:tmp-budget-new"
+   ],
+   "timestamp": "2026-07-01T00:00:00+00:00",
+   "valid_from": "2026-07-01T00:00:00+00:00",
+   "task_id": "orion-budget",
+   "context": {
+    "progress": [
+     "Orion 2026 H2 云预算为 58 万元"
+    ]
+   }
+  },
+  {
+   "content": "Orion 发布节奏为双周一次",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:tmp-cadence-old"
+   ],
+   "timestamp": "2026-01-01T00:00:00+00:00",
+   "valid_from": "2026-01-01T00:00:00+00:00",
+   "valid_until": "2026-04-30T23:59:59+00:00",
+   "task_id": "orion-cadence",
+   "context": {
+    "progress": [
+     "Orion 发布节奏为双周一次"
+    ]
+   }
+  },
+  {
+   "content": "Orion 发布节奏改为每周一次",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:tmp-cadence-new"
+   ],
+   "timestamp": "2026-05-01T00:00:00+00:00",
+   "valid_from": "2026-05-01T00:00:00+00:00",
+   "task_id": "orion-cadence",
+   "context": {
+    "progress": [
+     "Orion 发布节奏改为每周一次"
+    ]
+   }
+  },
+  {
+   "content": "Orion 日志保留周期为 30 天",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:tmp-logret-old"
+   ],
+   "timestamp": "2026-01-01T00:00:00+00:00",
+   "valid_from": "2026-01-01T00:00:00+00:00",
+   "valid_until": "2026-05-31T23:59:59+00:00",
+   "task_id": "orion-logret",
+   "context": {
+    "progress": [
+     "Orion 日志保留周期为 30 天"
+    ]
+   }
+  },
+  {
+   "content": "Orion 日志保留周期调整为 90 天",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:tmp-logret-new"
+   ],
+   "timestamp": "2026-06-01T00:00:00+00:00",
+   "valid_from": "2026-06-01T00:00:00+00:00",
+   "task_id": "orion-logret",
+   "context": {
+    "progress": [
+     "Orion 日志保留周期调整为 90 天"
+    ]
+   }
+  },
+  {
+   "content": "Orion 网关 CPU 告警阈值为 80%",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:tmp-cpu-old"
+   ],
+   "timestamp": "2026-01-01T00:00:00+00:00",
+   "valid_from": "2026-01-01T00:00:00+00:00",
+   "valid_until": "2026-06-30T23:59:59+00:00",
+   "task_id": "orion-cpu",
+   "context": {
+    "progress": [
+     "Orion 网关 CPU 告警阈值为 80%"
+    ]
+   }
+  },
+  {
+   "content": "Orion 网关 CPU 告警阈值调整为 90%",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:tmp-cpu-new"
+   ],
+   "timestamp": "2026-07-01T00:00:00+00:00",
+   "valid_from": "2026-07-01T00:00:00+00:00",
+   "task_id": "orion-cpu",
+   "context": {
+    "progress": [
+     "Orion 网关 CPU 告警阈值调整为 90%"
+    ]
+   }
+  },
+  {
+   "content": "Orion Q3 次日留存目标为 35%",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:tmp-retention-old"
+   ],
+   "timestamp": "2026-07-01T00:00:00+00:00",
+   "valid_from": "2026-07-01T00:00:00+00:00",
+   "valid_until": "2026-09-30T23:59:59+00:00",
+   "task_id": "orion-retention",
+   "context": {
+    "progress": [
+     "Orion Q3 次日留存目标为 35%"
+    ]
+   }
+  },
+  {
+   "content": "Orion Q4 次日留存目标为 40%",
+   "kind": "fact",
+   "scope": "shared",
+   "source_agent": "benchmark",
+   "evidence": [
+    "benchmark:tmp-retention-new"
+   ],
+   "timestamp": "2026-10-01T00:00:00+00:00",
+   "valid_from": "2026-10-01T00:00:00+00:00",
+   "task_id": "orion-retention",
+   "context": {
+    "progress": [
+     "Orion Q4 次日留存目标为 40%"
+    ]
+   }
+  }
+ ],
+ "queries": [
+  {
+   "id": "fact-gateway-rate",
+   "category": "fact_recall",
+   "query": "Orion 网关限流阈值是多少",
+   "expect": [
+    "每分钟 1200 次"
+   ]
+  },
+  {
+   "id": "fact-gateway-cert",
+   "category": "fact_recall",
+   "query": "Orion 网关证书什么时候到期",
+   "expect": [
+    "2027-03-15"
+   ]
+  },
+  {
+   "id": "fact-user-db",
+   "category": "fact_recall",
+   "query": "Orion 用户服务主库地址",
+   "expect": [
+    "db-03"
+   ]
+  },
+  {
+   "id": "fact-user-replica",
+   "category": "fact_recall",
+   "query": "Orion 用户服务只读副本地址",
+   "expect": [
+    "db-04"
+   ]
+  },
+  {
+   "id": "fact-cache-host",
+   "category": "fact_recall",
+   "query": "Orion 缓存服务部署主机",
+   "expect": [
+    "cache-07"
+   ]
+  },
+  {
+   "id": "fact-cache-policy",
+   "category": "fact_recall",
+   "query": "Orion 缓存淘汰策略",
+   "expect": [
+    "allkeys-lru"
+   ]
+  },
+  {
+   "id": "fact-cache-port",
+   "category": "fact_recall",
+   "query": "Orion 缓存端口是多少",
+   "expect": [
+    "6380"
+   ]
+  },
+  {
+   "id": "fact-search-index",
+   "category": "fact_recall",
+   "query": "Orion 搜索索引名",
+   "expect": [
+    "orion-docs-v3"
+   ]
+  },
+  {
+   "id": "fact-billing-topic",
+   "category": "fact_recall",
+   "query": "Orion 计费订阅的 Kafka topic",
+   "expect": [
+    "billing-events"
+   ]
+  },
+  {
+   "id": "fact-pipeline-dag",
+   "category": "fact_recall",
+   "query": "Orion 数据管道 dag id",
+   "expect": [
+    "orion_daily"
+   ]
+  },
+  {
+   "id": "fact-security-vault",
+   "category": "fact_recall",
+   "query": "Orion 密钥保管路径",
+   "expect": [
+    "secret/orion"
+   ]
+  },
+  {
+   "id": "fact-domain",
+   "category": "fact_recall",
+   "query": "Orion 服务域名",
+   "expect": [
+    "api.orion.internal"
+   ]
+  },
+  {
+   "id": "upd-search-shards",
+   "category": "knowledge_update",
+   "query": "Orion 搜索集群分片数",
+   "expect": [
+    "分片数调整为 16"
+   ],
+   "expect_absent": [
+    "分片数为 8"
+   ]
+  },
+  {
+   "id": "upd-cache-maxmemory",
+   "category": "knowledge_update",
+   "query": "Orion 缓存服务 maxmemory",
+   "expect": [
+    "maxmemory 调整为 64G"
+   ],
+   "expect_absent": [
+    "maxmemory 为 32G"
+   ]
+  },
+  {
+   "id": "upd-billing-partitions",
+   "category": "knowledge_update",
+   "query": "Orion 计费 Kafka 分区数",
+   "expect": [
+    "分区数调整为 24 个"
+   ],
+   "expect_absent": [
+    "分区数为 12 个"
+   ]
+  },
+  {
+   "id": "upd-alert-tool",
+   "category": "knowledge_update",
+   "query": "Orion 告警通知工具",
+   "expect": [
+    "切换为 OpsGenie"
+   ],
+   "expect_absent": [
+    "使用 PagerDuty"
+   ]
+  },
+  {
+   "id": "upd-pipeline-schedule",
+   "category": "knowledge_update",
+   "query": "Orion 数据管道运行时间",
+   "expect": [
+    "调整为 04:30"
+   ],
+   "expect_absent": [
+    "每天 03:00 运行"
+   ]
+  },
+  {
+   "id": "upd-mobile-sdk",
+   "category": "knowledge_update",
+   "query": "Orion 移动端 Android min SDK",
+   "expect": [
+    "升级到 26"
+   ],
+   "expect_absent": [
+    "min SDK 为 24"
+   ]
+  },
+  {
+   "id": "upd-deploy-nodes",
+   "category": "knowledge_update",
+   "query": "Orion 部署集群节点池",
+   "expect": [
+    "扩容到 10 个节点"
+   ],
+   "expect_absent": [
+    "节点池为 6 个节点"
+   ]
+  },
+  {
+   "id": "upd-secret-rotation",
+   "category": "knowledge_update",
+   "query": "Orion 密钥轮换周期",
+   "expect": [
+    "调整为 60 天"
+   ],
+   "expect_absent": [
+    "轮换周期为 90 天"
+   ]
+  },
+  {
+   "id": "tmp-release-window",
+   "category": "temporal",
+   "query": "Orion 发布窗口灰度阶段夜间放量",
+   "expect": [
+    "灰度阶段",
+    "22:00"
+   ],
+   "expect_absent": [
+    "全量阶段"
+   ],
+   "as_of": "2026-03-10T00:00:00+00:00"
+  },
+  {
+   "id": "tmp-oncall-primary",
+   "category": "temporal",
+   "query": "Orion 值班主责是谁",
+   "expect": [
+    "值班主责是林晓"
+   ],
+   "expect_absent": [
+    "值班主责是赵敏"
+   ],
+   "as_of": "2026-02-15T00:00:00+00:00"
+  },
+  {
+   "id": "tmp-migration-status",
+   "category": "temporal",
+   "query": "Orion 数据库迁移当前状态",
+   "expect": [
+    "Q1 期间只读维护"
+   ],
+   "expect_absent": [
+    "已完成主库切换"
+   ],
+   "as_of": "2026-03-15T00:00:00+00:00"
+  },
+  {
+   "id": "tmp-budget-h1",
+   "category": "temporal",
+   "query": "Orion 云预算 H1 金额",
+   "expect": [
+    "H1 云预算为 42 万元"
+   ],
+   "expect_absent": [
+    "H2 云预算"
+   ],
+   "as_of": "2026-05-01T00:00:00+00:00"
+  },
+  {
+   "id": "tmp-cadence",
+   "category": "temporal",
+   "query": "Orion 发布节奏",
+   "expect": [
+    "双周一次"
+   ],
+   "expect_absent": [
+    "发布节奏改为每周一次"
+   ],
+   "as_of": "2026-03-01T00:00:00+00:00"
+  },
+  {
+   "id": "tmp-logret",
+   "category": "temporal",
+   "query": "Orion 日志保留周期",
+   "expect": [
+    "保留周期为 30 天"
+   ],
+   "expect_absent": [
+    "调整为 90 天"
+   ],
+   "as_of": "2026-03-01T00:00:00+00:00"
+  },
+  {
+   "id": "tmp-cpu-alert",
+   "category": "temporal",
+   "query": "Orion 网关 CPU 告警阈值",
+   "expect": [
+    "阈值为 80%"
+   ],
+   "expect_absent": [
+    "阈值调整为 90%"
+   ],
+   "as_of": "2026-03-01T00:00:00+00:00"
+  },
+  {
+   "id": "tmp-retention-q3",
+   "category": "temporal",
+   "query": "Orion 次日留存目标",
+   "expect": [
+    "Q3 次日留存目标为 35%"
+   ],
+   "expect_absent": [
+    "Q4 次日留存"
+   ],
+   "as_of": "2026-08-15T00:00:00+00:00"
+  },
+  {
+   "id": "cont-user-login-owner",
+   "category": "continuity",
+   "query": "Orion 用户服务登录注册负责人",
+   "expect": [
+    "登录注册",
+    "张伟"
+   ]
+  },
+  {
+   "id": "cont-user-db-replica",
+   "category": "continuity",
+   "query": "Orion 用户服务主库只读副本",
+   "expect": [
+    "db-03",
+    "db-04"
+   ]
+  },
+  {
+   "id": "cont-gateway-rate-owner",
+   "category": "continuity",
+   "query": "Orion 网关限流阈值负责人",
+   "expect": [
+    "每分钟 1200 次",
+    "林晓"
+   ]
+  },
+  {
+   "id": "cont-search-engine-index",
+   "category": "continuity",
+   "query": "Orion 搜索引擎 Elasticsearch 索引",
+   "expect": [
+    "Elasticsearch",
+    "orion-docs-v3"
+   ]
+  },
+  {
+   "id": "cont-cache-policy-port",
+   "category": "continuity",
+   "query": "Orion 缓存淘汰策略端口",
+   "expect": [
+    "allkeys-lru",
+    "6380"
+   ]
+  },
+  {
+   "id": "cont-billing-invoice-owner",
+   "category": "continuity",
+   "query": "Orion 计费月度账单负责人",
+   "expect": [
+    "月度账单",
+    "王芳"
+   ]
+  },
+  {
+   "id": "cont-deploy-k8s-az",
+   "category": "continuity",
+   "query": "Orion 部署 Kubernetes 可用区",
+   "expect": [
+    "Kubernetes",
+    "3 个可用区"
+   ]
+  },
+  {
+   "id": "cont-security-audit-owner",
+   "category": "continuity",
+   "query": "Orion 安全审计每季度负责人",
+   "expect": [
+    "每季度",
+    "赵敏"
+   ]
+  },
+  {
+   "id": "abs-mars-oxygen",
+   "category": "abstention",
+   "query": "火星基地的氧气配额是多少",
+   "expect": [],
+   "expect_absent": [
+    "火星",
+    "氧气"
+   ]
+  },
+  {
+   "id": "abs-submarine-depth",
+   "category": "abstention",
+   "query": "深海潜艇的最大下潜深度",
+   "expect": [],
+   "expect_absent": [
+    "潜艇",
+    "下潜"
+   ]
+  },
+  {
+   "id": "abs-tang-poet",
+   "category": "abstention",
+   "query": "唐代诗人李白的代表作",
+   "expect": [],
+   "expect_absent": [
+    "李白",
+    "唐诗"
+   ]
+  },
+  {
+   "id": "abs-quantum-bits",
+   "category": "abstention",
+   "query": "量子计算机的量子比特数量",
+   "expect": [],
+   "expect_absent": [
+    "量子比特"
+   ]
+  },
+  {
+   "id": "abs-bread-bake",
+   "category": "abstention",
+   "query": "如何烘焙欧包",
+   "expect": [],
+   "expect_absent": [
+    "欧包"
+   ]
+  },
+  {
+   "id": "abs-penguin-migration",
+   "category": "abstention",
+   "query": "南极企鹅的迁徙路线",
+   "expect": [],
+   "expect_absent": [
+    "企鹅"
+   ]
+  },
+  {
+   "id": "abs-marathon-pace",
+   "category": "abstention",
+   "query": "马拉松配速训练计划",
+   "expect": [],
+   "expect_absent": [
+    "马拉松"
+   ]
+  },
+  {
+   "id": "abs-caffeine-intake",
+   "category": "abstention",
+   "query": "咖啡因每日安全摄入量",
+   "expect": [],
+   "expect_absent": [
+    "咖啡因"
+   ]
+  },
+  {
+   "id": "abs-castle-defense",
+   "category": "abstention",
+   "query": "中世纪城堡的防御结构",
+   "expect": [],
+   "expect_absent": [
+    "城堡"
+   ]
+  },
+  {
+   "id": "abs-blackhole-mass",
+   "category": "abstention",
+   "query": "银河系中心黑洞质量",
+   "expect": [],
+   "expect_absent": [
+    "黑洞"
+   ]
+  },
+  {
+   "id": "abs-opera-masks",
+   "category": "abstention",
+   "query": "京剧脸谱颜色含义",
+   "expect": [],
+   "expect_absent": [
+    "京剧"
+   ]
+  },
+  {
+   "id": "abs-rainforest-trees",
+   "category": "abstention",
+   "query": "热带雨林树种多样性",
+   "expect": [],
+   "expect_absent": [
+    "雨林"
+   ]
+  }
+ ]
+}

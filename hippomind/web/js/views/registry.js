@@ -36,6 +36,9 @@ export const VIEWS = [
   { id: "reference", index: "10", title: "参考", eyebrow: "REFERENCE",
     subtitle: "HTTP 接口、界面设置与版本信息",
     load: () => import("./reference.js") },
+  { id: "forgetting", index: "11", title: "遗忘", eyebrow: "FORGETTING",
+    subtitle: "为什么这条记忆被降权：原因、降幅与还能不能召回",
+    load: () => import("./forgetting.js") },
 ];
 
 export function viewById(id) {

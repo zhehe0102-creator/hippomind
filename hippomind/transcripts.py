@@ -193,36 +193,68 @@ class TranscriptScanner:
         self.ledger.set_cursor(cursor_id, json.dumps(value, separators=(",", ":")),
                                error=error, metadata={"kind": "transcript"})
 
-    def _messages(self, agent: str, path: Path, offset: int,
-                  max_messages: int) -> Tuple[List[TranscriptMessage], int, bool]:
+    @staticmethod
+    def _cursor_state(cursor: Mapping[str, Any]) -> Dict[str, Any]:
+        """Normalise a persisted cursor into the next batch's start state.
+
+        line is the *absolute* line number within the file (not how many lines
+        this batch read): evidence must cite an absolute position, and a Codex
+        session's session_meta lives at line 1, so a later batch has to recover
+        the session/project it never sees.
+        """
+        try:
+            offset = max(0, int(cursor.get("offset", 0) or 0))
+        except (TypeError, ValueError):
+            offset = 0
+        try:
+            line = max(0, int(cursor.get("line", 0) or 0))
+        except (TypeError, ValueError):
+            line = 0
+        return {"offset": offset, "line": line,
+                "session_id": str(cursor.get("session_id") or ""),
+                "cwd": str(cursor.get("cwd") or "")}
+
+    def _messages(self, agent: str, path: Path, state: Mapping[str, Any],
+                  max_messages: int
+                  ) -> Tuple[List[TranscriptMessage], Dict[str, Any], bool, bool]:
+        """Read at most max_messages complete lines from a cursor state.
+
+        Returns (messages, next_state, done, reset).  reset is True when the
+        file shrank below the cursor offset (truncated or rewritten); all
+        carried state -- byte offset, absolute line, session and cwd -- restarts
+        from zero so stale line numbers never leak into evidence.
+        """
         reader = READERS.get(agent)
+        next_state = dict(state)
         if reader is None:
-            return [], offset, True
+            return [], next_state, True, False
         try:
             size = path.stat().st_size
         except OSError:
-            return [], offset, True
-        if size < offset:
-            offset = 0
+            return [], next_state, True, False
+        reset = False
+        if size < int(next_state.get("offset", 0) or 0):
+            next_state = {"offset": 0, "line": 0, "session_id": "", "cwd": ""}
+            reset = True
+        offset = int(next_state["offset"])
         try:
             with path.open("rb") as handle:
                 handle.seek(offset)
                 chunk = handle.read(MAX_BYTES_PER_FILE)
         except OSError:
-            return [], offset, True
+            return [], next_state, True, reset
         if not chunk:
-            return [], offset, True
+            return [], next_state, True, reset
         consumed = 0
         messages: List[TranscriptMessage] = []
-        session_id = ""
-        cwd = ""
-        line_number = 0
         # Only advance past complete lines; a writer may be mid-line.
         for raw_line in chunk.splitlines(keepends=True):
             if not raw_line.endswith(bytes([10])):
                 break
             consumed += len(raw_line)
-            line_number += 1
+            next_state["offset"] = offset + consumed
+            next_state["line"] = int(next_state.get("line", 0)) + 1
+            line_number = int(next_state["line"])
             try:
                 line = raw_line.decode("utf-8", errors="replace")
                 payload = json.loads(line)
@@ -232,18 +264,60 @@ class TranscriptScanner:
                 continue
             if agent == "codex" and payload.get("type") == "session_meta":
                 body = payload.get("payload") if isinstance(payload.get("payload"), Mapping) else {}
-                session_id = str(body.get("session_id") or body.get("id") or session_id)
-                cwd = str(body.get("cwd") or cwd)
+                session = str(body.get("session_id") or body.get("id") or "")
+                if session:
+                    next_state["session_id"] = session
+                working = str(body.get("cwd") or "")
+                if working:
+                    next_state["cwd"] = working
                 continue
             # Reuse the per-file reader logic by parsing the already decoded line.
             temp = self._message_from_payload(agent, payload, path, line_number)
-            if temp is not None:
-                if agent == "codex":
-                    temp = replace(temp, session_id=session_id, cwd=cwd)
-                messages.append(temp)
-                if len(messages) >= max_messages:
-                    break
-        return messages, offset + consumed, False
+            if temp is None:
+                continue
+            if agent == "codex":
+                temp = replace(temp, session_id=str(next_state.get("session_id") or ""),
+                               cwd=str(next_state.get("cwd") or ""))
+            else:
+                # Claude repeats sessionId/cwd on every line; when a line omits
+                # them, carry the last known values instead of writing empty.
+                if temp.session_id:
+                    next_state["session_id"] = temp.session_id
+                elif next_state.get("session_id"):
+                    temp = replace(temp, session_id=str(next_state["session_id"]))
+                if temp.cwd:
+                    next_state["cwd"] = temp.cwd
+                elif next_state.get("cwd"):
+                    temp = replace(temp, cwd=str(next_state["cwd"]))
+            messages.append(temp)
+            if len(messages) >= max_messages:
+                break
+        # If the very first line in this chunk exceeds MAX_BYTES_PER_FILE (so no
+        # newline exists inside chunk), skip ahead to the next newline instead
+        # of wedging at the same offset on every sync pass.
+        if consumed == 0 and len(chunk) >= MAX_BYTES_PER_FILE and b"\n" not in chunk:
+            skipped = len(chunk)
+            found_nl = False
+            try:
+                with path.open("rb") as handle:
+                    handle.seek(offset + skipped)
+                    max_skip = MAX_BYTES_PER_FILE * 16
+                    while skipped < max_skip:
+                        tail = handle.read(65_536)
+                        if not tail:
+                            break
+                        nl_pos = tail.find(b"\n")
+                        if nl_pos >= 0:
+                            skipped += nl_pos + 1
+                            found_nl = True
+                            break
+                        skipped += len(tail)
+            except OSError:
+                skipped = 0
+            if skipped > 0 and (found_nl or offset + skipped >= size):
+                next_state["offset"] = offset + skipped
+                next_state["line"] = int(next_state.get("line", 0)) + 1
+        return messages, next_state, False, reset
 
     @staticmethod
     def _message_from_payload(agent: str, payload: Mapping[str, Any], path: Path,
@@ -285,11 +359,14 @@ class TranscriptScanner:
 
     def _record(self, message: TranscriptMessage) -> Dict[str, Any]:
         project = Path(message.cwd).name if message.cwd else ""
+        ev_seed = f"{message.path}|{message.line_number}|{message.session_id}|{message.role}"
+        external_id = "tx:" + hashlib.sha1(ev_seed.encode("utf-8")).hexdigest()[:32]
         return {
             "content": message.content,
             "kind": "raw_chat",
             "source_agent": message.agent,
             "session_id": message.session_id,
+            "event_id": external_id,
             "project": project[:200],
             "role": message.role,
             "scope": "agent:" + message.agent,
@@ -300,6 +377,7 @@ class TranscriptScanner:
                          "line": message.line_number,
                          "cwd": message.cwd,
                          "sidechain": message.sidechain,
+                         "external_id": external_id,
                          "source": "native-transcript"},
         }
 
@@ -307,22 +385,25 @@ class TranscriptScanner:
              max_per_file: int = 40) -> Dict[str, Any]:
         started = time.time()
         summary = {"files": 0, "messages": 0, "inserted": 0, "duplicate": 0,
-                   "errors": 0, "bytes": 0, "elapsed_ms": 0.0}
+                   "errors": 0, "bytes": 0, "resets": 0, "elapsed_ms": 0.0}
         remaining = max(0, int(max_messages))
         for agent, path in self.files():
             if remaining <= 0:
                 break
             summary["files"] += 1
             cursor_id = self._cursor_id(agent, path)
-            cursor = self._read_cursor(cursor_id)
-            offset = int(cursor.get("offset", 0) or 0)
+            stored = self._read_cursor(cursor_id)
+            state = self._cursor_state(stored)
+            starting_offset = int(state["offset"])
             try:
-                messages, next_offset, done = self._messages(agent, path, offset,
-                                                              min(max_per_file, remaining))
+                messages, next_state, _done, reset = self._messages(
+                    agent, path, state, min(max_per_file, remaining))
             except Exception as exc:  # one bad transcript must not stop the loop
                 summary["errors"] += 1
-                self._write_cursor(cursor_id, cursor, error=str(exc)[:500])
+                self._write_cursor(cursor_id, stored, error=str(exc)[:500])
                 continue
+            if reset:
+                summary["resets"] += 1
             if messages:
                 records = [self._record(message) for message in messages]
                 try:
@@ -332,13 +413,20 @@ class TranscriptScanner:
                     summary["duplicate"] += sum(1 for result in results if not result.inserted)
                 except LedgerError as exc:
                     summary["errors"] += 1
-                    self._write_cursor(cursor_id, cursor, error=str(exc)[:500])
+                    self._write_cursor(cursor_id, stored, error=str(exc)[:500])
                     continue
-            summary["bytes"] += max(0, next_offset - offset)
+            summary["bytes"] += max(0, int(next_state["offset"]) - starting_offset)
             remaining -= len(messages)
-            self._write_cursor(cursor_id, {"offset": next_offset,
-                                           "size": path.stat().st_size if path.exists() else 0,
-                                           "updated_at": utc_now()})
+            payload = {"offset": int(next_state["offset"]),
+                       "line": int(next_state["line"]),
+                       "session_id": str(next_state.get("session_id") or ""),
+                       "cwd": str(next_state.get("cwd") or ""),
+                       "size": path.stat().st_size if path.exists() else 0,
+                       "updated_at": utc_now()}
+            if reset:
+                payload["truncated_resets"] = int(stored.get("truncated_resets", 0) or 0) + 1
+                payload["last_reset_at"] = utc_now()
+            self._write_cursor(cursor_id, payload)
         summary["elapsed_ms"] = round((time.time() - started) * 1000.0, 1)
         self._last_summary = summary
         return summary

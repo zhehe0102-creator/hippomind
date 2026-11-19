@@ -1,0 +1,334 @@
+{
+  "_schema": "Follow-up anchoring fixture for HippoMind session-aware query disambiguation (WP-M). Top-level: _schema (this text), _version (int, bump only on breaking change), cases (list). Each case: id (unique str), session_id (str, the host conversation id), prior_messages (list[str], chronological user messages from that session; they are ingested as raw_chat role=user records for benchmark replay), followup_query (str, the current user turn), expect (list[str], content markers that a correct anchored pack must recall; empty list means the case must NOT anchor and must not inject unrelated memory), category (str, one of the categories below). Categories: zh_pure_followup, zh_prefix_followup, zh_ack_followup, en_pure_followup, en_prefix_followup, safety_short_request, session_isolation, guard_no_overlap, window_expiry, normal_query. Cases are language-agnostic replay inputs for WP-N; do not rename fields or reorder semantics.",
+  "_version": 1,
+  "cases": [
+    {
+      "id": "zh-001",
+      "session_id": "sess-gui-1",
+      "prior_messages": [
+        "优化 GUI 的 recall 视图",
+        "分组预算改到 64 条"
+      ],
+      "followup_query": "继续",
+      "expect": [
+        "GUI recall 视图"
+      ],
+      "category": "zh_pure_followup"
+    },
+    {
+      "id": "zh-002",
+      "session_id": "sess-gui-1",
+      "prior_messages": [
+        "优化 GUI 的 recall 视图"
+      ],
+      "followup_query": "接着弄",
+      "expect": [
+        "GUI recall 视图"
+      ],
+      "category": "zh_pure_followup"
+    },
+    {
+      "id": "zh-003",
+      "session_id": "sess-gui-1",
+      "prior_messages": [
+        "优化 GUI 的 recall 视图"
+      ],
+      "followup_query": "同上",
+      "expect": [
+        "GUI recall 视图"
+      ],
+      "category": "zh_pure_followup"
+    },
+    {
+      "id": "zh-004",
+      "session_id": "sess-gui-1",
+      "prior_messages": [
+        "优化 GUI 的 recall 视图"
+      ],
+      "followup_query": "好的",
+      "expect": [
+        "GUI recall 视图"
+      ],
+      "category": "zh_ack_followup"
+    },
+    {
+      "id": "zh-005",
+      "session_id": "sess-gui-1",
+      "prior_messages": [
+        "优化 GUI 的 recall 视图",
+        "分组预算改到 64 条"
+      ],
+      "followup_query": "继续优化 GUI 的分组预算",
+      "expect": [
+        "GUI",
+        "分组预算"
+      ],
+      "category": "zh_prefix_followup"
+    },
+    {
+      "id": "zh-006",
+      "session_id": "sess-gui-1",
+      "prior_messages": [
+        "优化 GUI 的 recall 视图"
+      ],
+      "followup_query": "再优化 GUI",
+      "expect": [
+        "GUI"
+      ],
+      "category": "zh_prefix_followup"
+    },
+    {
+      "id": "zh-007",
+      "session_id": "sess-gui-1",
+      "prior_messages": [
+        "优化 GUI 的 recall 视图"
+      ],
+      "followup_query": "下一步",
+      "expect": [
+        "GUI recall 视图"
+      ],
+      "category": "zh_pure_followup"
+    },
+    {
+      "id": "zh-008",
+      "session_id": "sess-db-1",
+      "prior_messages": [
+        "数据库端口改成 5432",
+        "迁移脚本回滚预案"
+      ],
+      "followup_query": "继续",
+      "expect": [
+        "数据库端口 5432"
+      ],
+      "category": "zh_pure_followup"
+    },
+    {
+      "id": "zh-009",
+      "session_id": "sess-db-1",
+      "prior_messages": [
+        "数据库端口改成 5432",
+        "迁移脚本回滚预案"
+      ],
+      "followup_query": "接着做回滚预案",
+      "expect": [
+        "回滚预案"
+      ],
+      "category": "zh_prefix_followup"
+    },
+    {
+      "id": "zh-010",
+      "session_id": "sess-db-1",
+      "prior_messages": [
+        "数据库端口改成 5432",
+        "迁移脚本准备"
+      ],
+      "followup_query": "继续跑迁移脚本",
+      "expect": [
+        "迁移脚本"
+      ],
+      "category": "zh_prefix_followup"
+    },
+    {
+      "id": "zh-011",
+      "session_id": "sess-api-1",
+      "prior_messages": [
+        "API 限流改成令牌桶"
+      ],
+      "followup_query": "往下",
+      "expect": [
+        "令牌桶"
+      ],
+      "category": "zh_pure_followup"
+    },
+    {
+      "id": "zh-012",
+      "session_id": "sess-api-1",
+      "prior_messages": [
+        "API 限流改成令牌桶"
+      ],
+      "followup_query": "继续改限流参数",
+      "expect": [
+        "限流"
+      ],
+      "category": "zh_prefix_followup"
+    },
+    {
+      "id": "en-001",
+      "session_id": "sess-en-1",
+      "prior_messages": [
+        "optimise the GUI recall view"
+      ],
+      "followup_query": "continue",
+      "expect": [
+        "GUI recall view"
+      ],
+      "category": "en_pure_followup"
+    },
+    {
+      "id": "en-002",
+      "session_id": "sess-en-1",
+      "prior_messages": [
+        "optimise the GUI recall view"
+      ],
+      "followup_query": "go on",
+      "expect": [
+        "GUI recall view"
+      ],
+      "category": "en_pure_followup"
+    },
+    {
+      "id": "en-003",
+      "session_id": "sess-en-1",
+      "prior_messages": [
+        "optimise the GUI recall view"
+      ],
+      "followup_query": "keep going",
+      "expect": [
+        "GUI recall view"
+      ],
+      "category": "en_pure_followup"
+    },
+    {
+      "id": "en-004",
+      "session_id": "sess-en-1",
+      "prior_messages": [
+        "optimise the GUI recall view"
+      ],
+      "followup_query": "same as above",
+      "expect": [
+        "GUI recall view"
+      ],
+      "category": "en_pure_followup"
+    },
+    {
+      "id": "en-005",
+      "session_id": "sess-en-1",
+      "prior_messages": [
+        "optimise the GUI recall view"
+      ],
+      "followup_query": "continue the recall grouping",
+      "expect": [
+        "GUI recall view"
+      ],
+      "category": "en_prefix_followup"
+    },
+    {
+      "id": "safe-001",
+      "session_id": "sess-gui-2",
+      "prior_messages": [
+        "优化 GUI 的 recall 视图"
+      ],
+      "followup_query": "跑测试",
+      "expect": [],
+      "category": "safety_short_request"
+    },
+    {
+      "id": "safe-002",
+      "session_id": "sess-gui-2",
+      "prior_messages": [
+        "优化 GUI 的 recall 视图"
+      ],
+      "followup_query": "部署",
+      "expect": [],
+      "category": "safety_short_request"
+    },
+    {
+      "id": "safe-003",
+      "session_id": "sess-gui-2",
+      "prior_messages": [
+        "优化 GUI 的 recall 视图"
+      ],
+      "followup_query": "回滚",
+      "expect": [],
+      "category": "safety_short_request"
+    },
+    {
+      "id": "safe-004",
+      "session_id": "sess-gui-2",
+      "prior_messages": [
+        "优化 GUI 的 recall 视图"
+      ],
+      "followup_query": "再次部署",
+      "expect": [],
+      "category": "safety_short_request"
+    },
+    {
+      "id": "session-001",
+      "session_id": "sess-isolate-b",
+      "prior_messages": [
+        "数据库端口改成 5432"
+      ],
+      "followup_query": "继续",
+      "expect": [
+        "数据库端口 5432"
+      ],
+      "category": "session_isolation"
+    },
+    {
+      "id": "guard-001",
+      "session_id": "sess-guard-1",
+      "prior_messages": [
+        "数据库端口改成 5432"
+      ],
+      "followup_query": "再优化 GUI",
+      "expect": [],
+      "category": "guard_no_overlap"
+    },
+    {
+      "id": "window-001",
+      "session_id": "sess-old-1",
+      "prior_messages": [
+        "优化 GUI 的 recall 视图"
+      ],
+      "followup_query": "继续",
+      "expect": [],
+      "category": "window_expiry"
+    },
+    {
+      "id": "normal-001",
+      "session_id": "sess-gui-3",
+      "prior_messages": [
+        "优化 GUI 的 recall 视图"
+      ],
+      "followup_query": "今天天气怎么样",
+      "expect": [],
+      "category": "normal_query"
+    },
+    {
+      "id": "normal-002",
+      "session_id": "sess-db-2",
+      "prior_messages": [
+        "数据库迁移步骤：端口改成 5432"
+      ],
+      "followup_query": "数据库迁移的步骤是什么",
+      "expect": [
+        "数据库迁移"
+      ],
+      "category": "normal_query"
+    },
+    {
+      "id": "normal-003",
+      "session_id": "sess-gui-4",
+      "prior_messages": [
+        "优化 GUI 的 recall 视图"
+      ],
+      "followup_query": "优化 GUI 的 recall 视图",
+      "expect": [
+        "GUI recall 视图"
+      ],
+      "category": "normal_query"
+    },
+    {
+      "id": "zh-013",
+      "session_id": "sess-cache-1",
+      "prior_messages": [
+        "缓存 TTL 调到 300 秒"
+      ],
+      "followup_query": "继续",
+      "expect": [
+        "缓存 TTL 300"
+      ],
+      "category": "zh_pure_followup"
+    }
+  ]
+}

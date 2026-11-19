@@ -13,7 +13,9 @@ import {
   badge, card, chip, emptyState, errorState, skeleton, segmented, textField,
 } from "../components.js";
 import { icon } from "../icons.js";
-import { createGraphCanvas } from "../components/graph-canvas.js";
+import {
+  createGraphCanvas, RELATION_WEIGHT_HINTS,
+} from "../components/graph-canvas.js";
 import { claimStateBadge } from "../components/inspector.js";
 
 export const meta = {
@@ -66,12 +68,38 @@ function subjectList(subjects, active, filter, onPick) {
     subjectRow(item, item.subject === active, onPick)));
 }
 
+/* The legend has to teach two different things, and conflating them was the
+   original bug:
+     * WHAT the relation is  -> hue (causal / support / conflict / structural)
+     * HOW MUCH it counts    -> the weight from ledger/graph.py RELATION_WEIGHTS
+   same_subject(0.9) and same_task(0.7) are separate tiers in associative
+   expansion; related_to and every legacy type sit at 1.0.  A reader who only
+   sees colours cannot tell that, which is why the weights are printed. */
+function legendItem(className, label, hint) {
+  return el("span", { class: "vb-legend-item", title: hint || label },
+    el("i", { class: className }), label);
+}
+
 function legend() {
+  const weightOf = (type) => {
+    const entry = RELATION_WEIGHT_HINTS.find((item) => item.type === type);
+    return entry ? entry.weight.toFixed(1) : "1.0";
+  };
   return el("div", { class: "vb-graph-legend" },
-    el("span", { class: "vb-legend-item" }, el("i", { class: "vb-dot vb-dot--link" }), "因果"),
-    el("span", { class: "vb-legend-item" }, el("i", { class: "vb-dot vb-dot--ok" }), "支持/确认"),
-    el("span", { class: "vb-legend-item" }, el("i", { class: "vb-dot vb-dot--danger" }), "冲突/取代"),
-    el("span", { class: "vb-legend-item" }, el("i", { class: "vb-dot vb-dot--ink" }), "其他关系"),
+    legendItem("vb-dot vb-dot--link", "因果",
+      "caused_by / causes / follows — 权重 " + weightOf("related_to")),
+    legendItem("vb-dot vb-dot--ok", "支持/确认",
+      "support / confirm — 权重 " + weightOf("related_to")),
+    legendItem("vb-dot vb-dot--danger", "冲突/取代",
+      "contradict / supersedes — 权重 " + weightOf("related_to")),
+    legendItem("vb-dot vb-dot--ink2", "同主语 " + weightOf("same_subject"),
+      "same_subject — 虚线 · 联想扩展权重 " + weightOf("same_subject") +
+      "（同主语只证明在谈同一件事，比显式因果弱一档）"),
+    legendItem("vb-dot vb-dot--dotted", "同任务 " + weightOf("same_task"),
+      "same_task — 点线 · 联想扩展权重 " + weightOf("same_task") +
+      "（同一任务里本来就有大量无关记忆，是最弱的一层关联）"),
+    legendItem("vb-dot vb-dot--ink", "其他 " + weightOf("related_to"),
+      "related_to 及历史/未知类型 — 实线 · 权重恒为 1.0（存量边逐字节不变）"),
     el("span", { class: "vb-graph-hint" }, "滚轮缩放 · 拖拽平移 · 点击节点 · 双击复位"));
 }
 

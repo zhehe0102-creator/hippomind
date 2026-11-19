@@ -18,6 +18,14 @@ Two labelled sets measure two different capabilities:
 Both are grounded in the production ledger (source_ids records provenance;
 docs/EVAL.md explains how to refresh them and why the second set exists).
 
+A third capability -- **refusal** -- has no recall metric (there is no answer to
+find), so it lives in its own script: scripts/eval_refusal.py measures whether a
+question the ledger cannot answer comes back empty instead of inventing a
+neighbour. --set refusal delegates to it (gating is this script's default, so
+only --no-gate disables it), and --include-refusal folds it into the --set all
+combined gate. Both are opt-in: the default keyword/semantic/all output format
+and exit codes are unchanged.
+
 Usage:
     python3 scripts/eval_memory.py                 # gate the keyword set
     python3 scripts/eval_memory.py --set semantic  # gate the paraphrase set
@@ -908,19 +916,29 @@ def check_gate(
     }
 
 
-def check_combined_gate(gates: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
-    """Aggregate per-set gate verdicts: every set must pass."""
+def check_combined_gate(gates: Dict[str, Dict[str, Any]],
+                        order: Sequence[str] = SET_ORDER) -> Dict[str, Any]:
+    """Aggregate per-set gate verdicts: every set must pass.
+
+    order defaults to SET_ORDER so the historical keyword+semantic verdict is
+    byte-identical; --include-refusal passes an order that also names refusal.
+    """
     failures: List[str] = []
-    for name in SET_ORDER:
+    for name in order:
         gate = gates.get(name)
         if gate is None:
             continue
         failures.extend("%s: %s" % (name, failure) for failure in gate["failures"])
-    return {
+    verdict = {
         "passed": not failures,
         "failures": failures,
         "sets": gates,
     }
+    if tuple(order) != tuple(SET_ORDER):
+        # Only present when the set list is non-default (--include-refusal), so
+        # the historical keyword+semantic payload keeps its exact shape.
+        verdict["order"] = list(order)
+    return verdict
 
 
 def _print_ledger_stats(result: Dict[str, Any]) -> None:
@@ -958,6 +976,49 @@ def _print_set_report(set_name: str, result: Dict[str, Any]) -> None:
                  stats["duplicate_rate"]))
 
 
+def _load_refusal_module():
+    """Import scripts/eval_refusal.py lazily.
+
+    eval_refusal imports eval_memory at module load (it reuses percentile and
+    the query-set conventions), so this import must stay inside the function or
+    the two modules deadlock at import time.
+    """
+    scripts = str(ROOT / "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    import eval_refusal
+    return eval_refusal
+
+
+def evaluate_refusal_set(ledger_path: Path, *, limit: int,
+                         min_score: float, no_audit: bool = False
+                         ) -> Dict[str, Any]:
+    """Run the refusal set against ledger_path with a read-only ledger.
+
+    A dedicated read-only connection (not the caller's ledger) is deliberate:
+    the refusal pass must be unable to write, and the keyword/semantic run that
+    shares the process must not see its caches or generation bumped.
+    """
+    refusal = _load_refusal_module()
+    specs = refusal.validate_refusal_queries(refusal.REFUSAL_QUERIES)
+    ledger = refusal.ReadOnlyLedger(ledger_path)
+    try:
+        grounding = None if no_audit else refusal.audit_grounding(ledger, specs)
+        result = refusal.evaluate_refusal(ledger, specs, limit=limit,
+                                          min_score=min_score)
+    finally:
+        ledger.close()
+    result["set"] = "refusal"
+    result["ledger"] = str(ledger_path)
+    result["grounding"] = grounding
+    result["gate"] = refusal.check_refusal_gate(result, grounding=grounding)
+    return result
+
+
+def _print_refusal_set(result: Dict[str, Any]) -> None:
+    _load_refusal_module()._print_report(result, result.get("grounding"))
+
+
 def _print_gate(gate: Dict[str, Any], k: int) -> None:
     thresholds = gate["thresholds"]
     print("gate: %s  (min_recall@%d=%.2f, min_mrr=%.2f, "
@@ -978,15 +1039,30 @@ def _print_report(result: Dict[str, Any]) -> None:
         print("")
         _print_gate(result["gate"], result["k"])
         return
-    for name in SET_ORDER:
+    order = tuple(result.get("order") or SET_ORDER)
+    for name in order:
         if name not in sets:
             continue
-        _print_set_report(name, sets[name])
-        _print_gate(sets[name]["gate"], sets[name]["k"])
+        if name == "refusal":
+            # The refusal gate has its own thresholds (no recall/MRR at all), so
+            # it prints through its own printer instead of _print_gate.
+            _print_refusal_set(sets[name])
+            _load_refusal_module()._print_gate(sets[name]["gate"],
+                                               sets[name]["k"])
+        else:
+            _print_set_report(name, sets[name])
+            _print_gate(sets[name]["gate"], sets[name]["k"])
         print("")
     print("== combined ==")
-    for name in SET_ORDER:
+    for name in order:
         if name not in sets:
+            continue
+        if name == "refusal":
+            metrics = sets[name]["metrics"]
+            print("  %-10s n=%-3d empty=%d noise=%d leak=%d refusal_rate=%.3f"
+                  % (name, sets[name]["queries"], metrics["empty"],
+                     metrics["noise"], metrics["leak"],
+                     metrics["refusal_rate"]))
             continue
         print("  %-10s n=%-3d recall@%d=%.3f mrr=%.3f"
               % (name, sets[name]["queries"], sets[name]["k"],
@@ -995,7 +1071,7 @@ def _print_report(result: Dict[str, Any]) -> None:
     gate = result["gate"]
     print("gate: %s  (%s)"
           % ("PASS" if gate["passed"] else "FAIL",
-             ", ".join(name for name in SET_ORDER if name in sets)))
+             ", ".join(name for name in order if name in sets)))
     for failure in gate["failures"]:
         print("  failure: %s" % failure)
 
@@ -1021,11 +1097,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--queries",
                         help="JSON query file (overrides the built-in set for "
                              "--set keyword|semantic)")
-    parser.add_argument("--set", choices=("keyword", "semantic", "all"),
+    parser.add_argument("--set",
+                        choices=("keyword", "semantic", "refusal", "all"),
                         default="keyword",
                         help="labelled set to run: keyword (near-saturated, "
                              "vocabulary overlap), semantic (paraphrase, "
-                             "vocabulary mismatch), or all (default: keyword)")
+                             "vocabulary mismatch), refusal (questions the "
+                             "ledger cannot answer; delegates to "
+                             "eval_refusal.py), or all (default: keyword)")
     parser.add_argument("--limit", "-k", type=int, default=8,
                         help="results retrieved per query (k)")
     parser.add_argument("--json", action="store_true", help="emit JSON report")
@@ -1053,6 +1132,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="search = candidate ranking; pack = the context actually injected")
     parser.add_argument("--min-score", type=float, default=0.20,
                         help="relevance gate used by --mode pack")
+    parser.add_argument("--include-refusal", action="store_true",
+                        help="with --set all: also run the refusal set "
+                             "(scripts/eval_refusal.py) and require it to pass "
+                             "in the combined gate. Default off, so the --set "
+                             "all report format is unchanged")
     args = parser.parse_args(argv)
     if args.limit < 1:
         parser.error("--limit must be >= 1")
@@ -1060,6 +1144,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("error: --queries cannot be combined with --set all",
               file=sys.stderr)
         return 2
+    if args.include_refusal and args.set != "all":
+        print("error: --include-refusal requires --set all",
+              file=sys.stderr)
+        return 2
+    if args.set == "refusal":
+        # The refusal capability has no recall metric, so it lives in its own
+        # script. Delegating (rather than reimplementing) keeps one definition
+        # of "refused" and one set of thresholds. --queries is forwarded so a
+        # custom refusal set behaves like a custom labelled set.
+        refusal_argv = ["--ledger", args.ledger, "--limit", str(args.limit),
+                        "--min-score", str(args.min_score)]
+        if args.queries:
+            refusal_argv.extend(["--queries", args.queries])
+        if args.min_queries is not None:
+            # Same meaning on both sides: the set must not shrink silently.
+            refusal_argv.extend(["--min-queries", str(args.min_queries)])
+        if args.json:
+            refusal_argv.append("--json")
+        if not args.no_gate:
+            refusal_argv.append("--gate")
+        return _load_refusal_module().main(refusal_argv)
     set_names = list(SET_ORDER) if args.set == "all" else [args.set]
     try:
         sets: Dict[str, List[Dict[str, Any]]] = {}
@@ -1107,18 +1212,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             }
         result["gate"] = check_gate(
             result, **_set_thresholds(name, mode=args.mode, overrides=overrides))
+    if args.include_refusal:
+        # Opt-in only: without this flag --set all produces exactly the report
+        # and exit code it always has (tests/test_eval_memory.py pins that).
+        results["refusal"] = evaluate_refusal_set(
+            ledger_path, limit=args.limit, min_score=args.min_score)
     if len(results) == 1:
         report = next(iter(results.values()))
     else:
         gates = {name: result["gate"] for name, result in results.items()}
+        order = SET_ORDER + (("refusal",) if args.include_refusal else ())
         report = {
             "sets": results,
             "queries": sum(result["queries"] for result in results.values()),
             "k": args.limit,
             "mode": args.mode,
             "ledger": str(ledger_path),
-            "gate": check_combined_gate(gates),
+            "gate": check_combined_gate(gates, order=order),
         }
+        if args.include_refusal:
+            report["order"] = list(order)
         if ledger_stats is not None:
             report["ledger_stats"] = {
                 key: ledger_stats.get(key)

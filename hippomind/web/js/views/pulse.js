@@ -8,10 +8,12 @@
 import { el, clear } from "../core/dom.js";
 import { api } from "../core/api.js";
 import {
-  fmtInt, fmtCompact, fmtBytes, fmtPct, relTime, absTime, duration, truncate,
+  fmtInt, fmtCompact, fmtBytes, fmtPct, fmtMs, relTime, absTime, duration,
+  truncate,
 } from "../core/format.js";
 import {
-  badge, card, metric, emptyState, errorState, skeleton, copyButton,
+  badge, card, metric, emptyState, errorState, skeleton, copyButton, meter,
+  statRow,
 } from "../components.js";
 import { sparkline, barList } from "../charts.js";
 import { icon } from "../icons.js";
@@ -296,6 +298,318 @@ function automationStrip(data, health, context) {
     el("div", { class: "va-auto-strip-cells" }, ...cells));
 }
 
+
+/* ------------------------------------------------------- retrieval channels -- */
+
+/* 三路检索通道的真实状态。数据全部来自本视图已经在拿的两个 payload：
+   /health 的 fts 检查项（词法），/overview 的 daemon_health（向量 + 实体）。
+   不新增端点，也不重复查询。
+
+   这里最容易做错的一件事：把「已关闭」渲染成「坏了」。entity_index 默认是
+   {"state":"disabled"}，因为 HIPPOMIND_ENTITY_CHANNEL 默认关闭——那是一个
+   可开启的功能，不是一个故障。两者在界面上必须能一眼分开，所以 state 映射
+   到三种语气：ready=ok / disabled=neutral / unavailable|error=warn。 */
+const CHANNEL_STATE_TONE = {
+  ready: "ok",
+  disabled: "neutral",
+  unavailable: "warn",
+  error: "warn",
+  warn: "warn",
+  stopped: "neutral",
+  pending: "neutral",
+};
+
+const CHANNEL_STATE_LABEL = {
+  ready: "运行中",
+  disabled: "已关闭",
+  unavailable: "不可用",
+  error: "报错",
+  warn: "有告警",
+  stopped: "已停止",
+  pending: "等待首轮",
+};
+
+/* The three channels do not share a field name for their health: the index
+   loops publish `state`, the FTS check publishes `status`.  Reading only one
+   of them made a healthy lexical channel render as "等待首轮". */
+function channelState(raw) {
+  if (!raw || typeof raw !== "object" || !Object.keys(raw).length) return "pending";
+  const state = String(raw.state || "").trim();
+  if (state) return state;
+  const status = String(raw.status || "").trim();
+  if (status) return status === "ok" ? "ready" : "warn";
+  return raw.error ? "error" : "pending";
+}
+
+function fmtChannelCount(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? fmtInt(numeric) : "—";
+}
+
+/* 每路通道的规模说明。字段名来自各索引自己的 stats()，这里只做展示映射，
+   缺失一律显示「—」而不是 0：没报告不等于零。 */
+function channelDetail(id, raw, fts, ledger) {
+  const state = channelState(raw);
+  if (id === "lexical") {
+    if (!fts || typeof fts !== "object") return "daemon 未报告 FTS 检查项";
+    const rows = fmtChannelCount(fts.fts_rows);
+    const unindexed = fmtChannelCount(fts.unindexed);
+    const stale = fmtChannelCount(fts.stale);
+    const p95 = Number(ledger.search_p95_ms);
+    return "FTS " + rows + " 行 · 未索引 " + unindexed + " · 陈旧 " + stale +
+      (Number.isFinite(p95) ? " · 检索 p95 " + fmtMs(p95) : "");
+  }
+  if (state === "disabled") {
+    return id === "entity"
+      ? "已关闭：HIPPOMIND_ENTITY_CHANNEL=1 可开启（暖态构建约 30 ms）"
+      : "已关闭：需要 daemon 以 --watch 启动且已安装嵌入模型";
+  }
+  if (state === "unavailable") {
+    return id === "entity"
+      ? "不可用：账本里还没有可建索引的 claim"
+      : "不可用：未安装嵌入模型（semantic_onnx 未就绪）";
+  }
+  if (state === "warn" && id === "lexical") {
+    return "FTS 检查报 " + String(fts && fts.status || "warn") +
+      " · 未索引 " + fmtChannelCount(fts && fts.unindexed) +
+      " · 陈旧 " + fmtChannelCount(fts && fts.stale);
+  }
+  if (state === "error") return "报错：" + String(raw.error || "未知错误").slice(0, 120);
+  if (id === "vector") {
+    const docs = fmtChannelCount(raw.docs);
+    const dim = raw.dim ? String(raw.dim) + " 维" : "";
+    const model = String(raw.model || "");
+    return docs + " docs" + (dim ? " · " + dim : "") + (model ? " · " + model : "") +
+      (raw.built_at ? " · 构建于 " + relTime(raw.built_at) : "");
+  }
+  const entities = fmtChannelCount(raw.entities);
+  const claims = fmtChannelCount(raw.claims);
+  return entities + " 实体 · " + claims + " claims" +
+    (raw.built_at ? " · 构建于 " + relTime(raw.built_at) : "");
+}
+
+function channelScale(id, raw, fts) {
+  if (id === "lexical") {
+    return fts && Number.isFinite(Number(fts.fts_rows)) ? fmtInt(fts.fts_rows) : "—";
+  }
+  const state = channelState(raw);
+  if (state !== "ready") return "—";
+  const key = id === "vector" ? raw.docs : raw.entities;
+  return Number.isFinite(Number(key)) ? fmtInt(key) : "—";
+}
+
+function retrievalChannels(data, health) {
+  const daemonHealth = data.daemon_health && typeof data.daemon_health === "object"
+    ? data.daemon_health : {};
+  const checks = health && Array.isArray(health.checks) ? health.checks : [];
+  const ftsCheck = checks.find((check) => check && check.id === "fts") || null;
+  const fts = (health && health.fts) || (ftsCheck ? ftsCheck.fts : null)
+    || (data.ledger && data.ledger.fts) || null;
+  const ledger = data.ledger || {};
+  const vector = daemonHealth.vector_index && typeof daemonHealth.vector_index === "object"
+    ? daemonHealth.vector_index : {};
+  const entity = daemonHealth.entity_index && typeof daemonHealth.entity_index === "object"
+    ? daemonHealth.entity_index : {};
+
+  const channels = [
+    { id: "lexical", eyebrow: "LEXICAL", label: "词法", raw: fts || {}, fts },
+    { id: "vector", eyebrow: "VECTOR", label: "向量", raw: vector, fts },
+    { id: "entity", eyebrow: "ENTITY", label: "实体", raw: entity, fts },
+  ];
+
+  const cells = channels.map((channel) => {
+    const state = channelState(channel.raw);
+    const tone = CHANNEL_STATE_TONE[state] || "neutral";
+    return el("div", { class: "va-channel", dataset: { tone, channel: channel.id } },
+      el("div", { class: "va-channel-head" },
+        dot(tone),
+        el("span", { class: "va-channel-eyebrow" }, channel.eyebrow),
+        el("span", { class: "va-channel-label" }, channel.label),
+        badge(CHANNEL_STATE_LABEL[state] || state, { tone })),
+      el("div", { class: "va-channel-figure" },
+        el("b", {}, channelScale(channel.id, channel.raw, channel.fts)),
+        el("span", { class: "va-channel-unit" },
+          channel.id === "entity" ? "实体" : "索引项")),
+      el("p", { class: "va-channel-detail" },
+        channelDetail(channel.id, channel.raw, channel.fts, ledger)));
+  });
+
+  const readyCount = channels.filter((c) => channelState(c.raw) === "ready").length;
+  return card({
+    eyebrow: "RETRIEVAL CHANNELS",
+    title: "检索通道",
+    actions: badge(fmtInt(readyCount) + " / 3 运行中",
+      { tone: readyCount === 3 ? "ok" : readyCount ? "warn" : "neutral" }),
+    body: el("div", {},
+      el("div", { class: "va-channels" }, ...cells),
+      el("p", { class: "va-note" },
+        "召回按三路并行打分：词法（FTS + LIKE）、向量（语义近邻）、实体（claim 主语倒排）。",
+        "某一路「已关闭」只是它没有参与打分，另外两路照常工作——",
+        "「已关闭」不等于「不可用」，后者才是需要处理的故障。")),
+  });
+}
+
+
+/* ---------------------------------------------------------- injection A/B -- */
+
+/* A/B 进度条。这个区块存在的理由：用户开了实验之后，界面上没有任何地方告诉他
+   「还要等多久」。30 条样本的门槛在 20% 对照比例下意味着约 150 次提问——不说
+   出来，实验看起来就是永远没有结论。
+
+   两个分母必须分开讲，混在一起这类面板就开始撒谎：
+     * min_samples(30) 是「任何结论」的门槛；
+     * 两臂对照还额外要求 min(treatment_n, control_n) >= 30，
+       所以默认比例下**对照组**才是瓶颈，不是总数。
+
+   进度数字来自 /api/v1/injection-ab 的快速路径（trace 尾部计数，实测 3.8 ms）。
+   真实的可评估样本要跑 injection_quality，实测 6.6 s，所以它是显式按钮。 */
+
+function armProgress(arm, label, tone) {
+  const have = Number(arm && arm.have) || 0;
+  const need = Math.max(1, Number(arm && arm.need) || 1);
+  const shortfall = Math.max(0, Number(arm && arm.shortfall) || 0);
+  return el("div", { class: "va-ab-arm", dataset: { tone } },
+    meter({
+      label: label,
+      value: have,
+      max: need,
+      tone,
+      valueText: fmtInt(have) + " / " + fmtInt(need) +
+        (shortfall ? "（还差 " + fmtInt(shortfall) + "）" : "（已达标）"),
+    }));
+}
+
+function injectionAbCard(ab, context) {
+  if (!ab || typeof ab !== "object") {
+    return card({
+      eyebrow: "INJECTION A/B",
+      title: "注入实验",
+      body: emptyState({
+        plain: true,
+        icon: "info",
+        title: "daemon 未返回实验状态",
+        hint: "本视图需要 /api/v1/injection-ab；请确认 daemon 已更新到当前版本。",
+      }),
+    });
+  }
+  const config = ab.config || {};
+  const progress = ab.progress || {};
+  const traces = ab.traces || {};
+  const enabled = Boolean(config.enabled);
+  const rate = Number(config.rate);
+  const binding = String(progress.binding_arm || "");
+  const bindingShort = Number(progress.binding_shortfall) || 0;
+  const promptsNeeded = Number(progress.prompts_needed);
+
+  const tone = !enabled ? "neutral" : bindingShort > 0 ? "warn" : "ok";
+  const headline = !enabled
+    ? "实验未开启：所有提问都走注入臂，没有对照组可比"
+    : bindingShort > 0
+      ? "还差 " + fmtInt(bindingShort) + " 条" +
+        (binding === "control" ? "对照" : "注入") + "样本才能下结论"
+      : "两臂样本都达标，可以跑一次指标计算看结论";
+
+  const body = el("div", { class: "va-ab" },
+    el("div", { class: "va-ab-head" },
+      dot(tone),
+      el("div", { class: "va-ab-headline" }, headline),
+      badge(enabled ? "实验进行中" : "已关闭", { tone })),
+    statRow([
+      { label: "对照比例",
+        value: Number.isFinite(rate) ? fmtPct(rate) : "—" },
+      { label: "每 100 次提问的对照数",
+        value: config.expected_control_per_100_prompts === null ||
+          config.expected_control_per_100_prompts === undefined
+          ? "—" : String(config.expected_control_per_100_prompts) },
+      { label: "结论门槛",
+        value: fmtInt(ab.min_samples) + " 条 / 臂" },
+      { label: "达标所需提问",
+        value: Number.isFinite(promptsNeeded) ? fmtInt(promptsNeeded) + " 次" : "—" },
+      { label: "已记录 trace",
+        value: fmtInt(traces.read) + " 条" +
+          (traces.truncated ? "（只读了文件尾部）" : "") +
+          (Number(traces.malformed) ? " · 无法解析 " + fmtInt(traces.malformed) : "") },
+      { label: "最近一次",
+        value: traces.last_at ? relTime(traces.last_at) : "尚无记录" },
+    ]),
+    el("div", { class: "va-ab-arms" },
+      armProgress(progress.treatment, "注入臂（treatment）", "accent"),
+      armProgress(progress.control, "对照臂（control · 不注入）", "link")));
+
+  const footnote = el("p", { class: "va-note" },
+    "「已记录 trace」是可评估样本的【上界】，不是它本身：" +
+    "一条 trace 只有在其时间窗内",
+    "存在可读的 assistant 回复时才可评估。真实样本数与两臂指标要点下面的按钮现算（约数秒）。");
+  body.appendChild(footnote);
+
+  const result = el("div", { class: "va-ab-metrics" });
+  const button = el("button", {
+    class: "atlas-btn atlas-btn--ghost atlas-btn--sm",
+    type: "button",
+  }, icon("pulse", { size: 13 }), el("span", {}, "计算两臂指标"));
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    result.replaceChildren(el("p", { class: "va-note" },
+      "正在计算（要读 raw 回复，实测数秒）…"));
+    try {
+      const data = await api.get("/api/v1/injection-ab",
+        { metrics: "1", limit: 500 }, { signal: context.signal });
+      const arms = data.arms || {};
+      const verdict = data.verdict || {};
+      const nodes = [];
+      if (data.metrics_error) {
+        nodes.push(el("p", { class: "va-note tone-warn" },
+          "指标计算失败：" + String(data.metrics_error)));
+      } else {
+        nodes.push(el("div", { class: "va-ab-verdict" },
+          badge(verdict.conclusive ? "可下结论" : "尚不可下结论",
+            { tone: verdict.conclusive ? "ok" : "warn" }),
+          el("span", { class: "va-ab-verdict-text" }, verdict.headline || "")));
+        nodes.push(statRow([
+          { label: "可评估样本",
+            value: fmtInt(data.evaluable) + " 条（门槛 " + fmtInt(ab.min_samples) + "）" },
+          { label: "注入臂 n / 复用率",
+            value: fmtInt(arms.treatment_n) + " · " +
+              (arms.treatment_citation_rate === null ? "—" :
+                fmtPct(arms.treatment_citation_rate)) },
+          { label: "对照臂 n / 复用率",
+            value: fmtInt(arms.control_n) + " · " +
+              (arms.control_citation_rate === null ? "—" :
+                fmtPct(arms.control_citation_rate)) },
+          { label: "差值",
+            value: arms.difference === null || arms.difference === undefined
+              ? "—" : String(arms.difference) },
+          { label: "耗时",
+            value: Math.round(Number(data.metrics_elapsed_ms) || 0) + " ms" },
+        ]));
+        const caveats = Array.isArray(verdict.caveats) ? verdict.caveats : [];
+        if (caveats.length) {
+          nodes.push(el("ul", { class: "va-ab-caveats" },
+            ...caveats.map((line) => el("li", {}, line))));
+        }
+      }
+      result.replaceChildren(...nodes);
+    } catch (error) {
+      if (error && error.name === "AbortError") return;
+      result.replaceChildren(el("p", { class: "va-note tone-danger" },
+        "指标计算失败：" + String((error && (error.detail || error.message)) || "未知错误")));
+    } finally {
+      button.disabled = false;
+    }
+  });
+  body.appendChild(el("div", { class: "va-ab-actions" }, button));
+  body.appendChild(result);
+
+  return card({
+    eyebrow: "INJECTION A/B",
+    title: "注入实验",
+    actions: enabled
+      ? badge("对照 " + (Number.isFinite(rate) ? fmtPct(rate) : "—"), { tone: "accent" })
+      : badge("未开启", { tone: "neutral" }),
+    body,
+  });
+}
+
 /* ------------------------------------------------------------ composition -- */
 
 function compositionCard(data) {
@@ -488,7 +802,7 @@ function emptyLedgerCard(context) {
 
 /* ------------------------------------------------------------------- paint -- */
 
-function paint(root, data, activity, health, context) {
+function paint(root, data, activity, health, ab, context) {
   clear(root);
   const ledger = data.ledger || {};
   root.appendChild(heroSection(data));
@@ -497,6 +811,8 @@ function paint(root, data, activity, health, context) {
   if (strip.children.length) root.appendChild(strip);
 
   root.appendChild(automationStrip(data, health, context));
+  root.appendChild(retrievalChannels(data, health));
+  root.appendChild(injectionAbCard(ab, context));
 
   if (!Number(ledger.memories)) root.appendChild(emptyLedgerCard(context));
 
@@ -533,12 +849,26 @@ async function fetchHealth(context) {
 /* The automation strip reads overview.daemon_health and health.checks; taking
    both in one parallel batch keeps the three stages describing the same
    moment instead of two snapshots a minute apart. */
+/* The A/B progress payload is sub-4 ms on the daemon (trace tail counting),
+   so it belongs in the first-paint batch.  Its DEEP metrics cost 6.6 s and
+   stay behind the card's explicit button instead. */
+async function fetchInjectionAb(context) {
+  try {
+    return await api.get("/api/v1/injection-ab", null, { signal: context.signal });
+  } catch (error) {
+    if (error && error.name === "AbortError") throw error;
+    console.warn("[atlas] pulse injection-ab unavailable", error);
+    return null;
+  }
+}
+
 async function loadSnapshot(context) {
-  const [overview, health] = await Promise.all([
+  const [overview, health, ab] = await Promise.all([
     api.get("/api/v1/overview", { days: OVERVIEW_DAYS }, { signal: context.signal }),
     fetchHealth(context),
+    fetchInjectionAb(context),
   ]);
-  return { overview, health };
+  return { overview, health, ab };
 }
 
 export async function render(context) {
@@ -557,7 +887,8 @@ export async function render(context) {
       console.warn("[atlas] pulse activity unavailable", error);
     }
     if (context.signal.aborted) return root;
-    paint(root, data || {}, activity || {}, snapshot.health, context);
+    paint(root, data || {}, activity || {}, snapshot.health, snapshot.ab,
+      context);
   } catch (error) {
     if (error && error.name === "AbortError") return root;
     clear(root);
@@ -584,7 +915,8 @@ export async function refresh(context) {
       console.warn("[atlas] pulse activity unavailable", error);
     }
     if (context.signal.aborted) return;
-    paint(root, snapshot.overview || {}, activity || { items: [], counts: {} }, snapshot.health, context);
+    paint(root, snapshot.overview || {}, activity || { items: [], counts: {} },
+      snapshot.health, snapshot.ab, context);
   } catch (error) {
     if (error && error.name === "AbortError") return;
     if (current.painted) context.toast("脉搏刷新失败：" + String((error && (error.detail || error.message)) || "未知错误"), { tone: "warn" });

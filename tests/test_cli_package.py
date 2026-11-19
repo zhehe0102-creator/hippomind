@@ -107,21 +107,24 @@ def _digest(rows):
 #: not move, and test_pin_help_text_is_unchanged pins that separately.
 PARSER_SURFACE = {
     # +1 sub-command (capture-status) and therefore +1 SUBCOMMAND row.
-    "(root)": ("e3c7f69eb8fd1b8dd3db106a945d4f957a0667c61586b441f1ec54c2132aca2f", 45),
+    "(root)": ("aad701b62596df55421d90eefc8073120b77aaa984cfe58d3812c6386df2409a", 46),
     "agent-status": ("c6ce3680226dad9d5019b2ce233e1580998dfc861921c6e3ca1f02ff8e4ed5bf", 7),
-    "auto-context": ("bcd24f3b2a2dd0f637d61a2f1dc9744cf08d71cef0717f5dfc97203004d1af8c", 22),
+    "auto-context": ("dbb7c5d45097c1d1aa5af750cb9ce2515b0feee0a22166c0f577fbc5ff5a3664", 23),
     "backup": ("3ba2b08b93a835ababbf4b62a644915a0df48e7e998837500580929290eadfd5", 6),
     # Added deliberately with the capture self-check (task-16): probe-only, so
     # it takes the connection flags and one output-format switch.
     "capture-status": ("3221fff0d7df8f217a0b1487d8a96fdc5cd86f556b4c7d5122f9ef08c9288875", 6),
     "checkup": ("f423e1adb4f6d6617acf985908bb9ffd532c4680269f621eaa066e566c5105c5", 7),
     "conflicts": ("aef6f57aa52644e95131795e33dbc4b0882d949530e3d9504e584982c149c28f", 8),
-    "context": ("d3835f73f8eb2364e3b1e08e6281f45755352304564bd108ac8ec536f3b3b5ce", 22),
+    "context": ("8a41d149c1e80f02e3386f1adb1fd947f7ed54558d2f7986693101d7d209c0dd", 23),
     "digest": ("88bba3b9a9c08a9acb42c5de1dd72fdca23a0185134d87b6f15ff295aae5a98e", 11),
     "semantic-build": ("28dfc614186893793d48b2df0905381a02f7dcbbd0b1b1ce0b1cbf1bb60b3651", 6),
     "discover-agents": ("2e0dbd54e137ff04e8f0e4a6659d7b161494d53088ff22f152227e8ea019bbf7", 6),
     "distill": ("366a9e30187d71e3583bfc428372802792970f8ae395588b676037ab39ecec65", 9),
     "doctor": ("b953cb2db3bf28e7d6b06c9fcc2a47ee04bd7218846ceadd934aa47702d93d7f", 7),
+    # Added by WP-R (offline explain CLI): query candidate + --query + 5 filters
+    # + --json + --trace/--agent.  A deliberate, reviewed surface addition.
+    "explain": ("bdc2d02d4640ffcb090dd999dc17203fefeab2c2151ed3ffefd17ddbf55de1dc", 16),
     "export": ("a81c0f81a8cdb1b0739bf5a7e4dc23370113a13a422515cbfff1582897cc4790", 13),
     "facts": ("e6a51afb9a8d74116eb93e92a8f52ef59f2ccc7d70bfff83018e8d32fcb324ea", 9),
     "feedback": ("49fabd11ed0bf3931e58f04c5089040529ea1b11a5e6a0101fc2c5c4c9f3b376", 10),
@@ -229,7 +232,7 @@ class CliPackageSurfaceTests(unittest.TestCase):
             if "|SUBCOMMAND " in row:
                 name = row.split("|SUBCOMMAND ")[1].split("|")[0]
                 handlers[name] = row.rsplit("func=", 1)[1]
-        self.assertEqual(43, len(handlers))
+        self.assertEqual(44, len(handlers))
         for name, handler in sorted(handlers.items()):
             self.assertTrue(callable(getattr(self.cli, handler)),
                             "%s -> %s is not reachable on hippomind.cli"

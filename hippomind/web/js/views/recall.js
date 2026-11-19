@@ -3,6 +3,10 @@
    One big serif query field over the ledger's FTS + LIKE double channel.
    Hits are ranked, highlighted by wrapping matched text in <mark> nodes (never
    markup), and open the same inspector as the archive.
+
+   as_of（双时态切片）与 compose 视图保持同一套写法：同一个 label、同一个
+   「留空 = 现在」语义、同样进请求体的 options.as_of。差别只在于 recall 的
+   筛选状态是 URL 参数（可分享、可刷新），compose 是表单内部 state。
    ========================================================================= */
 "use strict";
 
@@ -27,6 +31,7 @@ export const meta = {
 const SUGGESTIONS = ["验收 标准", "决策 理由", "阻塞", "Context Pack", "token 权限", "FTS 检索", "部署 脚本", "用户偏好"];
 const LIMITS = [20, 50, 100];
 const DEFAULT_LIMIT = 20;
+const AS_OF_LABEL = "as_of（双时态切片）";
 
 let live = null;
 
@@ -46,12 +51,14 @@ function readState(params) {
     to: params.get("to") || "",
     raw: params.get("raw") === "include",
     requireEvidence: params.get("require_evidence") !== "0",
+    asOf: params.get("as_of") || "",
   };
 }
 
 function hasAdvanced(state) {
   return Boolean(state.agent || state.project || state.from || state.to ||
-    state.raw || !state.requireEvidence || state.limit !== DEFAULT_LIMIT);
+    state.raw || !state.requireEvidence || state.limit !== DEFAULT_LIMIT ||
+    state.asOf);
 }
 
 function buildQuery(state) {
@@ -65,6 +72,7 @@ function buildQuery(state) {
   if (state.to) query.to = state.to;
   if (state.raw) query.raw = "include";
   if (!state.requireEvidence) query.require_evidence = "0";
+  if (state.asOf) query.as_of = state.asOf;
   return query;
 }
 
@@ -210,10 +218,13 @@ function emptyFor(instance, kind) {
   return emptyState({
     icon: "search",
     title: "没有召回结果",
-    hint: "可以换更短或更常见的词；关闭 require_evidence 会纳入无证据记忆；" +
-      "raw 模式会搜索原始聊天（默认排除）。当前筛选：" +
-      (state.requireEvidence ? "要求证据" : "不要求证据") + " · " +
-      (state.raw ? "含原始聊天" : "排除原始聊天") + "。",
+    hint: (instance.appliedAsOf
+      ? "当前是 as_of=" + instance.appliedAsOf + " 的历史切片：那一刻可能还没有这条记忆，" +
+        "或它当时尚未生效。清空时间点可回到当前状态。"
+      : "可以换更短或更常见的词；关闭 require_evidence 会纳入无证据记忆；" +
+        "raw 模式会搜索原始聊天（默认排除）。当前筛选：" +
+        (state.requireEvidence ? "要求证据" : "不要求证据") + " · " +
+        (state.raw ? "含原始聊天" : "排除原始聊天") + "。"),
     action: [
       suggestionChips(instance),
       {
@@ -284,6 +295,50 @@ function dateInput(label, value, onCommit) {
     el("span", { class: "atlas-field-label" }, label), input);
 }
 
+/* as_of 输入 + 清空时间点。清空按钮是「一键回到现在」：只清 as_of，不动
+   关键词和其他筛选——用户改的是时间视角，不是检索条件。compose 的整表单
+   「清空」在这里不适用，因为那会连查询词一起丢掉。 */
+function asOfCell(instance) {
+  const { state } = instance;
+  const note = el("span", { class: "vb-asof-note" }, "未应用：按 Enter 或点「应用筛选」");
+  const field = textField({
+    label: AS_OF_LABEL,
+    name: "as_of",
+    value: state.asOf,
+    placeholder: "ISO 时间（可选）",
+    monospace: true,
+    hint: "留空 = 现在",
+    onInput: (event, value) => {
+      state.asOf = value;
+      /* 草稿态只影响提示，不影响结果区：结果区显示的是真正发出去的
+         as_of，避免「输入框里有值但结果还是现在的」被误读成历史切片。 */
+      note.classList.toggle("is-visible", value.trim() !== instance.appliedAsOf);
+    },
+    onKeyDown: (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        apply(instance, { asOf: state.asOf.trim(), offset: 0 });
+      }
+    },
+  });
+  const clear = el("button", {
+    class: "atlas-btn atlas-btn--ghost atlas-btn--sm vb-asof-clear",
+    type: "button",
+    title: "清空时间点，回到当前状态",
+    on: {
+      click: () => {
+        field.input.value = "";
+        state.asOf = "";
+        note.classList.remove("is-visible");
+        apply(instance, { asOf: "", offset: 0 });
+      },
+    },
+  }, icon("refresh", { size: 12 }), el("span", {}, "清空时间点"));
+  return el("div", { class: "vb-asof-cell" },
+    field,
+    el("div", { class: "vb-asof-actions" }, clear, note));
+}
+
 function buildAdvanced(instance) {
   const { state } = instance;
   const arrow = el("span", { class: "vb-advanced-arrow" }, icon("chevron-right", { size: 12 }));
@@ -308,11 +363,12 @@ function buildAdvanced(instance) {
       state.agent ? "agent=" + state.agent : "",
       state.project ? "project=" + state.project : "",
       state.from || state.to ? "时间范围" : "",
+      state.asOf ? "as_of=" + state.asOf : "",
       state.raw ? "含 raw" : "",
       state.requireEvidence ? "" : "不要求证据",
       state.limit !== DEFAULT_LIMIT ? "limit=" + state.limit : "",
     ].filter(Boolean).join(" · ")
-    : "agent / project / 时间范围 / raw / 证据门槛 / 每页";
+    : "agent / project / 时间范围 / as_of / raw / 证据门槛 / 每页";
 
   const agent = textField({
     label: "agent",
@@ -335,6 +391,7 @@ function buildAdvanced(instance) {
       click: () => apply(instance, {
         agent: state.agent.trim(),
         project: state.project.trim(),
+        asOf: state.asOf.trim(),
         offset: 0,
       }),
     },
@@ -362,6 +419,7 @@ function buildAdvanced(instance) {
       agent, project,
       dateInput("起始 from", state.from, (value) => apply(instance, { from: value, offset: 0 })),
       dateInput("截止 to", state.to, (value) => apply(instance, { to: value, offset: 0 })),
+      asOfCell(instance),
       el("div", { class: "atlas-field vb-advanced-apply" },
         el("span", { class: "atlas-field-label" }, "提交筛选"), applyButton),
       el("div", { class: "atlas-field vb-advanced-seg" },
@@ -380,6 +438,30 @@ function skeletonBlock() {
   return el("div", { class: "vb-loading" }, skeleton(6));
 }
 
+/* as_of 生效时结果区最显眼的元素。双时态最容易误导的地方，就是用户把
+   「当时为真」当成「现在为真」——所以这条提示必须整条横幅、带图标、带
+   时间戳，而不是缩在筛选摘要里的一小段文字。
+
+   文本只取 instance.appliedAsOf（真正进了请求体的那个值），不取输入框
+   草稿：草稿改了没提交时结果仍是当前状态，提示也必须仍是当前状态。 */
+function sliceBanner(instance) {
+  const asOf = instance.appliedAsOf;
+  if (!asOf) return null;
+  return el("div", {
+    class: "vb-recall-slice",
+    role: "status",
+    "aria-live": "polite",
+  },
+    icon("info", { size: 15 }),
+    el("div", { class: "vb-recall-slice-body" },
+      el("b", {}, "历史切片"),
+      el("span", { class: "vb-recall-slice-stamp" }, "as_of=" + asOf),
+      el("p", { class: "vb-recall-slice-note" },
+        "以下结果按该时刻的 valid_from / valid_until 窗口求值，是「当时为真」的记忆，" +
+        "不是当前状态：已被后续事实取代或已过期的行会重新出现。" +
+        "清空时间点即可回到现在。")));
+}
+
 function renderResults(instance) {
   const { bodyHost, data, state, timing } = instance;
   clear(bodyHost);
@@ -387,10 +469,15 @@ function renderResults(instance) {
   const offset = Math.max(0, Number(data && data.offset) || state.offset);
   const limit = Math.max(1, Number(data && data.limit) || state.limit);
 
+  const banner = sliceBanner(instance);
+  if (banner) bodyHost.appendChild(banner);
+
+  const channelNote = instance.appliedAsOf
+    ? "as_of 切片绕过热索引（memory_fts 只装当前可召回集合），候选由有界 LIKE 扫描生成；score 仍为融合相关性。"
+    : "FTS5 trigram + LIKE 双通道召回，score 为融合相关性；";
   const metaBar = el("div", { class: "vb-recall-meta" },
     icon("info", { size: 13 }),
-    el("span", {},
-      "FTS5 trigram + LIKE 双通道召回，score 为融合相关性；" +
+    el("span", {}, channelNote +
       (state.requireEvidence ? "只返回带证据的记忆。" : "包含无证据记忆。")),
     el("span", { class: "vb-recall-timing" },
       "前端耗时 ", el("b", {}, fmtMs(timing)),
@@ -433,6 +520,12 @@ async function load(instance, options = {}) {
     bodyHost.appendChild(skeletonBlock());
   }
   instance.root.classList.add("is-busy");
+  /* 发的是 appliedAsOf，不是 state.asOf。state.asOf 是输入框草稿，用户每敲
+     一个字符它就变；app 的 30s 心跳会调 refresh() -> load() 做静默重载，
+     如果这里读草稿，一次后台刷新就会把用户还没提交的时间点偷偷发出去，
+     结果区和 URL 立刻对不上（as_of 从没点过「应用」，结果却变成了历史切片）。
+     草稿只有经过 apply() 才会变成 appliedAsOf 并写回 URL。 */
+  const asOf = instance.appliedAsOf;
   const started = performance.now();
   try {
     const data = await api.post("/recall", {
@@ -447,6 +540,7 @@ async function load(instance, options = {}) {
         to_time: state.to,
         raw_chat: state.raw,
         require_evidence: state.requireEvidence,
+        as_of: asOf,
       },
     }, { signal: context.signal });
     if (instance.destroyed) return;
@@ -473,6 +567,9 @@ export async function render(context) {
   const instance = {
     context, state, root, bodyHost,
     data: null, timing: null, searchInput: null,
+    /* 已应用的 as_of。挂载时等于 URL 参数；之后只在 apply() 之后由重新挂载
+       更新。草稿态（state.asOf）永远不直接进请求体。 */
+    appliedAsOf: state.asOf,
     advancedOpen: hasAdvanced(state),
     destroyed: false,
   };
