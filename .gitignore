@@ -25,3 +25,17 @@ BASELINE_*.md
 
 # macOS AppleDouble metadata on external (exFAT/FAT) volumes
 ._*
+
+# 2026-10-26: 外来的 muse-manager/ 与 ai-hub/ 已摘出到 /Volumes/移动硬盘/Muse Cockpit
+# 与 /Volumes/移动硬盘/AI Hub，本仓库不再包含它们。
+
+# 2026-11-19: local agent/tool state — never source
+.workbuddy/
+.agentgate/
+.ruff_cache/
+
+# Local disk-cleanup dashboard (HANDOFF.md §九: do not commit)
+系统盘清理仪表盘.html
+
+# Git bundles / local packaging artifacts
+*.bundle
