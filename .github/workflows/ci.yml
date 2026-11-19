@@ -1,0 +1,189 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  # Tests and drills must never touch a real ledger, and CI has none.  Pointing
+  # HIPPOMIND_HOME at the runner's temp dir keeps any accidental writes out of
+  # the checkout, so 'git status' after a run stays clean.
+  HIPPOMIND_HOME: ${{ runner.temp }}/hippomind-home
+  PYTHONPATH: ${{ github.workspace }}
+  # ruff is pinned so a new release cannot turn an unrelated PR red.
+  RUFF_VERSION: "0.16.2"
+
+jobs:
+  test:
+    name: Test (ubuntu, Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.13 is the newest supported CPython; keeping the floor (3.9) in the
+        # same matrix proves every intermediate version still runs the suite.
+        python-version: ['3.9', '3.11', '3.12', '3.13']
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Compile Python modules
+        # -x skips exFAT AppleDouble companions (._foo.py are resource-fork
+        # blobs, not Python); harmless on the Linux/macOS hosted runners.
+        run: python -m compileall -q -x '(^|/)\._' hippomind integrations
+      - name: Run test suite
+        run: python -m unittest discover -s tests -v
+
+  # Cross-platform gate.  The product is launched from macOS (login item,
+  # launchd, daemon paths) but CI historically only ran Linux; a macOS runner
+  # catches POSIX permission/path/launchd assumptions the Linux job cannot.
+  # One macOS Python version is enough here: the ubuntu matrix already covers
+  # 3.9 through 3.13, and setup-python only ships recent arm64 builds for
+  # macos-latest.
+  test-macos:
+    name: Test (macOS, Python 3.13)
+    runs-on: macos-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Compile Python modules
+        # -x skips exFAT AppleDouble companions (._foo.py are resource-fork
+        # blobs, not Python); harmless on the Linux/macOS hosted runners.
+        run: python -m compileall -q -x '(^|/)\._' hippomind integrations
+      - name: Run test suite
+        run: python -m unittest discover -s tests -v
+
+  # The schema-migration drill is the regression test for the outage this
+  # repository is recovering from: a live ledger reached v8 while the only
+  # published source tree was v5, so 1.5M memories had no code that could read
+  # them.  Unit tests cannot catch that - they build databases with the code
+  # under test, which can never be too new for it.  The drill opens frozen
+  # historical fixtures (tests/fixtures/schema/vN.sql) instead.
+  #
+  # CI has no production ledger, so the drill defaults to fixtures mode and
+  # never tries to copy a live database.
+  schema-drill:
+    name: Schema migration drill
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Drill historical schema fixtures
+        run: |
+          set -o pipefail
+          python tests/drill_schema_migration.py --json | tee drill-report.json
+      - name: Upload drill report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: schema-drill-report
+          path: drill-report.json
+          if-no-files-found: warn
+
+  lint:
+    name: Lint (ruff ratchet)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Install ruff
+        run: python -m pip install "ruff==${{ env.RUFF_VERSION }}"
+      - name: Run lint gate
+        run: bash scripts/lint.sh
+
+  # Benchmark smoke: the --quick profile keeps the expensive scale sweep out.
+  # This is a smoke test, not a performance gate - it proves the benchmark
+  # harness still runs end to end, so a broken benchmark cannot rot silently.
+  benchmarks:
+    name: Benchmark smoke (--quick)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Run quick benchmarks
+        run: |
+          if [ -f tests/run_all_benchmarks.py ]; then
+            python tests/run_all_benchmarks.py --quick
+          else
+            echo "tests/run_all_benchmarks.py is missing; skipping benchmark smoke."
+          fi
+
+  # Release gate: everything a tagged release must prove before artifacts are
+  # published.  The DSH plugin is JavaScript, the acceptance audit re-runs the
+  # 13 reproduced audit findings, the schema drill proves old data is still
+  # readable, and the retrieval benchmark gate proves retrieval quality did not
+  # regress (scripts/eval_benchmark.py vs its committed baseline).  Any failing
+  # step fails the job (each step is a separate gate; no continue-on-error).
+  # The same sequence is available locally as
+  # 'bash scripts/release_check.sh --quick'.
+  release-gate:
+    name: Release gate (node + acceptance + schema drill + retrieval quality + backup drill)
+    runs-on: ubuntu-latest
+    needs: [test, test-macos, schema-drill, lint]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Prepare isolated HOME
+        run: |
+          mkdir -p "${{ runner.temp }}/release-gate-home" "${{ runner.temp }}/hippomind-home"
+      - name: Node syntax check (DSH plugin)
+        run: node --check integrations/dsh-plugin/lib/index.js
+      - name: DSH plugin tests
+        run: node tests/test_dsh_plugin.mjs
+      - name: Acceptance audit (13 reproduced audit items)
+        env:
+          HOME: ${{ runner.temp }}/release-gate-home
+          HIPPOMIND_HOME: ${{ runner.temp }}/release-gate-home/hippomind
+        run: python scripts/audit_acceptance.py --json
+      - name: Schema migration drill
+        run: python tests/drill_schema_migration.py --json
+      - name: Retrieval quality gate (benchmark fixture)
+        run: python scripts/eval_benchmark.py --json
+      - name: Backup/restore drill (synthetic ledger)
+        run: bash scripts/backup_restore_drill.sh --json
