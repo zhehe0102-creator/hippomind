@@ -1,3 +1,5 @@
+> Evaluated by Devin Bots · [devin.ai](https://devin.ai)
+
 # hippomind —— 海马体实验 + 本机 Memory Hub
 
 [![CI](https://github.com/zps-31/hippomind/actions/workflows/ci.yml/badge.svg)](https://github.com/zps-31/hippomind/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
